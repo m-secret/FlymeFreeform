@@ -184,6 +184,9 @@ class RadialMenuView(context: Context) : View(context) {
         alpha = 1f
         enterScale = 1f
         selectedScale = 1f
+        // 手指已经松开，呼出阶段扫过的选中态不该留着：否则粘滞态下第一下按到同一个图标时，
+        // update() 会因为「选中项没变」直接返回，连震带高亮一起静默。
+        selectedIndex = -1
         invalidate()
     }
 
@@ -210,16 +213,27 @@ class RadialMenuView(context: Context) : View(context) {
      * 粘滞态：轮盘已松手保持显示，窗口此时可触摸，点击即命中。
      *
      * 点中图标（selectionFor 返回有效槽位）→ onTap(槽位)；点空白 → onTap(-1)。
-     * DOWN 必须返回 true 消费，否则收不到后续的 UP。
+     *
+     * **按下与滑动都走 [update]，和呼出阶段完全一致。** 这里早先只处理 DOWN/UP，
+     * 于是「松手前划过图标有震动、松手后再划和点击都没反应」——手指压在同一条弧上，
+     * 反馈却断掉了。现在按下即选中并给一次轻触感，滑动换格照常震动。
+     *
+     * DOWN 必须返回 true 消费，否则收不到后续的 MOVE / UP。
      */
     override fun onTouchEvent(event: MotionEvent): Boolean {
         return when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> true
-            MotionEvent.ACTION_UP -> {
-                val slot = selectionFor(event.x, event.y)
-                onTap?.invoke(slot)
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_MOVE,
+            -> {
+                update(event.x, event.y)
                 true
             }
+
+            MotionEvent.ACTION_UP -> {
+                onTap?.invoke(selectionFor(event.x, event.y))
+                true
+            }
+
             else -> true
         }
     }
