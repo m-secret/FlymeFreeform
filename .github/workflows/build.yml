@@ -70,7 +70,15 @@ jobs:
           name: FlymeFreeform-debug-apk
           path: apk
 
+      # 本 job 没有 checkout，目录不是 git 仓库，`gh release create` 会报
+      # "fatal: not a git repository"。用 --repo 显式指定目标仓库即可。
+      # --verify-tag 保证只在标签已存在时创建，避免 gh 自作主张基于默认分支新建标签。
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" apk/*.apk --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" apk/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
