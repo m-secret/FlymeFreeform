@@ -8,6 +8,7 @@
   <img src="https://img.shields.io/badge/ROM-ColorOS-00A862" alt="面向 ColorOS" />  
   <img src="https://img.shields.io/badge/minSdk-35-3DDC84?logo=android" alt="最低 API 35" />  
   <img src="https://img.shields.io/badge/license-GPL--3.0-4285F4" alt="GPL-3.0" />  
+  <img src="https://github.com/m-secret/FlymeFreeform/actions/workflows/build.yml/badge.svg" alt="Build APK" />  
 </p>
 
 在 ColorOS 上还原魅族 Flyme 小窗「呼之即来，挥之即去」的手感 —— **不需要 root，不需要 Xposed，不写一行 hook。**
@@ -76,6 +77,15 @@
 产物：`app/build/outputs/apk/debug/FlymeFreeform-<版本>-Debug.apk`
 
 > 注意：**不要**给这个模块显式加 `org.jetbrains.kotlin.android` 插件 —— AGP 9 自带 Kotlin 支持，额外声明会让 Gradle 报 “plugin is already on the classpath with an unknown version”。
+
+## 下载 / CI
+
+不想自己配环境的话，直接用 GitHub Actions 产出的 APK：
+
+- **每次提交**：在 [Actions](../../actions/workflows/build.yml) 页面选最新一次成功的运行，页面底部 **Artifacts** 里的 `FlymeFreeform-debug-apk` 就能下载。
+- **正式发版**：推一个 `v*` 标签（如 `git tag v0.6.10 && git push origin v0.6.10`），会自动建 Release 并把 APK 挂上去，可直接下载安装。
+
+CI 配置在 [`.github/workflows/build.yml`](.github/workflows/build.yml)：JDK 17 + Android SDK（`platforms;android-37.0`、`build-tools;36.0.0`）+ Gradle 9.6.0。产物是 **debug 签名**的 APK，可直接安装体验。
 
 ## 文档
 
