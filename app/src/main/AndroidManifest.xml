@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 角落悬浮窗需要的「显示在其他应用上层」权限，由用户手动授权。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 扇形菜单划过图标时的触感反馈。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Shizuku 授权通道。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <!-- 枚举所有已安装应用（用于检测图标包、应用列表）。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+    <!-- 开机自启：系统重启后自动恢复 Shizuku 监听与主动呼出服务。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.FlymeFreeformNoRoot">
+
+        <activity
+            android:name=".MainActivity"
+            android:enableOnBackInvokedCallback="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 扇形应用管理单独成页：应用列表太长，放设置主页会把后面的设置项顶到很远。 -->
+        <activity
+            android:name=".AppManagementActivity"
+            android:exported="false"
+            android:label="@string/app_management_title" />
+
+        <activity
+            android:name=".LogActivity"
+            android:exported="false"
+            android:label="运行日志" />
+
+        <activity
+            android:name=".CornerSettingsActivity"
+            android:exported="false"
+            android:label="主动呼出" />
+
+        <activity
+            android:name=".OutsideTapSettingsActivity"
+            android:exported="false"
+            android:label="窗外点击关闭" />
+
+        <service
+            android:name=".OverlayGestureService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="corner_gesture_overlay" />
+        </service>
+
+        <!-- 窗外点击关闭：靠无障碍拿窗口边界 + 铺点击接收层，替代 Hook system_server。 -->
+        <service
+            android:name=".FreeformAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/freeform_accessibility_service" />
+        </service>
+
+        <!-- 开机 / 应用更新后自动恢复：挂 Shizuku 重连监听 + 服务开着就拉起来。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 应用安装/卸载时通知服务刷新「更多」面板的应用列表。 -->
+        <receiver
+            android:name=".PackageEventsReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.PACKAGE_ADDED" />
+                <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.PACKAGE_FULLY_REMOVED" />
+                <data android:scheme="package" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    </application>
+
+</manifest>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    「窗外点击关闭」与「角落点击透传」需要的无障碍能力：
+    - flagRetrieveInteractiveWindows 才能通过 getWindows() 拿到全部窗口及其边界（识别小窗的前提）；
+    - canRetrieveWindowContent 用于读取窗口归属包名（用来把自己的窗口排除掉），
+      并按语义找到小窗标题栏上的关闭入口；
+    - flagReportViewIds 让节点带上资源 id，便于日志定位关闭入口；
+    - canPerformGestures 用于「角落点击透传」把被悬浮窗吃掉的按压按回原坐标。
+
+    只订阅窗口变化类事件，不订阅内容变化，避免高频回调导致遮罩抖动。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100"
+    android:summary="@string/accessibility_service_summary" />

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Flyme 小窗</string>
+    <string name="notification_channel_name">主动呼出</string>
+    <string name="notification_title">Flyme 小窗</string>
+    <string name="notification_text">主动呼出已开启，用于呼出扇形菜单</string>
+    <string name="accessibility_service_label">Flyme 小窗 · 窗外点击关闭</string>
+    <string name="accessibility_service_summary">识别小窗位置，点击窗外区域时关闭小窗</string>
+    <string name="accessibility_service_description">用于实现「点击小窗外任意位置关闭小窗」。开启后本服务会读取窗口边界以定位当前小窗，并在小窗四周铺设透明的点击接收层；不会读取窗口内的文字内容，也不会上传任何数据。</string>
+    <string name="app_management_title">扇形应用</string>
+</resources>

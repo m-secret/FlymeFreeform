@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.FlymeFreeformNoRoot" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@color/page_background</item>
+        <item name="android:statusBarColor">@color/page_background</item>
+        <!-- 浅色背景必须配深色状态栏图标，否则白字看不清。 -->
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <!-- 内容避开系统栏（状态栏/手势条），title 不再贴着状态栏。 -->
+        <item name="android:fitsSystemWindows">true</item>
+    </style>
+</resources>
