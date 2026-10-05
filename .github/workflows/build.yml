@@ -29,14 +29,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # setup-android 会装好 cmdline-tools 并把 sdkmanager 加进 PATH，同时自动接受 SDK 许可。
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      # 装工程实际用到的三个包。注意 compileSdk 37 对应的包名是 platforms;android-37.0
-      # （Android 16 起 SDK 引入次版本号，包名带 .0），不是 android-37。
-      - name: Install SDK components
-        run: sdkmanager --install "platforms;android-37.0" "build-tools;36.0.0" "platform-tools"
+      # 不用 android-actions/setup-android：它默认会执行 `sdkmanager tools`，
+      # 而 Google 早已下架遗留的 `tools` 包，会直接报 Failed to find package 'tools'。
+      # GitHub 的 ubuntu runner 本来就预装了 Android SDK 与 cmdline-tools，直接调 sdkmanager 即可。
+      - name: Install Android SDK components
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort | tail -1)"
+          echo "sdkmanager: $SDKMANAGER"
+          # compileSdk 37 对应的包名是 platforms;android-37.0（Android 16 起 SDK 引入
+          # 次版本号，包名带 .0），不是 android-37。
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platforms;android-37.0" "build-tools;36.0.0" "platform-tools"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
