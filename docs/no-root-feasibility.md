@@ -207,7 +207,7 @@ Hook 的是 `UIService.onBind`，需要把自定义 Binder 返回给调用方。
 | 原生侧边栏「全部」面板 | — | 无法复用原生面板，改用上面的自绘面板 |
 
 **构建状态**：命令行 `./gradlew :app:assembleDebug` 已编译通过，产物为
-`app/build/outputs/apk/debug/FlymeFreeform-NoRoot-<版本>-Debug.apk`（首次验证时约 2.7 MB）。
+`app/build/outputs/apk/debug/FlymeFreeform-<版本>-Debug.apk`（首次验证时约 2.7 MB）。
 
 真机验证步骤与判读标准见 [`no-root-verify.md`](no-root-verify.md)。
 原型的核心假设（无 root 能否以小窗启动）仍未验证，必须先做那一步再评估整体。

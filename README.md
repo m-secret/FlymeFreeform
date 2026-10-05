@@ -73,7 +73,7 @@
 ./gradlew :app:assembleDebug
 ```
 
-产物：`app/build/outputs/apk/debug/FlymeFreeform-NoRoot-<版本>-Debug.apk`
+产物：`app/build/outputs/apk/debug/FlymeFreeform-<版本>-Debug.apk`
 
 > 注意：**不要**给这个模块显式加 `org.jetbrains.kotlin.android` 插件 —— AGP 9 自带 Kotlin 支持，额外声明会让 Gradle 报 “plugin is already on the classpath with an unknown version”。
 

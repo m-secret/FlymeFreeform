@@ -6,7 +6,7 @@
 
 - Android 15（API 35）及以上的 ColorOS 设备。
 - 构建：用 Android Studio 打开工程选 `app` 运行配置；或命令行 `./gradlew :app:assembleDebug`。
-- 产物路径：`app/build/outputs/apk/debug/FlymeFreeform-NoRoot-<版本>-Debug.apk`。
+- 产物路径：`app/build/outputs/apk/debug/FlymeFreeform-<版本>-Debug.apk`。
 
 ### 命令行构建环境（本机已验证通过）
 
