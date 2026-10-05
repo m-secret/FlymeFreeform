@@ -30,15 +30,14 @@ import kotlin.math.hypot
  * - **选中态是图标放大**，不是套一圈绿环。
  * - **相邻图标的边缘间距 ≈ 1.15 倍直径**（圆心距 ≈ 4.3 倍半径）。早先固定 10dp 的间隙
  *   让整条弧挤成一团，是「太丑」的另一半原因。
- * - 「更多」是一个**白色圆 + 深色三点**——它没有图标本体，需要一个容器才看得见。
+ * - 「更多」是一个**蓝色圆盘 + 白色三点**——它没有图标本体，需要一个容器才看得见。
+ *   容器后面**不画投影**：投影在浅色背景上会露出一圈灰边，像给三点糊了层灰。
  */
 class RadialMenuView(context: Context) : View(context) {
 
     private val density = resources.displayMetrics.density
 
-    /** 「更多」的圆盘与三点：flyme 蓝底 + 白点。投影用一圈放大的半透明圆代替。 */
-    private val morePlateShadowPaint =
-        Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x2E000000.toInt() }
+    /** 「更多」的圆盘与三点：flyme 蓝底 + 白点。 */
     private val morePlatePaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply { color = MORE_BLUE }
     private val moreDotPaint =
@@ -249,15 +248,14 @@ class RadialMenuView(context: Context) : View(context) {
     }
 
     /**
-     * 按项数与半径决定步进角与图标尺寸。
+     * 按项数算出步进角与图标尺寸。
      *
-     * 半径**不在这里被撑大**：它由设置给定，是「贴不贴角」的唯一旋钮。项数在当前半径下
-     * 排不下时（张角超过 [MAX_SPAN_DEG]），改为按可用张角压缩图标尺寸，
-     * 保证相邻图标不重叠的同时，整条弧始终贴着角落。
+     * 张角固定（[MenuGeometry.MAX_SPAN_DEG]），项数只决定弧内怎么均分；半径只决定弧离角落多远。
+     * 图标尺寸**完全按设置来，不做封顶**——调得比弧上的格子大时会相互重叠，由用户自己调。
      */
     private fun resolveGeometry(count: Int) {
         // 与设置页预览共用 [MenuGeometry]，保证预览的位置/大小和真机一致。
-        val layout = MenuGeometry.resolve(count, radiusX, radiusY, baseIconRadius, density)
+        val layout = MenuGeometry.resolve(count, baseIconRadius)
         iconRadius = layout.iconRadius
         stepDeg = layout.stepDeg
         spanDeg = layout.spanDeg
@@ -344,11 +342,13 @@ class RadialMenuView(context: Context) : View(context) {
     }
 
     /**
-     * 「更多」是一个**白色圆 + 深色三点**——它没有图标本体，直接画三个点在任何页面背景上
-     * 都不一定看得清，所以给它一个白色容器（官方同样如此），底下再垫一圈柔和投影。
+     * 「更多」是一个**蓝底圆盘 + 白色三点**——它没有图标本体，直接画三个点在任何页面背景上
+     * 都不一定看得清，所以给它一个容器（官方同样如此）。
+     *
+     * **不再画那一圈投影。** 之前用放大的半透明黑圆当投影，在浅色页面背景上会露出一圈灰边，
+     * 看起来像「三个点糊了一层灰」。蓝底本身在深浅背景上都够清楚，不需要投影。
      */
     private fun drawMoreGlyph(canvas: Canvas, cx: Float, cy: Float, r: Float) {
-        canvas.drawCircle(cx, cy + 1.5f * density, r + 1.5f * density, morePlateShadowPaint)
         canvas.drawCircle(cx, cy, r, morePlatePaint)
         val dotRadius = r * 0.1f
         val gap = r * 0.42f

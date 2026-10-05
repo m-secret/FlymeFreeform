@@ -58,18 +58,43 @@ class OutsideTapBlocker(private val context: Context) {
     /** 当前生效的遮罩块数，用于日志与设置页展示。 */
     val activeCount: Int get() = views.size
 
+    /** 现在是不是「全屏兜住」状态（见 [captureAll]）。 */
+    val capturing: Boolean get() = views.containsKey(KEY_CAPTURE)
+
+    /**
+     * 先拿**一整块全屏遮罩**把屏幕兜住。
+     *
+     * 用在「小窗刚被拉起来、还在展开动画里」的那几百毫秒。
+     *
+     * 为什么需要：ColorOS 的小窗是**从一个小尺寸长到最终尺寸**的（实测从 231×411 长到
+     * 1020×1813），而 231×411 只有屏幕的 2.7%，过不了 [FreeformAccessibilityService] 里
+     * 「面积下限」那道门 —— 于是我们以为「没有小窗」把遮罩全撤了。用户恰好在这一刻点「窗外」，
+     * 就会直接点到下层应用（他反馈的正是「小窗打开时立刻点窗外会点到底下的软件」）。
+     *
+     * 这段时间宁可整屏都别穿透：那个还在长大的窗口本来也点不着。等它长到能被识别出来，
+     * 下一次 [apply] 会自然把这块换成正常的上/下/左/右四块。
+     */
+    fun captureAll(screen: Rect, debug: Boolean) {
+        val manager = windowManager ?: return
+        if (screen.isEmpty) return
+        views.keys.toList().forEach { key -> if (key != KEY_CAPTURE) detach(key) }
+        place(manager, KEY_CAPTURE, screen, debug)
+    }
+
     fun apply(layout: Layout, store: SettingsStore) {
         val manager = windowManager ?: return
         val regions = computeRegions(layout, store)
         val debug = store.outsideTapDebugOutline
+        // 每块遮罩可能被「挖洞」切成好几片（见 [subtractHoles]），所以这里按 `key#序号` 记账。
+        val wanted = LinkedHashMap<String, Rect>()
         for (key in KEYS) {
-            val rect = regions[key]
-            if (rect == null || rect.isEmpty) {
-                detach(key)
-            } else {
-                place(manager, key, rect, debug)
+            regions[key].orEmpty().forEachIndexed { index, rect ->
+                if (!rect.isEmpty) wanted["$key#$index"] = rect
             }
         }
+        // 先撤掉这一轮不再需要的（含同一块遮罩被切分后多出来的那些），再摆新的。
+        views.keys.toList().forEach { key -> if (!wanted.containsKey(key)) detach(key) }
+        wanted.forEach { (key, rect) -> place(manager, key, rect, debug) }
     }
 
     fun detachAll() {
@@ -79,7 +104,15 @@ class OutsideTapBlocker(private val context: Context) {
 
     // ---- 区域计算 ----
 
-    private fun computeRegions(layout: Layout, store: SettingsStore): Map<String, Rect?> {
+    /**
+     * 算出四块遮罩：小窗的上、下、左、右。
+     *
+     * **不要在遮罩上挖洞**（哪怕是为了给角落触摸条让路）。挖掉的地方就是「点下去会穿透到
+     * 下面的应用」的地方——那比轮盘难呼出严重得多。触摸条和遮罩都是悬浮窗，触摸条这一层
+     * 本来就更高（`TYPE_APPLICATION_OVERLAY` 2038 > `TYPE_ACCESSIBILITY_OVERLAY` 2032），
+     * 靠层序就够了；真出问题也该去调层序，不是在这里开口子。
+     */
+    private fun computeRegions(layout: Layout, store: SettingsStore): Map<String, List<Rect>> {
         // 软键盘弹出时必须把它让出来：键盘铺在屏幕底部，正好压在「小窗下方」那块遮罩上，
         // 用户在小窗里打字、点键盘字母时会命中遮罩，被当成「点了窗外」而关掉小窗。
         //
@@ -87,7 +120,7 @@ class OutsideTapBlocker(private val context: Context) {
         // 点那里照样能关闭小窗，只是键盘本身不再被遮罩盖住。
         val bottomLimit = layout.ime?.top?.let { minOf(it, layout.safe.bottom) } ?: layout.safe.bottom
         val safe = Rect(layout.safe.left, layout.safe.top, layout.safe.right, bottomLimit)
-        if (safe.isEmpty) return KEYS.associateWith { null as Rect? }
+        if (safe.isEmpty) return KEYS.associateWith { emptyList() }
 
         val pad = CornerGeometry.dp(context, store.outsideTapPaddingDp)
         // 外扩：小窗标题栏/缩放热区可能贴在边界外沿，内缩会让用户拖不动窗。
@@ -104,10 +137,10 @@ class OutsideTapBlocker(private val context: Context) {
         val right = Rect(innerRight, innerTop, safe.right, innerBottom)
 
         return mapOf(
-            KEY_TOP to if (store.outsideTapSidesOnly) null else top,
-            KEY_BOTTOM to if (store.outsideTapSidesOnly) null else bottom,
-            KEY_LEFT to left,
-            KEY_RIGHT to right,
+            KEY_TOP to if (store.outsideTapSidesOnly) emptyList() else listOf(top),
+            KEY_BOTTOM to if (store.outsideTapSidesOnly) emptyList() else listOf(bottom),
+            KEY_LEFT to listOf(left),
+            KEY_RIGHT to listOf(right),
         )
     }
 
@@ -143,6 +176,16 @@ class OutsideTapBlocker(private val context: Context) {
         }
         val params = existing.layoutParams as? WindowManager.LayoutParams ?: return
         existing.setBackgroundColor(if (debug) DEBUG_COLOR else Color.TRANSPARENT)
+        // 位置和尺寸都没变就别 `updateViewLayout` 了：那是一次跨进程调用，而 `refresh()` 会被
+        // 每一次窗口变化事件触发（小窗拖动时一秒能来好几次），四块遮罩跟着白跑四趟。
+        // 主线程被这些 IPC 占住，用户的感觉就是「面板卡」。
+        if (params.x == rect.left &&
+            params.y == rect.top &&
+            params.width == rect.width() &&
+            params.height == rect.height()
+        ) {
+            return
+        }
         params.x = rect.left
         params.y = rect.top
         params.width = rect.width()
@@ -182,6 +225,15 @@ class OutsideTapBlocker(private val context: Context) {
         private const val KEY_BOTTOM = "bottom"
         private const val KEY_LEFT = "left"
         private const val KEY_RIGHT = "right"
+
+        /**
+         * 「全屏兜住」那一块的键名，见 [captureAll]。
+         *
+         * 它不参与四块遮罩的记账（[apply] 找不到这个键就会把它 detach 掉），
+         * 所以两者天然互斥、不会同时挂着。
+         */
+        private const val KEY_CAPTURE = "capture"
+
         private val KEYS = listOf(KEY_TOP, KEY_BOTTOM, KEY_LEFT, KEY_RIGHT)
 
         /** 调试描边色（半透明红），仅用于确认真机上的覆盖范围。 */

@@ -31,6 +31,32 @@ object AppCatalog {
     private const val ICON_SIZE_DP = 48f
     private const val FALLBACK_DENSITY_DPI = 320
 
+    /**
+     * 图标缓存：`图标包 | 组件 | 安装路径` → **已经裁好的**圆形图标位图。
+     *
+     * 重读目录时最贵的一步就是「把每个应用的图标解码出来、再圆角裁剪」——88 个应用加起来
+     * 几百毫秒，而它们的图标其实一个都没变。缓存之后，重读只剩一次 `getActivityList` 和排序。
+     * 用户反馈的「更多面板加载慢」主要就是这一步。
+     *
+     * 键里带上 `sourceDir`：**应用一升级，安装路径就会变**，于是缓存自动失效、不会一直用旧图标。
+     * 每次读完整批替换（[swapIcons]），所以卸载掉的图标也会跟着释放，缓存体积永远等于当前应用数。
+     */
+    private val iconCache = HashMap<String, Bitmap>()
+    private val iconCacheLock = Any()
+
+    private fun iconKey(info: android.content.pm.LauncherActivityInfo, iconPackPkg: String): String =
+        iconPackPkg + "|" + info.componentName.flattenToString() + "|" +
+            (info.applicationInfo?.sourceDir ?: "")
+
+    private fun cachedIcon(key: String): Bitmap? = synchronized(iconCacheLock) { iconCache[key] }
+
+    private fun swapIcons(next: Map<String, Bitmap>) {
+        synchronized(iconCacheLock) {
+            iconCache.clear()
+            iconCache.putAll(next)
+        }
+    }
+
     fun load(context: Context): List<AppEntry> {
         val launcherApps = context.getSystemService(LauncherApps::class.java) ?: return emptyList()
         val pm = context.packageManager
@@ -41,29 +67,46 @@ object AppCatalog {
         val iconPackPkg = SettingsStore(context).iconPackPackage
         val iconMapping =
             if (iconPackPkg.isNotBlank()) IconPackLoader.loadMapping(context, iconPackPkg) else emptyMap()
-        return try {
-            launcherApps
-                .getActivityList(null, Process.myUserHandle())
-                .asSequence()
-                .filterNot { it.componentName.packageName == context.packageName }
-                .mapNotNull { info ->
-                    runCatching {
-                        AppEntry(
-                            component = info.componentName,
-                            label =
-                                info.label?.toString()?.trim().orEmpty()
-                                    .ifEmpty { info.componentName.packageName },
-                            icon = resolveIcon(context, pm, info, densityDpi, iconPackPkg, iconMapping).circleCrop(),
-                        )
-                    }.getOrNull()
-                }
-                .distinctBy(AppEntry::component)
-                .sortedWith { first, second -> collator.compare(first.label, second.label) }
-                .toList()
-        } catch (exception: RuntimeException) {
-            DebugLog.warn("APP_CATALOG_LOAD_FAILED", null, exception)
-            emptyList()
-        }
+        // 这一批用到的图标，读完整体替换缓存（见 [iconKey]）。
+        val icons = HashMap<String, Bitmap>()
+        val apps =
+            try {
+                launcherApps
+                    .getActivityList(null, Process.myUserHandle())
+                    .asSequence()
+                    .filterNot { it.componentName.packageName == context.packageName }
+                    .mapNotNull { info ->
+                        runCatching {
+                            val key = iconKey(info, iconPackPkg)
+                            val icon =
+                                cachedIcon(key)
+                                    ?: resolveIcon(
+                                        context,
+                                        pm,
+                                        info,
+                                        densityDpi,
+                                        iconPackPkg,
+                                        iconMapping,
+                                    ).circleCrop()
+                            icons[key] = icon
+                            AppEntry(
+                                component = info.componentName,
+                                label =
+                                    info.label?.toString()?.trim().orEmpty()
+                                        .ifEmpty { info.componentName.packageName },
+                                icon = icon,
+                            )
+                        }.getOrNull()
+                    }
+                    .distinctBy(AppEntry::component)
+                    .sortedWith { first, second -> collator.compare(first.label, second.label) }
+                    .toList()
+            } catch (exception: RuntimeException) {
+                DebugLog.warn("APP_CATALOG_LOAD_FAILED", null, exception)
+                emptyList()
+            }
+        if (apps.isNotEmpty()) swapIcons(icons)
+        return apps
     }
 
     /**

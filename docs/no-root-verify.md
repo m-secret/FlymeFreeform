@@ -271,8 +271,8 @@ SDK 位置写在根目录 `local.properties` 的 `sdk.dir`（该文件已被 `.g
 | --- | --- | --- |
 | 图标中心到屏幕角落的距离（弧半径） | ≈ **屏幕短边的 70%** | `menuRadiusPercent` 默认 **70%** |
 | 相邻图标**边缘**间距 | ≈ **1.15 倍直径** | `CHORD_PER_RADIUS` = 4.3（圆心距 4.3×半径） |
-| 整条弧的张角（6 项时） | ≈ **60°~75°** | 同左 |
-| 图标直径 | 46dp 量出来偏大 | `menuIconDp` 默认 **34dp**，滑块 24~52dp |
+| 整条弧的张角（6 项时） | ≈ **60°~75°** | 由步进角 `STEP_DEG` = 25°/格 算得（6 项 ≈ 125°）。该常量按「默认 170dp 半径 + 34dp 图标 = 官方那档 1.15 倍直径间距」反推得到 |
+| 图标直径 | 46dp 量出来偏大 | `menuIconDp` 默认 **34dp**，滑块 24~88dp；**上限由弧上留出的空位决定**，设置页会写出当前上限 |
 | 弧的中心方向 | ≈ 45°（对角线） | `CENTER_ANGLE_DEG` = 45° |
 | 「更多」的位置 | 弧的**最低端** | 固定占 0 号槽位 |
 
@@ -303,7 +303,7 @@ SDK 位置写在根目录 `local.properties` 的 `sdk.dir`（该文件已被 `.g
 
 > **关于震动「为什么前几版都没有」**：0.1.4 用 `USAGE_TOUCH` 通道，对后台 Service 悬浮窗会被系统静默丢弃；0.1.5/0.1.6 改用 Composition 原语直调，但没先问马达支不支持——不支持的机型上 `vibrate()` 不抛异常也不震。0.1.7 起按「原语（先 `areAllPrimitivesSupported`）→ 预置 `EFFECT_CLICK`（先 `areEffectsSupported`）→ 定长 `createOneShot(12/28ms)`」三级兜底，**定长震动是任何马达都会执行的物理保证**。每次实际走哪一级都写日志 `HAPTIC_PATH`，再「没震」把这条日志发我就能定位断在哪。
 
-相关常量都在 `RadialMenuView` 的 companion object 里：`MAX_SPAN_DEG`（张角上限 86°）、`CHORD_PER_RADIUS`（4.3）、`SELECTED_SCALE`（1.22）、`MIN_ICON_RADIUS_DP`（缩图下限 12dp）。
+扇形几何常量都在 `MenuGeometry` 里（`RadialMenuView` 与设置页预览共用同一套计算）：`STEP_DEG`（步进角 25°/格，**只由项数决定**）、`MAX_SPAN_DEG`（张角上限 170°）、`MIN_ICON_RADIUS_DP`（缩图下限 12dp）、`CENTER_ANGLE_DEG`（45°）。`RadialMenuView` 自己的 companion 里是观感常量：`SELECTED_SCALE`（1.22）、`HIT_RADIUS_RATIO`（1.6）、`MORE_BLUE`。
 
 ## 需要真机调优的参数（都已做成可调项）
 

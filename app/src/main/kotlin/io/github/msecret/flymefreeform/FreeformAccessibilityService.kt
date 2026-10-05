@@ -3,17 +3,24 @@ package io.github.msecret.flymefreeform
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.MediaStore
 import android.provider.Settings
+import android.view.Display
 import android.view.Gravity
 import android.view.View
+import kotlin.math.abs
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -40,17 +47,45 @@ class FreeformAccessibilityService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
 
+    /**
+     * 学「小横条真实坐标」用的线程。
+     *
+     * 读 logcat 是阻塞的（几十到几百毫秒），绝不能落在无障碍服务的主线程上。
+     * 单线程就够：同一时刻只会有一次学习在跑，[FreeformCaption] 内部还做了节流。
+     */
+    private val captionWorker = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "caption-learn")
+    }
+
+    /** 上一次打过的窗口快照，用来跳掉内容完全相同的重复日志（见 observeLayout）。 */
+    private var lastWindowScan = ""
+
     /** 最近一次识别到的小窗包名，用于「强力关闭」兜底。 */
     private var lastFreeformPackage: String? = null
 
     /** 最近一次识别到的小窗矩形，供「点标题栏」策略定位。 */
     private var lastFreeformBounds: Rect? = null
 
+    // ---- 「用户自己上滑小横条」= 系统原生的「调整窗口大小」 ----
+    //
+    // **这里特意什么都不做。**
+    //
+    // 曾经在这里识别「用户在小横条上滑」并在松手后替他补完到屏幕顶，想让「上滑一下」就等于
+    // 「上滑到顶」从而收成迷你（仿魅族）。实测是错的，而且有害：
+    // - 它并不产生迷你 —— 日志里窗口从 858×1525 一路等比缩到 89×159，然后**整个消失**，
+    //   那是关闭动画，不是吸附成迷你；
+    // - 更糟的是它把用户本来要做的「调整大小」直接变成了「关掉窗口」。
+    //
+    // 所以用户在小横条上滑就让他滑，系统给的是「调整大小」，我们不插手。
+
     /** 返回键补发次数，避免在根本关不掉的应用上无限重试。 */
     private var retryCount = 0
 
     /** 正在关闭流程中：这期间窗口变化事件不该把遮罩重新铺回去。 */
     private var closing = false
+
+    /** 这次关闭流程是什么时候开始的。用于「超时未收尾就强制复位」兜底（见 [refresh]）。 */
+    private var closingStartedAt = 0L
 
     /** 发起关闭那一刻的小窗矩形，用来分辨「没关掉」和「正在播收起动画」。 */
     private var closeStartBounds: Rect? = null
@@ -64,18 +99,64 @@ class FreeformAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        DebugLog.enabled = SettingsStore(this).debugLogEnabled
-        val created = OutsideTapBlocker(this).also { it.onOutsideTap = { x, y -> onOutsideTap(x, y) } }
-        blocker = created
-        DebugLog.info("A11Y_CONNECTED", "无障碍服务已连接")
-        refresh()
+        AppContext.attach(this)
+        A11yTrace.append(this, "A11Y_CONNECTED 无障碍服务已连接")
+        // 这一层 runCatching 不是"保险丝"，是**必需的**：从 `onServiceConnected` 冒出去的异常
+        // 会被系统记成「服务故障」，后果是**系统直接把本无障碍服务禁用掉**——用户看到的
+        // 就是「重启之后无障碍权限没了」。所以这里一行都不许往外抛。
+        runCatching {
+            DebugLog.enabled = SettingsStore(this).debugLogEnabled
+            val created =
+                OutsideTapBlocker(this).also { it.onOutsideTap = { x, y -> onOutsideTap(x, y) } }
+            blocker = created
+            DebugLog.info("A11Y_CONNECTED", "无障碍服务已连接")
+        }.onFailure {
+            DebugLog.error("A11Y_CONNECT_FAILED", null, it)
+            // 起了但构造失败：**这也会被系统记成服务故障并停用**，所以必须留痕，重启后还能看。
+            A11yTrace.append(this, "A11Y_CONNECT_FAILED ${it.javaClass.simpleName}: ${it.message}")
+        }
+        // 第一次布局交给消息队列：`refresh()` 要查窗口（IPC），占着 `onServiceConnected`
+        // 会拖长连接过程，卡太久同样会被系统当成无响应。
+        handler.post { safeRefresh() }
+    }
+
+    /**
+     * `refresh()` 的安全外壳。
+     *
+     * `refresh()` 里要查窗口、挂遮罩、算几何，任何一步抛异常都会顺着
+     * `onAccessibilityEvent` / `onServiceConnected` 冒回系统——**那会导致系统禁用本服务**。
+     * 所有调用点都必须走这里。
+     */
+    private fun safeRefresh() {
+        runCatching { refresh() }.onFailure { DebugLog.error("A11Y_REFRESH_FAILED", null, it) }
+    }
+
+    /**
+     * 有没有已经排队的重排。
+     *
+     * 窗口变化事件是**成串**来的（开机那一段尤其密），每个都同步跑一遍 `refresh()` 意味着
+     * 每次都做「查窗口(IPC) + 最多四次 updateViewLayout(IPC) + 拼一长串日志」，
+     * 全压在无障碍服务的**主线程**上。主线程被占住，系统会把它当成无响应的无障碍服务并
+     * 直接停用——这正是「重启后无障碍权限丢了」最可能的成因之一。
+     *
+     * 所以多次事件合并成一次重排：已经排了就把这次丢掉。
+     */
+    private var refreshScheduled = false
+
+    private fun scheduleRefresh() {
+        if (refreshScheduled) return
+        refreshScheduled = true
+        handler.post {
+            refreshScheduled = false
+            safeRefresh()
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         when (event?.eventType) {
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            -> refresh()
+            -> scheduleRefresh()
             else -> Unit
         }
     }
@@ -83,14 +164,80 @@ class FreeformAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     override fun onUnbind(intent: Intent?): Boolean {
-        handler.removeCallbacksAndMessages(null)
-        closing = false
-        blocker?.detachAll()
-        blocker = null
-        removeCloseAnchorMarker()
+        // 这里同样不能往外抛：断开时爆异常也可能被系统记成服务故障。
+        runCatching {
+            handler.removeCallbacksAndMessages(null)
+            closing = false
+            blocker?.detachAll()
+            blocker = null
+            removeCloseAnchorMarker()
+            DebugLog.info("A11Y_DISCONNECTED", "无障碍服务已断开")
+            A11yTrace.append(this, "A11Y_DISCONNECTED 无障碍服务被断开（若紧接着系统把开关关了，就是被停用）")
+        }.onFailure { DebugLog.error("A11Y_UNBIND_FAILED", null, it) }
         instance = null
-        DebugLog.info("A11Y_DISCONNECTED", "无障碍服务已断开")
         return super.onUnbind(intent)
+    }
+
+    /** 「落定探测」剩余还会再探几次。 */
+    private var settleWatchTicks = 0
+
+    /**
+     * 连续几次重探都看到「有焦点的全屏应用窗口」。
+     *
+     * 要**连续两次**才认（约 240ms）。因为 ColorOS 的 `getBoundsInScreen` 有时把自由窗报成
+     * 接近全屏（见 [observeLayout] 里的注释），而自由窗展开动画的最后一段尺寸也在变 ——
+     * 单次命中就当「这是全屏应用」，可能刚好在那一瞬间把防穿透的兜底撤掉。
+     */
+    private var fullscreenSightings = 0
+
+    /**
+     * 这一轮启动里**已经认出过**小窗吗。
+     *
+     * 认出来就说明展开动画结束了，「全屏兜住」的使命完成，之后**不许再兜**——
+     * 否则小窗被关掉之后（`observeLayout` 返回 null）它会被当成「还在动画里」重新挂上，
+     * 于是整块屏幕被一块全屏遮罩盖住、点哪儿都没反应。用户反馈的
+     * 「更多页面卡死 / 挡住别的应用的正常使用」就是这个。
+     */
+    private var sawFreeformSinceLaunch = false
+
+    /** 本轮第一次「全屏兜住」的时刻（0 = 还没兜过）。给兜底加一个**硬上限**。 */
+    private var captureStartedAt = 0L
+
+    private val settleWatch =
+        object : Runnable {
+            override fun run() {
+                if (settleWatchTicks <= 0) return
+                settleWatchTicks--
+                safeRefresh()
+                if (settleWatchTicks > 0) handler.postDelayed(this, SETTLE_WATCH_INTERVAL_MS)
+            }
+        }
+
+    /**
+     * 启动一次「落定探测」：接下来约 2.4 秒里密集重探窗口，把小窗落定的那一刻尽早抓住。
+     * 重复调用会重新计时。
+     */
+    private fun startSettleWatch() {
+        handler.removeCallbacks(settleWatch)
+        settleWatchTicks = SETTLE_WATCH_TICKS
+        // 计数清零：否则上一次启动留下的「全屏应用」计数会让这一次刚开就判成「已经落定」，
+        // 兜底遮罩挂不上，防穿透就白做了。
+        fullscreenSightings = 0
+        // 兜底的「使命」也重新开始：这一轮还没认出过小窗，允许先兜住。
+        sawFreeformSinceLaunch = false
+        captureStartedAt = 0L
+        handler.post(settleWatch)
+    }
+
+    /**
+     * 提前收工。
+     *
+     * 抓住小窗之后就没什么可探的了；再探下去反而会在小窗**被关掉之后**又去「全屏兜住」，
+     * 把整块屏幕挡死。
+     */
+    private fun stopSettleWatch() {
+        settleWatchTicks = 0
+        handler.removeCallbacks(settleWatch)
     }
 
     /** 配置变化或窗口变化后重新布局。必须在主线程调用。 */
@@ -98,8 +245,19 @@ class FreeformAccessibilityService : AccessibilityService() {
         val store = SettingsStore(this)
         val target = blocker ?: return
         if (closing) {
-            updateCloseAnchorMarker(store, null)
-            return
+            // 兜底：万一某次关闭流程没能走到收尾（注入抛异常、手势被系统掐断……），
+            // `closing` 会永远停在 true，`refresh()` 就永远从这里返回——遮罩再也挂不回来。
+            // 症状正是「小窗开着但点得动下面的应用」和「把窗外关闭关掉再打开也没用」。
+            // 超过时限就当这次关闭已经结束了，强制复位。
+            if (SystemClock.elapsedRealtime() - closingStartedAt <= CLOSING_TIMEOUT_MS) {
+                updateCloseAnchorMarker(store, null)
+                return
+            }
+            DebugLog.warn(
+                "CLOSE_FLOW_TIMEOUT",
+                "关闭流程超过 ${CLOSING_TIMEOUT_MS}ms 没收尾，强制复位（否则遮罩永远挂不回来）",
+            )
+            closing = false
         }
         // 每次都探一遍窗口：标记需要它，校准后的关闭也需要最新的小窗边界。
         val layout = observeLayout()
@@ -113,7 +271,38 @@ class FreeformAccessibilityService : AccessibilityService() {
             }
 
             layout == null -> {
-                if (target.activeCount > 0) {
+                // 认不出小窗，可能是两种情况，处理方式**正好相反**：
+                //
+                // 1. 小窗正在**展开动画**里 → 面积还很小（实测 231×411，只有屏幕的 2.7%），
+                //    过不了 [MIN_RATIO_PERCENT] 那道门。用户在这一刻点「窗外」，遮罩已经撤了，
+                //    于是直接点到下层应用——这正是用户反馈的「小窗打开时立刻点窗外会点到底下」。
+                //    这时候必须**整屏兜住**，一个像素都别漏。
+                // 2. 应用根本没以小窗打开（它不支持自由窗，直接占了全屏）→ 千万别兜，
+                //    否则用户会有一两秒完全点不动屏幕。
+                //
+                // 用「还在落定探测窗口里」+「前台没有全屏应用」把两者分开。
+                // 三道门，缺一不可：
+                // 1. 还在这一轮的落定探测里；
+                // 2. **还没认出过小窗**——认出来了就说明动画结束，绝不能再兜（不然小窗关掉后
+                //    会重新兜上，整屏被挡住）；
+                // 3. 兜底有硬上限（[CAPTURE_MAX_MS]），超时立刻放手，宁可漏一点也不能挡死用户。
+                val canCapture =
+                    settleWatchTicks > 0 &&
+                        !sawFreeformSinceLaunch &&
+                        (
+                            captureStartedAt == 0L ||
+                                SystemClock.elapsedRealtime() - captureStartedAt <= CAPTURE_MAX_MS
+                        )
+                if (canCapture && !fullscreenSettled()) {
+                    if (captureStartedAt == 0L) captureStartedAt = SystemClock.elapsedRealtime()
+                    if (!target.capturing) {
+                        DebugLog.info(
+                            "OUTSIDE_TAP_CAPTURE",
+                            "小窗还在展开动画里（面积过小识别不出），先全屏兜住防穿透",
+                        )
+                    }
+                    target.captureAll(screenBounds(), store.outsideTapDebugOutline)
+                } else if (target.activeCount > 0) {
                     target.detachAll()
                     DebugLog.info("OUTSIDE_TAP_NO_WINDOW", "未识别到小窗，撤下遮罩")
                 }
@@ -125,6 +314,40 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     // ---- 小窗识别 ----
+
+    /**
+     * 前台有没有**占着全屏的应用窗口**，并且已经连续 [FULLSCREEN_STABLE_TICKS] 次重探都是它。
+     *
+     * 只用来区分「小窗还在展开动画里」和「应用压根没以小窗打开、直接占了全屏」：
+     * 前者要全屏兜住防穿透，后者兜住就是白挡用户一两秒。
+     *
+     * 只看 **有焦点的** 窗口：全屏应用打开后焦点必然在它身上；而展开动画里的小窗虽然也可能被
+     * 报成全屏（ColorOS 的 `getBoundsInScreen` 有这个毛病），但那个瞬间焦点还没落上去，
+     * 而且尺寸一直在变、很难连续两次都命中。
+     */
+    private fun fullscreenSettled(): Boolean {
+        val sighting = hasFullscreenForeground()
+        fullscreenSightings = if (sighting) fullscreenSightings + 1 else 0
+        return fullscreenSightings >= FULLSCREEN_STABLE_TICKS
+    }
+
+    /** 屏幕上有没有**有焦点的全屏应用窗口**（单次判断，见 [fullscreenSettled]）。 */
+    private fun hasFullscreenForeground(): Boolean {
+        val windowList = runCatching { windows }.getOrNull() ?: return false
+        val screen = screenBounds()
+        val screenArea = screen.width().toLong() * screen.height()
+        if (screenArea <= 0) return false
+        for (window in windowList) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            if (packageOf(window) == packageName) continue
+            if (!window.isFocused && !window.isActive) continue
+            val bounds = Rect().also { window.getBoundsInScreen(it) }
+            if (bounds.isEmpty) continue
+            val area = bounds.width().toLong() * bounds.height()
+            if (area >= screenArea * FULLSCREEN_RATIO_PERCENT / 100) return true
+        }
+        return false
+    }
 
     private fun observeLayout(): OutsideTapBlocker.Layout? {
         val windowList = runCatching { windows }.getOrNull() ?: return null
@@ -151,14 +374,17 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
 
         if (windowList.isNotEmpty()) {
-            DebugLog.info(
-                "WINDOW_SCAN",
-                windowList.joinToString(" | ") { w ->
-                    val b = Rect().also { w.getBoundsInScreen(it) }
-                    "type=${w.type} pkg=${packageOf(w)} focused=${w.isFocused} " +
-                        "bounds=${b.toShortString()}"
-                },
-            )
+            val scan = windowList.joinToString(" | ") { w ->
+                val b = Rect().also { w.getBoundsInScreen(it) }
+                "type=${w.type} pkg=${packageOf(w)} focused=${w.isFocused} " +
+                    "bounds=${b.toShortString()}"
+            }
+            // 和上一次一模一样就不重复记了：小窗拖动时这段一秒能来好几次，
+            // 每次都要拼一大串字符串再写 logcat，全是压在无障碍主线程上的白工。
+            if (scan != lastWindowScan) {
+                lastWindowScan = scan
+                DebugLog.info("WINDOW_SCAN", scan)
+            }
         }
 
         // 自由窗优先：它通常是**焦点窗口**（isFocused/isActive），面积又比全屏前台应用小。
@@ -197,9 +423,23 @@ class FreeformAccessibilityService : AccessibilityService() {
             }
         }
 
-        val freeform = best ?: return null
+        val freeform = best ?: run {
+            // 小窗没了（被关掉了）。
+            // 边界也要清掉。否则它一直是**上一扇窗**留下的旧值，而「点窗外」的关闭流程
+            // 会拿它算注入落点 —— 落点跑到旧窗口的位置上，就会在那个坐标上凭空滑一下，
+            // 点到当时恰好在那儿的应用。宁可直接放弃这一次关闭。
+            lastFreeformBounds = null
+            lastFreeformPackage = null
+            return null
+        }
         lastFreeformPackage = bestPackage
         lastFreeformBounds = Rect(freeform)
+        sawFreeformSinceLaunch = true
+        stopSettleWatch()
+        // 顺手把小横条的真实坐标学下来（见 [FreeformCaption]）：它只能从系统日志里读，
+        // 窗口一出现先学一次，等用户点窗外时坐标已经就绪，关闭动作就不用再多等一截。
+        // 学习本身是「读一次 logcat 就退出」的子进程，不常驻，不额外耗电。
+        maybeLearnCaption()
         // 软键盘区域一并带出去：底部遮罩会收缩到它上沿。
         // 不这么做的话，在小窗里打字时点键盘字母会命中遮罩，小窗当场被关掉。
         val ime = imeBounds(windowList)
@@ -207,6 +447,18 @@ class FreeformAccessibilityService : AccessibilityService() {
             DebugLog.info("OUTSIDE_TAP_IME", "软键盘 ${ime.toShortString()}，底部遮罩已让开")
         }
         return OutsideTapBlocker.Layout(freeform, safe, ime)
+    }
+
+    /**
+     * 按需向 [FreeformCaption] 要一次小横条坐标。
+     *
+     * 只在「用小横条自动定位」这个关闭方式下才做——别的关闭方式用不上，白白起进程。
+     * [FreeformCaption] 自己带节流（最小间隔 3 秒），所以这里可以放心地在每次窗口刷新时调用。
+     */
+    private fun maybeLearnCaption() {
+        if (SettingsStore(this).outsideTapCloseMode != SettingsStore.CLOSE_MODE_CAPTION_AUTO) return
+        if (!FreeformCaption.isAvailable()) return
+        captionWorker.execute { FreeformCaption.refresh(this) }
     }
 
     /**
@@ -322,6 +574,194 @@ class FreeformAccessibilityService : AccessibilityService() {
             .getOrDefault(false)
     }
 
+    // ---- 系统工具：识屏 / 截屏 ----
+
+    /**
+     * 以「双指按压」的形态注入一次按压。
+     *
+     * 这正是 ColorOS「小布识屏」的**默认唤醒手势**——识屏由系统层识别手势后自己弹面板，
+     * 第三方应用能做的、也最接近原生的做法，就是把它自己的这个手势重放一次。
+     * （`com.coloros.directui` 没有对外公开的 Activity / Intent，只能走手势这条公开路径。）
+     *
+     * 两条 Stroke 的起始时间相同 = 两根手指同时按下；间距由 [spreadPx] 给出。
+     */
+    fun performTwoFingerPress(x: Float, y: Float, spreadPx: Float, durationMs: Long): Boolean {
+        val half = spreadPx / 2f
+        val left = Path().apply { moveTo(x - half, y) }
+        val right = Path().apply { moveTo(x + half, y) }
+        val gesture =
+            GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(left, 0L, durationMs))
+                .addStroke(GestureDescription.StrokeDescription(right, 0L, durationMs))
+                .build()
+        return runCatching { dispatchGesture(gesture, null, null) }
+            .onFailure { DebugLog.warn("TOOL_SCREEN_TEXT_GESTURE_FAILED", "($x,$y) 间距=$spreadPx", it) }
+            .getOrDefault(false)
+    }
+
+    /**
+     * 识屏的结果。
+     *
+     * @param lines 从上到下按屏幕顺序收集到的文字（已去空、去重）。
+     * @param sourcePackage 文字来自哪个应用，读不到时为 null。
+     */
+    data class ScreenTextReport(val lines: List<String>, val sourcePackage: String?)
+
+    /**
+     * 把当前屏幕上最上层那个应用窗口里的文字全部读出来。
+     *
+     * **只读节点树，不做 OCR。** 无障碍能拿到的是应用**主动暴露**的文字（`text` 与
+     * `contentDescription`）；图片里画的字、WebView/游戏 Canvas 里绘制的字都读不到。
+     * 这是无 root、不引入第三方 OCR 引擎时能做到的上限，界面上也会如实告诉用户。
+     *
+     * 只取最上层那个非本应用窗口：小窗场景下用户要看的就是小窗里的内容，把下层全屏应用的
+     * 文字一起抓进来只会得到一堆无关内容。
+     */
+    private fun collectScreenText(): ScreenTextReport {
+        val lines = LinkedHashSet<String>()
+        var sourcePackage: String? = null
+
+        // 第一优先：当前「活动窗口」的根节点。
+        // 这是无障碍里最稳的入口——多数 ROM 上 getWindows() 会给出成串的窗口，
+        // 而 rootInActiveWindow 总是直指用户正在操作的那一个，一次就能拿到内容。
+        val activeRoot = runCatching { rootInActiveWindow }.getOrNull()
+        if (activeRoot != null) {
+            val owner = runCatching { activeRoot.packageName?.toString() }.getOrNull()
+            if (!owner.isNullOrBlank() && owner != packageName) {
+                sourcePackage = owner
+                collectTextNodes(activeRoot, lines, depth = 0)
+            }
+        }
+        if (lines.isNotEmpty()) {
+            DebugLog.info(
+                "TOOL_SCREEN_TEXT_SCAN",
+                "来源=活动窗口 包名=$sourcePackage 行数=${lines.size}",
+            )
+            return ScreenTextReport(lines.toList(), sourcePackage)
+        }
+
+        // 第二优先：活动窗口拿不到（返回 null、或根节点属于本应用）时，
+        // 遍历全部窗口，挑最上层那个「非本应用」的应用窗口来读。小窗场景下就是小窗里的内容。
+        val windowList = runCatching { windows }.getOrNull().orEmpty()
+        val ordered = windowList.sortedByDescending { it.isFocused }
+        for (window in ordered) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val root = runCatching { window.root }.getOrNull() ?: continue
+            val owner = runCatching { root.packageName?.toString() }.getOrNull()
+            if (owner == packageName) continue
+            if (!owner.isNullOrBlank()) sourcePackage = owner
+            collectTextNodes(root, lines, depth = 0)
+            if (lines.isNotEmpty()) break
+        }
+        DebugLog.info(
+            "TOOL_SCREEN_TEXT_SCAN",
+            "窗口=${windowList.size} 包名=$sourcePackage 行数=${lines.size}",
+        )
+        return ScreenTextReport(lines.toList(), sourcePackage)
+    }
+
+    /** 深度优先收集 `text` 与 `contentDescription`，两者都空则跳过。 */
+    private fun collectTextNodes(
+        node: AccessibilityNodeInfo?,
+        out: MutableSet<String>,
+        depth: Int,
+    ) {
+        if (node == null || depth > TOOL_MAX_NODE_DEPTH || out.size >= TOOL_MAX_TEXT_COUNT) return
+        if (node.isVisibleToUser) {
+            node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(out::add)
+            node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(out::add)
+        }
+        for (index in 0 until node.childCount) {
+            collectTextNodes(runCatching { node.getChild(index) }.getOrNull(), out, depth + 1)
+        }
+    }
+
+    /**
+     * 截屏并存进相册。
+     *
+     * 走的是 `AccessibilityService.takeScreenshot`（API 30+），**不需要 `READ/WRITE` 存储权限、
+     * 也不需要 MediaProjection 的授权弹窗**——代价是必须在无障碍服务的配置里声明
+     * `canTakeScreenshot`。返回 false 表示服务未连接或系统直接拒绝。
+     */
+    private fun captureScreenshot(context: Context, callback: (Boolean, String) -> Unit): Boolean =
+        runCatching {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        val saved = runCatching { persistScreenshot(context, screenshot) }
+                        saved
+                            .onSuccess { ok ->
+                                callback(
+                                    ok,
+                                    if (ok) "已保存到相册 Pictures/FlymeFreeform" else "写入相册失败",
+                                )
+                            }
+                            .onFailure { error ->
+                                DebugLog.error("TOOL_SCREENSHOT_SAVE_FAILED", null, error)
+                                callback(false, "保存截屏失败：${error.javaClass.simpleName}")
+                            }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        DebugLog.warn("TOOL_SCREENSHOT_DENIED", "errorCode=$errorCode")
+                        callback(false, "系统拒绝了这次截屏（错误码 $errorCode）")
+                    }
+                },
+            )
+            // takeScreenshot 本身返回 Unit，这里补一个 true 让 runCatching 的类型是 Boolean，
+            // 否则 getOrDefault(false) 会退化成 Any。
+            true
+        }
+            .onFailure { DebugLog.error("TOOL_SCREENSHOT_FAILED", "提交截屏请求失败", it) }
+            .getOrDefault(false)
+
+    /**
+     * 把截屏写进系统相册。
+     *
+     * **必须先 `copy` 成软件位图再关掉 hardwareBuffer。** `wrapHardwareBuffer` 返回的是硬件位图，
+     * 它只借用那块 GraphicBuffer；缓冲区一关，位图内容就没了，压缩出来会是一张黑图。
+     */
+    private fun persistScreenshot(context: Context, screenshot: ScreenshotResult): Boolean {
+        val buffer = screenshot.hardwareBuffer
+        return try {
+            val hardware = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
+                ?: return false
+            val software = hardware.copy(Bitmap.Config.ARGB_8888, false) ?: return false
+            try {
+                saveToGallery(context, software)
+            } finally {
+                software.recycle()
+            }
+        } finally {
+            runCatching { buffer.close() }
+        }
+    }
+
+    private fun saveToGallery(context: Context, bitmap: Bitmap): Boolean {
+        val values =
+            ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "Screenshot_${System.currentTimeMillis()}.png")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/FlymeFreeform")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+        return runCatching {
+            resolver.openOutputStream(uri)?.use { stream ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            } ?: return false
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            true
+        }
+            .onFailure { DebugLog.error("TOOL_SCREENSHOT_WRITE_FAILED", "uri=$uri", it) }
+            .getOrDefault(false)
+    }
+
     // ---- 关闭动作 ----
 
     /**
@@ -361,12 +801,20 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 已在关闭流程中（复检、重试、或上一个注入还没结束）就不再重复触发。
         if (closing) return
         closing = true
+        closingStartedAt = SystemClock.elapsedRealtime()
         retryCount = 0
         closingWaitCount = 0
-        // 窗外遮罩若还在，会挡住注入的落点，先撤掉。
-        blocker?.detachAll()
         // 先重探一次窗口：用户可能刚拖过/缩放过小窗，用旧边界会把落点点偏。
         observeLayout()
+        // 重探之后仍然没有小窗（比如它还在展开动画里、或者已经被关掉了）→ **什么都别做**。
+        // 拿旧边界硬注入会在那个坐标上凭空滑一下，点到当时恰好在那儿的应用。
+        if (lastFreeformBounds == null) {
+            DebugLog.warn("CLOSE_NO_WINDOW", "重探后仍没识别到小窗（还在展开动画里？），这次不注入")
+            closing = false
+            return
+        }
+        // 窗外遮罩若还在，会挡住注入的落点，先撤掉。
+        blocker?.detachAll()
         closeStartBounds = lastFreeformBounds?.let { Rect(it) }
         val store = SettingsStore(this)
         DebugLog.info(
@@ -378,72 +826,162 @@ class FreeformAccessibilityService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         handler.postDelayed(
             {
-                performClose(store.outsideTapCloseMode, isRetry = false)
+                performCloseMode(store.outsideTapCloseMode, isRetry = false)
                 handler.postDelayed({ recheck() }, RECHECK_DELAY_MS)
             },
             INJECT_HANDOFF_MS,
         )
     }
 
-    /** 按当前策略执行一次关闭动作。 */
-    private fun performClose(mode: String, isRetry: Boolean): Boolean =
+    /**
+     * 按当前「关闭方式」执行一次关闭动作——「点窗外」和内置的「关闭小窗」工具都走这里。
+     *
+     * 语义是**唯一**的：把这扇小窗关掉。早先这里还分叉出一条「收成迷你浮窗」的路
+     * （拖窗口右下角缩到最小），那条手势在真机上不成立、还会把关闭本身带坏，已整体下线。
+     * 迷你窗交给 ColorOS 原生手势（用户自己滑小横条），本软件不插手。
+     */
+    private fun performCloseMode(mode: String, isRetry: Boolean): Boolean =
         when (mode) {
-            SettingsStore.CLOSE_MODE_SHIZUKU -> {
-                sendBackViaShizuku()
-                true
-            }
-
-            SettingsStore.CLOSE_MODE_BACK -> {
-                sendBack()
-                true
-            }
-
             SettingsStore.CLOSE_MODE_SYSTEM -> clickSystemCloseEntry(isRetry)
 
             // ColorOS 手势模式自带：在小窗底部横条上「快速上滑」= 关闭浮窗。用无障碍重放一次即可。
             SettingsStore.CLOSE_MODE_SWIPE_UP -> swipeUpOnCaption(isRetry)
 
-            // 默认（含未知取值）：在小窗底部横条上模拟一次「快速上滑」。
+            // 用小横条的**真实坐标**关闭（坐标来自系统日志，不用校准）。见 [closeViaCaption]。
+            SettingsStore.CLOSE_MODE_CAPTION_AUTO -> closeViaCaption(isRetry)
+
+            // 同样用真实坐标，但是**单击**小横条——ColorOS 上点它就是直接关掉自由窗。
+            SettingsStore.CLOSE_MODE_TAP_AUTO -> tapViaCaption(isRetry)
+
+            // 默认（含未知取值、含已下线的「返回键」两种取值）：模拟一次「快速上滑」。
             else -> swipeUpOnCaption(isRetry)
         }
 
-    private fun sendBack() {
-        val handled = performGlobalAction(GLOBAL_ACTION_BACK)
-        DebugLog.info("OUTSIDE_TAP_BACK", "performGlobalAction(BACK)=$handled")
+    /**
+     * 用小横条的**真实坐标**关闭。
+     *
+     * 坐标是 ColorOS 自己打在日志里的（见 [FreeformCaption]），比按小窗边界估算准得多，
+     * 也不需要用户校准。但它**跟着窗口走**：换个窗、把窗口拖到别处，旧坐标就指到空处去了。
+     * 所以用之前必须再验一次——坐标要落在当前小窗里（放宽几十像素）。
+     *
+     * 验不过或压根没学到，就退回按边界估算的老路子（[swipeUpOnCaption]），
+     * 保证这个模式在任何情况下都关得掉；两条路各走没走通都会写进日志。
+     */
+    private fun closeViaCaption(isRetry: Boolean): Boolean {
+        val bounds = lastFreeformBounds
+        val point = usableCaptionPoint(bounds, "CLOSE_CAPTION")
+        if (point == null) {
+            DebugLog.warn(
+                "CLOSE_CAPTION_MISS",
+                "日志里读不到可用的小横条坐标（用户还没碰过横条？），退回按边界估算",
+            )
+            return swipeUpOnCaption(isRetry)
+        }
+        DebugLog.info("CLOSE_CAPTION_USE", "小横条真实坐标 ($point) 窗口=$bounds")
+        if (FreeformCaption.closeSwipe()) return true
+        DebugLog.warn("CLOSE_CAPTION_INJECT_FAILED", "注入失败，退回按边界估算")
+        return swipeUpOnCaption(isRetry)
     }
-
-    // ---- 点小横条坐标（主力策略） ----
 
     /**
-     * 按坐标点小窗底部的小横条。
+     * 「轻点一下就关」的关闭方式。
      *
-     * 小横条相对小窗底边的位置是稳定的，所以只要不换 ROM 版本，这两个量就一直有效。
-     * 拿不到小窗边界（比如刚从后台唤起、窗口信息还没刷新）时返回 false，由上层复检重试。
+     * ## 为什么底层是**很短的快速上滑**，不是 `input tap`
+     *
+     * 用户最初要的是「单击小横条关闭」，我第一版真的用了 `input tap`。实测下来是**两段式**：
+     * 第一下点在小横条上 ColorOS 不认（它把按下当成了「准备拖动标题栏」），窗口没关，
+     * 于是走复检重试、第二下才关掉——用户看到的就是「点一下没反应，得再点一次」。
+     *
+     * 而**快速上滑小横条**是唯一实测一次就生效的动作（日志里
+     * `CLOSE_SWIPE_UP (635,1871)->(635,1362) 48ms` 一次成功）。所以这条路改成用一次
+     * **很短**的快速上滑来实现「点一下」的体感：距离只有常规关闭的 [TAP_SWIPE_FRACTION] 倍，
+     * 时长 [TAP_SWIPE_DURATION_MS]ms。
      */
-    private fun tapCloseAnchor(isRetry: Boolean): Boolean {
+    private fun tapViaCaption(isRetry: Boolean): Boolean {
         val bounds = lastFreeformBounds ?: run {
-            DebugLog.warn("CLOSE_ANCHOR_MISS", "还不知道小窗边界，跳过", null)
+            DebugLog.warn("CLOSE_TAP_NO_BOUNDS", "还不知道小窗边界，跳过", null)
             return false
         }
-        val store = SettingsStore(this)
-        val point = closeAnchorPoint(bounds, store)
-        // 小横条是一条水平居中的窄带，第一次没点中通常是**纵向**偏了（贴太靠外或太靠里），
-        // 横向保持中点不动，只把落点往窗口内侧抬一点再试。
-        val shift = CornerGeometry.dp(this, CLOSE_ANCHOR_RETRY_SHIFT_DP).toFloat()
-        val target = if (isRetry) point.first to (point.second - shift) else point
-        // 优先 Shizuku 注入受信任点击，可靠命中横条；不可用回退无障碍手势。
-        if (ShizukuShell.hasPermission) {
-            DebugLog.info("CLOSE_ANCHOR_TAP", "Shizuku 注入 (${target.first.toInt()},${target.second.toInt()})")
-            return ShizukuShell.injectTap(target.first.toInt(), target.second.toInt())
+        // 落点：真实坐标优先，拿不到就用按边界估算的（那条落点已经被证明能压中横条）。
+        val point = usableCaptionPoint(bounds, "CLOSE_TAP")
+        val startX: Int
+        val startY: Int
+        if (point != null) {
+            startX = point.x
+            startY = point.y
+            DebugLog.info("CLOSE_TAP_USE", "落点=小横条真实坐标 ($startX,$startY)")
+        } else {
+            val estimated = closeAnchorPoint(bounds, SettingsStore(this))
+            startX = estimated.first.toInt()
+            startY = estimated.second.toInt()
+            DebugLog.info("CLOSE_TAP_USE_ESTIMATED", "落点=按边界估算 ($startX,$startY) 窗口=$bounds")
         }
-        return dispatchTap(target.first, target.second, CLOSE_ANCHOR_TAP_MS, "CLOSE_ANCHOR_TAP")
+        val shortEdge =
+            minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
+        val factor = if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f
+        val distance = (shortEdge * TAP_SWIPE_FRACTION * factor).toInt()
+        val toY = (startY - distance).coerceAtLeast(0)
+        val durationMs = TAP_SWIPE_DURATION_MS
+        if (ShizukuShell.hasPermission) {
+            DebugLog.info("CLOSE_TAP_SWIPE", "(Shizuku) ($startX,$startY)->($startX,$toY) ${durationMs}ms")
+            return ShizukuShell.injectSwipe(startX, startY, startX, toY, durationMs)
+        }
+        val path =
+            Path().apply {
+                moveTo(startX.toFloat(), startY.toFloat())
+                lineTo(startX.toFloat(), toY.toFloat())
+            }
+        val dispatched =
+            runCatching {
+                dispatchGesture(
+                    GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.toLong()))
+                        .build(),
+                    null,
+                    null,
+                )
+            }.onFailure { DebugLog.warn("CLOSE_TAP_SWIPE_FAILED", "($startX,$startY)", it) }
+                .getOrDefault(false)
+        DebugLog.info(
+            "CLOSE_TAP_SWIPE",
+            "(无障碍) ($startX,$startY)->($startX,$toY) ${durationMs}ms 提交=$dispatched",
+        )
+        return dispatched
     }
+
+    /**
+     * 学过的小横条坐标——**且确实属于当前这扇窗**——才返回它，否则 null。
+     *
+     * 「学过」不等于「现在能用」：坐标跟着窗口走，换个窗、把窗拖到别处，旧坐标就指到空处去了。
+     * 两种用法（上滑关闭 / 单击关闭）都要这一层校验，所以抽在这里。
+     */
+    private fun usableCaptionPoint(bounds: Rect?, tag: String): android.graphics.Point? {
+        if (!FreeformCaption.isUsable()) {
+            FreeformCaption.refresh(this, force = true)
+        }
+        val point = FreeformCaption.cachedPoint() ?: return null
+        if (bounds != null && !nearFreeform(point, bounds)) {
+            DebugLog.warn("${tag}_STALE", "学到的坐标 $point 不在当前小窗 $bounds 里（多半是上一扇窗留下的），忽略")
+            return null
+        }
+        return point
+    }
+
+    /** 坐标是否落在（或紧贴）小窗里。给 [CLOSE_CAPTION_SLACK_PX] 的余量容错。 */
+    private fun nearFreeform(point: android.graphics.Point, bounds: Rect): Boolean =
+        point.x >= bounds.left - CLOSE_CAPTION_SLACK_PX &&
+            point.x <= bounds.right + CLOSE_CAPTION_SLACK_PX &&
+            point.y >= bounds.top - CLOSE_CAPTION_SLACK_PX &&
+            point.y <= bounds.bottom + CLOSE_CAPTION_SLACK_PX
+
+    // ---- 在小横条上注入手势 ----
 
     /**
      * 在小窗底部横条上模拟一次「**快速上滑**」——ColorOS 手势模式自带的关闭手势。
      *
-     * 与 [tapCloseAnchor] 不同：这里不是单击，而是一条从横条位置**向上、时长很短**的滑动轨迹，
-     * 系统会把手势识别成「关闭浮窗」。优点是不依赖任何第三方注入、也不碰横条的拖动功能。
+     * 是一条从横条位置**向上、时长很短**的滑动轨迹，系统会把手势识别成「关闭浮窗」。
+     * 优点是不碰横条的拖动功能，而且这是 ColorOS 上唯一实测「一次就生效」的关闭动作
+     * （所以 [tapViaCaption] 的「轻点一下关闭」底下用的也是它，只是距离更短）。
      *
      * 重试时把上滑距离放大一点，给窗口状态刷新留余量。
      */
@@ -505,21 +1043,6 @@ class FreeformAccessibilityService : AccessibilityService() {
         val x = bounds.left + bounds.width() * ratio
         val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDp)).toFloat()
         return x to y
-    }
-
-    /** 提交一次单击手势。 */
-    private fun dispatchTap(x: Float, y: Float, durationMs: Long, logTag: String): Boolean {
-        val path = Path().apply { moveTo(x, y) }
-        val gesture =
-            GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs))
-                .build()
-        val dispatched =
-            runCatching { dispatchGesture(gesture, null, null) }
-                .onFailure { DebugLog.warn("${logTag}_FAILED", "($x,$y)", it) }
-                .getOrDefault(false)
-        DebugLog.info(logTag, "(${x.toInt()},${y.toInt()}) 提交=$dispatched")
-        return dispatched
     }
 
     // ---- 关闭落点标记（校准用） ----
@@ -757,7 +1280,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         retryCount++
         DebugLog.info("OUTSIDE_TAP_RETRY", "小窗仍在，重试一次（第 $retryCount 次）")
-        performClose(store.outsideTapCloseMode, isRetry = true)
+        performCloseMode(store.outsideTapCloseMode, isRetry = true)
         handler.postDelayed({ recheck() }, RECHECK_DELAY_MS)
     }
 
@@ -775,19 +1298,6 @@ class FreeformAccessibilityService : AccessibilityService() {
         val startArea = start.width().toLong() * start.height()
         val nowArea = now.width().toLong() * now.height()
         return startArea > 0 && nowArea < startArea * CLOSING_AREA_RATIO
-    }
-
-    private fun sendBackViaShizuku() {
-        Thread(
-            {
-                val result = ShizukuShell.run("input keyevent KEYCODE_BACK")
-                DebugLog.info(
-                    "OUTSIDE_TAP_SHIZUKU",
-                    "exit=${result.exitCode} 输出=${(result.stdout + result.stderr).trim()}",
-                )
-            },
-            "outside-tap-shizuku",
-        ).start()
     }
 
     private fun forceStopViaShizuku() {
@@ -821,7 +1331,30 @@ class FreeformAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val FULLSCREEN_RATIO_PERCENT = 92L
+
+        /**
+         * 小窗刚被拉起后的「落定探测」：间隔与次数。
+         *
+         * 小窗是从全屏**动画放大/缩小**到小窗尺寸的，动画期间它的边界接近全屏，会被
+         * [FULLSCREEN_RATIO_PERCENT] 那条规则当成普通全屏应用跳过——于是遮罩晚挂，
+         * 用户这时候点「窗外」会点到下面的应用（反馈里那句「得等一秒、提前点会点到下方应用」）。
+         * 启动后按这个节奏多探几次，等它落定就立刻把遮罩挂上。
+         */
+        private const val SETTLE_WATCH_INTERVAL_MS = 120L
+        private const val SETTLE_WATCH_TICKS = 20
         private const val MIN_RATIO_PERCENT = 8L
+
+        /** 「全屏应用已经落定」要连续命中几次（见 [fullscreenSettled]）。 */
+        private const val FULLSCREEN_STABLE_TICKS = 2
+
+        /**
+         * 「全屏兜住」最多挂多久。
+         *
+         * 兜底只是为了让「小窗还在展开动画里」那几百毫秒不穿透，**绝不能变成一块长期挡屏的
+         * 遮罩**。超过这个时间无论认没认出小窗都要放手——漏一次穿透是可以接受的，
+         * 把用户整个屏幕挡住、点哪儿都没反应是不可接受的。
+         */
+        private const val CAPTURE_MAX_MS = 1_200L
         private const val BOTTOM_GESTURE_INSET_DP = 24
 
         /** 发出关闭动作后等多久复检。太短会误判（小窗还没退场），太长手感迟钝。
@@ -833,6 +1366,25 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 提到 600ms：收起动画比预想的更久，450ms 时窗口还在，那一刀补上去就是用户说的
          * 「卡了一下，先变小再关」。 */
         private const val RECHECK_DELAY_MS = 600L
+
+        /**
+         * 关闭流程超过这么久还没收尾，就认为它已经死了并强制复位。
+         *
+         * 不复位的话 [closing] 会永远停在 true，[refresh] 永远提前返回，遮罩再也挂不回来——
+         * 用户看到的就是「小窗开着但点得动下面的应用」+「把窗外关闭关掉再打开也没用」。
+         */
+        private const val CLOSING_TIMEOUT_MS = 2_500L
+
+        /** 校验「学到的小横条坐标」是否属于当前小窗时给的容错余量（px）。 */
+        private const val CLOSE_CAPTION_SLACK_PX = 48
+
+        /**
+         * 「轻点一下关闭」（[tapViaCaption]）那次上滑的距离——占屏幕短边的比例，以及时长。
+         *
+         * 只有常规关闭（默认 40%）的一半，时长也短，所以体感上就是「点了一下」而不是「划了一下」。
+         */
+        private const val TAP_SWIPE_FRACTION = 0.20f
+        private const val TAP_SWIPE_DURATION_MS = 60
 
         /** 撤掉捕获层/遮罩后到注入之间的等待（约一帧），让 WindowManager 真正移除窗口。 */
         private const val INJECT_HANDOFF_MS = 40L
@@ -852,12 +1404,6 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 也不要盲目补刀。
          */
         private const val MAX_RETRY = 1
-
-        /** 点小横条的按压时长。 */
-        private const val CLOSE_ANCHOR_TAP_MS = 60L
-
-        /** 重试时落点向上抬的距离，用于覆盖小横条命中范围的边缘。 */
-        private const val CLOSE_ANCHOR_RETRY_SHIFT_DP = 6
 
         /**
          * 上滑失败重试时把距离放大的倍数。
@@ -882,6 +1428,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val MAX_NODE_DEPTH = 24
         private const val MAX_NODE_COUNT = 400
 
+        /** 识屏遍历的上限。比关闭入口宽松——识屏就是要尽量读全一屏文字。 */
+        private const val TOOL_MAX_NODE_DEPTH = 40
+        private const val TOOL_MAX_TEXT_COUNT = 600
+
         /** 宽泛关键词的节点必须离小窗顶边这么近才算关闭入口。 */
         private const val CLOSE_ENTRY_PROXIMITY_DP = 48
 
@@ -905,6 +1455,16 @@ class FreeformAccessibilityService : AccessibilityService() {
         @Volatile
         private var instance: FreeformAccessibilityService? = null
 
+        /**
+         * 小窗刚被拉起时调一次（见 [OverlayGestureService.launch]）。
+         *
+         * 让服务在接下来两秒多里密集重探窗口，把小窗「落定」的那一刻尽早抓住——
+         * 只靠无障碍事件的话，动画期间那次探测会判不出小窗，遮罩就挂晚了。
+         */
+        fun watchForFreeformWindow() {
+            instance?.startSettleWatch()
+        }
+
         /** 服务实例是否存活（用于设置页状态显示）。 */
         val isConnected: Boolean get() = instance != null
 
@@ -922,8 +1482,46 @@ class FreeformAccessibilityService : AccessibilityService() {
 
         /** 配置变化后立即生效；服务未连接时忽略。 */
         fun refreshIfRunning() {
-            instance?.refresh()
+            // 丢到服务自己的消息队列上跑：`refresh()` 里要查窗口（IPC），
+            // 直接在设置页的主线程里同步跑容易把界面卡住。
+            val service = instance ?: return
+            service.handler.post { service.safeRefresh() }
         }
+
+        /**
+         * 识屏：读取当前屏幕文字。服务未连接返回 null，调用方据此提示用户开无障碍。
+         */
+        fun screenText(): ScreenTextReport? = instance?.collectScreenText()
+
+        /**
+         * 让无障碍服务就地关掉当前小窗（走 [startCloseFlow]，和「点窗外」同一条流程）。
+         *
+         * 给「关闭小窗」这个内置工具用：用户不必非得点窗外，从小窗自己里点一下工具也能关。
+         *
+         * @return false 表示服务没连上，关不了。
+         */
+        fun closeCurrentFreeform(reason: String): Boolean {
+            val service = instance ?: return false
+            service.handler.post { service.startCloseFlow(reason) }
+            return true
+        }
+
+        /**
+         * 注入一次「双指按压」——ColorOS 小布识屏的唤醒手势。
+         *
+         * 返回 false 表示服务未连接或系统拒绝了这次手势，调用方据此决定要不要走自研后备。
+         */
+        fun twoFingerPress(x: Float, y: Float, spreadPx: Float, durationMs: Long): Boolean =
+            instance?.performTwoFingerPress(x, y, spreadPx, durationMs) ?: false
+
+        /**
+         * 截屏：提交一次截屏请求并把结果写进相册。
+         *
+         * 真正的结果通过 [callback] 异步回传；返回值只表示「请求有没有提交出去」。
+         * 服务未连接时返回 false，调用方据此给出可读提示而不是静默失败。
+         */
+        fun takeScreenshot(context: Context, callback: (Boolean, String) -> Unit): Boolean =
+            instance?.captureScreenshot(context.applicationContext, callback) ?: false
 
         /** 从系统设置里读「本服务是否已被用户开启」，比内存标志更可靠。 */
         fun isEnabledInSettings(context: Context): Boolean {

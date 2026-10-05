@@ -2,6 +2,7 @@ package io.github.msecret.flymefreeform
 
 import android.content.ComponentName
 import android.content.Context
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
@@ -33,8 +34,9 @@ import kotlin.math.abs
  * 单击、长按、拖拽三种意图都在 [onTouchEvent] 里按位移与时长区分，避免「子 View 吃掉 DOWN
  * 之后父 View 再也收不到 MOVE」这类经典冲突。
  *
- * 布局：条目等分整条宽度（`weight = 1`），图标尺寸由调用方按屏幕比例给定（[preferredIconPx]），
- * 槽位太窄时自动缩小，所以固定 6 个也不会把窄屏撑破。
+ * 布局：默认条目等分整条宽度（`weight = 1`），图标尺寸由调用方按屏幕比例给定
+ * （[preferredIconPx]），槽位太窄时自动缩小，所以固定 6 个也不会把窄屏撑破；
+ * [packed] 打开时改成「每格刚好一个图标宽、整排居中」（卡片下方那条固定栏用）。
  */
 class PinnedStripView(
     context: Context,
@@ -44,21 +46,55 @@ class PinnedStripView(
     private val onTap: (AppEntry) -> Unit,
     /** 拖拽结束且顺序确实变了：回传新顺序（组件名，首位对应扇形里最低的那一格）。 */
     private val onReorder: (List<ComponentName>) -> Unit,
+    /**
+     * 紧凑排列：槽位不再等分整条宽度，而是「刚好一个图标宽」，整排居中。
+     *
+     * 「已选」条要的是等分槽位——它对应扇形上均匀分布的格子，铺满整条才看得出顺序。
+     * 卡片下方那条固定栏只要几个图标挨着，等分会让它们散得很开，所以那里开这个开关。
+     */
+    private val packed: Boolean = false,
+    /**
+     * 只把**图标本身**当作可点区域。
+     *
+     * 槽位即便紧凑，也还是比图标宽一点（图标外围留了内边距），点内边距里的空白同样会
+     * 命中这一格。开着这个开关时，横向落点必须落在图标范围内（两侧各留
+     * [ICON_TAP_PADDING_DP] 的容差）才算命中；落在空白处返回 -1，调用方据此
+     * 「吃掉这次点击但什么都不做」，避免点空白误开应用。
+     */
+    private val iconOnlyTap: Boolean = false,
 ) : LinearLayout(context) {
 
     private class Slot(
         val entry: AppEntry,
         val root: View,
         val iconHolder: FrameLayout,
+        /** 右上角的红色「－」角标，只在 [removeBadgeVisible] 时显示。 */
+        val removeBadge: TextView,
     )
 
     private val slots = mutableListOf<Slot>()
+
+    /**
+     * 是否在每个图标右上角画一个红底白「－」。
+     *
+     * 管理模式里把它打开，跟网格里绿色的「＋」配成一对：**绿 ＋ 是加、红 － 是删**。
+     * 点一下带红 － 的图标，就把它从这条里移出去（调用方按 [onTap] 里的模式分支处理）。
+     */
+    var removeBadgeVisible: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            refreshRemoveBadges()
+        }
 
     /** 虚拟顺序：第 i 项是「排在第 i 位」的 slot 下标。拖动只改它，不动真实 child 顺序。 */
     private val order = mutableListOf<Int>()
 
     private val handler = Handler(Looper.getMainLooper())
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+    /** [iconOnlyTap] 模式下给图标两侧留的可点容差（px）。 */
+    private val iconTapPadding = dp(ICON_TAP_PADDING_DP)
 
     private var pressedIndex = -1
     private var downX = 0f
@@ -114,8 +150,16 @@ class PinnedStripView(
             val slot = createSlot(entry)
             slots += slot
             order += slots.lastIndex
-            addView(slot.root, LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            // 紧凑模式给固定宽度（图标宽 + 一点余量），整排靠 gravity 居中；默认模式等分整条宽度。
+            val params =
+                if (packed) {
+                    LayoutParams(preferredIconPx + dp(PACKED_SLOT_GAP_DP), ViewGroup.LayoutParams.WRAP_CONTENT)
+                } else {
+                    LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+            addView(slot.root, params)
         }
+        if (packed) gravity = Gravity.CENTER_HORIZONTAL
         visibility = if (apps.isEmpty()) GONE else VISIBLE
         applySizing(width)
     }
@@ -141,6 +185,25 @@ class PinnedStripView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
+        // 右上角红底白「－」：管理模式里表示「点一下就从这条里移出」，与绿色的「＋」配成一对。
+        val size = (preferredIconPx * REMOVE_BADGE_FRACTION).toInt()
+        val badge =
+            TextView(context).apply {
+                text = "－"
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, size * 0.62f)
+                setTextColor(0xFFFFFFFF.toInt())
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background =
+                    GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(REMOVE_BADGE_COLOR)
+                        setStroke(dp(1), 0xFFFFFFFF.toInt())
+                    }
+                layoutParams = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END)
+                visibility = if (removeBadgeVisible) View.VISIBLE else View.GONE
+            }
+        holder.addView(badge)
         val label =
             TextView(context).apply {
                 text = entry.label
@@ -157,14 +220,24 @@ class PinnedStripView(
             label,
             LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
         )
-        return Slot(entry, root, holder)
+        return Slot(entry, root, holder, badge)
+    }
+
+    /** 把 [removeBadgeVisible] 同步到已建好的角标上（切换管理模式时调用）。 */
+    private fun refreshRemoveBadges() {
+        val visibility = if (removeBadgeVisible) View.VISIBLE else View.GONE
+        slots.forEach { slot -> slot.removeBadge.visibility = visibility }
     }
 
     /**
      * 图标尺寸 = 调用方给的 [preferredIconPx]（和下面网格里的一致）；槽位太窄时自动缩小，
      * 最多缩到 [preferredIconPx] 的 70%，不溢出。
+     *
+     * 紧凑模式（[packed]）不用算：槽位宽度在建子 View 时就按图标宽定死了，图标永远是
+     * [preferredIconPx]（固定栏最多 4 个，怎么都放得下）。
      */
     private fun applySizing(availableWidth: Int) {
+        if (packed) return
         if (slots.isEmpty() || availableWidth <= 0) return
         val usable = (availableWidth - paddingLeft - paddingRight).coerceAtLeast(1)
         val slot = usable / slots.size
@@ -243,11 +316,23 @@ class PinnedStripView(
         return super.onTouchEvent(event)
     }
 
+    /**
+     * 落点命中的槽位下标。
+     *
+     * [iconOnlyTap] 打开时只认图标本身：横向落点必须落在图标范围内（两侧各留
+     * [ICON_TAP_PADDING_DP] 的容差），落在槽位里的空白处返回 -1。这样点空白不会误开应用，
+     * 而空白处的事件仍会被本视图消费掉，不会穿透到下层去触发「点面板外关闭」。
+     */
     private fun indexAt(x: Float): Int {
         if (slots.isEmpty() || slotWidth <= 0) return -1
         val base = slots.first().root.left
         val index = ((x - base) / slotWidth).toInt()
-        return if (index in slots.indices) index else -1
+        if (index !in slots.indices) return -1
+        if (!iconOnlyTap) return index
+        val holder = slots[index].iconHolder
+        val left = slots[index].root.left + holder.left - iconTapPadding
+        val right = slots[index].root.left + holder.left + holder.width + iconTapPadding
+        return if (x >= left && x <= right) index else -1
     }
 
     /** 手指所在的虚拟位次，也就是被拖项应当占据的位置。 */
@@ -364,6 +449,16 @@ class PinnedStripView(
 
         /** 图标与槽位宽度之间留的余量，避免 6 个图标紧紧挨在一起。 */
         const val SLOT_GAP_DP = 6
+
+        /** 紧凑模式下每个槽位比图标多出来的宽度，也就是相邻图标之间的间距。 */
+        const val PACKED_SLOT_GAP_DP = 8
+
+        /** [iconOnlyTap] 模式下图标两侧各留的可点容差。给一点点余量，但远小于槽位空白。 */
+        const val ICON_TAP_PADDING_DP = 3
+
+        /** 删除角标：直径为图标的这个比例；底色用系统常见的警示红。 */
+        const val REMOVE_BADGE_FRACTION = 0.36f
+        const val REMOVE_BADGE_COLOR = 0xFFE53935.toInt()
 
         const val DRAG_BACKGROUND = 0xFFF0F0F0.toInt()
     }

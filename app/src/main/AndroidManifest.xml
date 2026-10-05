@@ -22,6 +22,20 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- 「扫一扫 / 付款码」要按 scheme 拉起微信、支付宝。声明出来才能解析到对方。 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="weixin" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="alipays" />
+        </intent>
+        <!--
+          识屏这边**不再需要任何包可见性声明**：小布识屏没有公开入口可以直启，也不吃侧边栏的
+          feature scheme（这两条路都试过、行不通，见 NativeScreenText），现在只靠重放它的
+          唤醒手势——那是纯无障碍注入，不涉及解析别人的组件。
+        -->
     </queries>
 
     <application
@@ -88,6 +102,20 @@
                 android:resource="@xml/freeform_accessibility_service" />
         </service>
 
+        <!-- 通知栏快捷磁贴：一键看状态 / 用 Shizuku 把无障碍写回来（重启后权限被系统清掉时用）。
+             磁贴自己**没有权限**开关无障碍（那是 WRITE_SECURE_SETTINGS 保护的系统设置），
+             只能借 Shizuku 的 shell 身份去写。 -->
+        <service
+            android:name=".FreeformTileService"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="免root小窗"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <!-- 开机 / 应用更新后自动恢复：挂 Shizuku 重连监听 + 服务开着就拉起来。 -->
         <receiver
             android:name=".BootReceiver"
@@ -109,6 +137,21 @@
                 <action android:name="android.intent.action.PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.PACKAGE_FULLY_REMOVED" />
                 <data android:scheme="package" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 「一键锁屏」的设备管理入口。只申请 force-lock，用户需手动激活一次。 -->
+        <receiver
+            android:name=".LockScreenAdmin"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/lock_admin_label"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
             </intent-filter>
         </receiver>
 

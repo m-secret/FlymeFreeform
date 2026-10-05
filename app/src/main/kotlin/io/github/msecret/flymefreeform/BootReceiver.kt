@@ -29,8 +29,19 @@ class BootReceiver : BroadcastReceiver() {
 
             else -> return
         }
+        AppContext.attach(context)
         DebugLog.enabled = SettingsStore(context).debugLogEnabled
         DebugLog.info("BOOT_RECEIVER", "action=${intent.action}")
+        // 开机后无障碍有可能被系统清掉：这里先看一眼（Shizuku 若还没起来，
+        // 稍后 binder 回来的那一刻 [ShizukuShell.startAutoReconnect] 里还会再查一次）。
+        if (SettingsStore(context).enabled) {
+            AccessibilityGrant.restoreIfMissing(context)
+        }
+        A11yTrace.append(
+            context,
+            "BOOT action=${intent.action} 无障碍已开=${FreeformAccessibilityService.isEnabledInSettings(context)} " +
+                "连上=${FreeformAccessibilityService.isConnected}",
+        )
         ShizukuShell.startAutoReconnect()
         if (SettingsStore(context).enabled) {
             DebugLog.info("BOOT_RECEIVER", "上次处于开启状态，自动重启主动呼出服务")

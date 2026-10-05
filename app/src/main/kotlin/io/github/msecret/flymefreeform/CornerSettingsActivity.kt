@@ -40,8 +40,28 @@ class CornerSettingsActivity : Activity() {
     }
 
     /** 预览开关打开时，调参数后刷新扇形预览。 */
+    /**
+     * 「图标大小」下面那行上限说明。宽度/高度一变它的数字也要跟着变，所以留个引用。
+     */
+    private var iconCapHint: TextView? = null
+
     private fun refreshPreview() {
         if (previewOn) OverlayGestureService.setPreview(this, true)
+        refreshIconCapHint()
+    }
+
+    /**
+     * 「图标大小」下面那行说明。
+     *
+     * 图标大小和扇形几何是**完全解耦**的（见 [MenuGeometry.resolve]）：拖它只改图标本身，
+     * 轮盘的形状、位置、张角全都不动。副作用是图标调得比弧上的格子大时会相互重叠——
+     * 那是有意的，由用户自己再调小一点。
+     */
+    private fun iconCapText(): String =
+        "图标大小只改图标本身，不影响扇形的位置与张角。调得比弧上的格子大时会相互重叠，按观感自己取。"
+
+    private fun refreshIconCapHint() {
+        iconCapHint?.text = iconCapText()
     }
 
     /** 恢复所有扇形/触摸区参数到默认值。 */
@@ -142,6 +162,8 @@ class CornerSettingsActivity : Activity() {
                 refreshPreview()
             },
         )
+        // 图标大小的上限由「扇形宽高 + 项数」决定，直接写出来，免得滑块拖了没反应还不知道为什么。
+        root.addView(hint(iconCapText()).also { iconCapHint = it })
         root.addView(
             hint("「宽度」管横向伸展、「高度」管纵向伸展，「离屏幕边距离」管扇形离角落多远——觉得图标靠边就调大它。"),
         )

@@ -1,6 +1,5 @@
 package io.github.msecret.flymefreeform
 
-import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -15,14 +14,14 @@ object MenuGeometry {
     /** 扇形以角落对角线方向为中心。 */
     const val CENTER_ANGLE_DEG = 45f
 
-    /** 张角上限。 */
+    /**
+     * 整条弧的张角（度）——**固定值**。
+     *
+     * 固定是关键：轮盘的形状与位置不该因为「多加了一项」或「把图标调大」而变。
+     * 项数只决定弧内怎么均分（一步 = 张角 ÷ 间隔数），半径只决定弧离角落多远。
+     * 于是：加应用时只有图标在弧内重新分布，轮的边界纹丝不动。
+     */
     const val MAX_SPAN_DEG = 86f
-
-    /** 圆心距与半径的比值（chord = 4.3 × r）。 */
-    const val CHORD_PER_RADIUS = 4.3f
-
-    /** 项数极多时缩图标的底线（dp）。 */
-    const val MIN_ICON_RADIUS_DP = 12f
 
     /** 一次布局的几何结果。 */
     data class Layout(
@@ -33,37 +32,27 @@ object MenuGeometry {
     )
 
     /**
-     * 按项数与横纵半径算出图标半径、步进角、张角、起始角。
+     * 按项数算出图标半径、步进角、张角、起始角。
      *
-     * 半径不在这里被撑大——排不下时缩小图标（见 [MIN_ICON_RADIUS_DP]），保证整条弧贴着角落。
+     * **张角固定**（[MAX_SPAN_DEG]），项数只影响弧内均分，半径只影响弧的位置。
+     * 图标就用调用方给的 `baseIconRadius`，**不做任何封顶**：项数多、图标又调得大时，
+     * 相邻图标会相互重叠——这是有意的取舍（见 [SettingsStore.menuIconDp]），
+     * 由用户自己把图标调小或把弧调大，程序不偷偷替他改尺寸。
      */
     fun resolve(
         count: Int,
-        radiusX: Float,
-        radiusY: Float,
         baseIconRadius: Float,
-        density: Float,
     ): Layout {
         if (count <= 1) {
             return Layout(baseIconRadius, 0f, 0f, CENTER_ANGLE_DEG)
         }
-        val avgRadius = (radiusX + radiusY) / 2f
-        val maxSpanRad = Math.toRadians(MAX_SPAN_DEG.toDouble()).toFloat()
-        val wantedStep =
-            2f * asin(((baseIconRadius * CHORD_PER_RADIUS) / (2f * avgRadius)).coerceIn(0f, 1f))
-        val iconRadius: Float
-        val stepDeg: Float
-        if (wantedStep * (count - 1) > maxSpanRad) {
-            val usedStep = maxSpanRad / (count - 1)
-            val chord = 2f * avgRadius * sin(usedStep / 2f)
-            iconRadius = (chord / CHORD_PER_RADIUS).coerceAtLeast(MIN_ICON_RADIUS_DP * density)
-            stepDeg = Math.toDegrees(usedStep.toDouble()).toFloat()
-        } else {
-            iconRadius = baseIconRadius
-            stepDeg = Math.toDegrees(wantedStep.toDouble()).toFloat()
-        }
-        val spanDeg = stepDeg * (count - 1)
-        return Layout(iconRadius, stepDeg, spanDeg, CENTER_ANGLE_DEG - spanDeg / 2f)
+        val stepDeg = MAX_SPAN_DEG / (count - 1)
+        return Layout(
+            iconRadius = baseIconRadius,
+            stepDeg = stepDeg,
+            spanDeg = MAX_SPAN_DEG,
+            angleStartDeg = CENTER_ANGLE_DEG - MAX_SPAN_DEG / 2f,
+        )
     }
 
     /** 某个槽位的图标圆心（屏幕坐标）。 */

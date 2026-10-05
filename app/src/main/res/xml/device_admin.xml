@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    「一键锁屏」需要的设备管理策略。
+
+    只申请 force-lock 一项——这是锁屏所需的最小权限集，不包含清除数据、重置密码、
+    强制锁定屏幕（改锁屏密码）等任何其它能力。激活页面上会如实展示这份清单。
+-->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <force-lock />
+    </uses-policies>
+</device-admin>

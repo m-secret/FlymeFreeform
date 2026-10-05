@@ -66,9 +66,9 @@ class MenuPreviewView(context: Context) : View(context) {
         this.radiusX = widthDp * density
         this.radiusY = heightDp * density
         this.itemCount = itemCount
-        // 与真实扇形同一套几何：用同一个图标基准半径与半径算布局。
+        // 与真实扇形同一套几何：同一个图标基准半径 → 同一份布局。
         val baseIconRadius = (iconSizeDp.coerceIn(1, 200) * density) / 2f
-        this.layout = MenuGeometry.resolve(itemCount, radiusX, radiusY, baseIconRadius, density)
+        this.layout = MenuGeometry.resolve(itemCount, baseIconRadius)
         invalidate()
     }
 

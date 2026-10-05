@@ -12,22 +12,109 @@ class SettingsStore(context: Context) {
         migrateCloseAnchorIfNeeded()
         migrateTouchAndInsetIfNeeded()
         migrateInsetDefaultTo10IfNeeded()
-        migrateRangeWidthTo30IfNeeded()
+        migrateCornerRangeDefaultsIfNeeded()
+        migrateMenuDimDefaultsIfNeeded()
         migrateCloseModeToSystemIfNeeded()
+        migrateCloseModeAwayFromBackIfNeeded()
         migrateSwipeDurationIfNeeded()
+        migrateCloseAnchorYToZeroIfNeeded()
+        dropRetiredTools()
     }
 
     /**
-     * 上滑时长旧默认 55ms 及更短的值，对 Shizuku 的 `input swipe` 来说太快（<60ms 会退化成
-     * 「瞬移」，系统识别不成滑动）。把 ≤55 的旧值抬到新默认 80ms，只跑一次。
+     * 清掉固定列表里**已经不再是工具**的那两个伪组件。
+     *
+     * 「关闭小窗」「转迷你小窗」曾经被做成扇形里的工具格子，现在改成设置里的「滑小横条时做什么」。
+     * 老配置里固定过它们的用户会看到一格点了没反应的东西（[ToolActions.run] 只会回一句
+     * 「这个工具还没有实现」），所以在启动时顺手摘掉。
+     *
+     * 幂等，不需要 one-shot 标记：列表里没有就什么都不做。
+     */
+    private fun dropRetiredTools() {
+        val retired =
+            listOf(SystemTools.TOOL_CLOSE_WINDOW, SystemTools.TOOL_MINI_WINDOW)
+                .map { SystemTools.componentFor(it) }
+        val pins = pinnedComponents
+        val keptPins = pins.filterNot { retired.contains(it) }
+        if (keptPins.size != pins.size) {
+            pinnedComponents = keptPins
+            DebugLog.info("PIN_RETIRED_TOOL_DROPPED", "扇形里摘掉已下线工具：${pins.size} -> ${keptPins.size}")
+        }
+        val dock = dockComponents
+        val keptDock = dock.filterNot { retired.contains(it) }
+        if (keptDock.size != dock.size) {
+            dockComponents = keptDock
+            DebugLog.info("DOCK_RETIRED_TOOL_DROPPED", "固定栏里摘掉已下线工具：${dock.size} -> ${keptDock.size}")
+        }
+    }
+
+    /**
+     * 「小横条落点距小窗底边」的默认从 8dp 改成 **0**，只跑一次。
+     *
+     * 8dp 是按「小横条贴在底边内侧」估的，实测太靠里：落点会落到横条**上方**的应用内容上，
+     * 表现就是「点了窗外却关不掉」。0 = 紧贴底边，正好压在横条上。
+     * 等于旧默认 8 的视为「没改过」才重置，用户自己调过的值不动。
+     */
+    private fun migrateCloseAnchorYToZeroIfNeeded() {
+        if (preferences.getBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_0, false)) return
+        if (preferences.getInt(KEY_CLOSE_BAR_Y_DP, -999) == LEGACY_DEFAULT_CLOSE_ANCHOR_Y_DP) {
+            preferences.edit().putInt(KEY_CLOSE_BAR_Y_DP, DEFAULT_CLOSE_ANCHOR_Y_DP).apply()
+        }
+        preferences.edit().putBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_0, true).apply()
+    }
+
+    /**
+     * 上滑时长旧默认 80ms 迁到新默认 40ms，只跑一次。
+     *
+     * 40ms 是实测下来 ColorOS 手势模式上「够快、能被识别成甩动」的量级；80ms 反而偏慢，
+     * 小窗会先被当成拖动缩一下。用户自己调过的值（> 旧默认）保持不动。
      */
     private fun migrateSwipeDurationIfNeeded() {
         if (preferences.getBoolean(KEY_SWIPE_DURATION_MIGRATED, false)) return
-        val current = preferences.getInt(KEY_CLOSE_SWIPE_DURATION, DEFAULT_CLOSE_SWIPE_DURATION)
-        if (current <= LEGACY_CLOSE_SWIPE_DURATION_MAX) {
+        val current = preferences.getInt(KEY_CLOSE_SWIPE_DURATION, -1)
+        if (current in 1..LEGACY_DEFAULT_CLOSE_SWIPE_DURATION) {
             preferences.edit().putInt(KEY_CLOSE_SWIPE_DURATION, DEFAULT_CLOSE_SWIPE_DURATION).apply()
         }
         preferences.edit().putBoolean(KEY_SWIPE_DURATION_MIGRATED, true).apply()
+    }
+
+    /**
+     * 主动呼出里触摸区尺寸的新默认：宽 30→40、高 60→70，只跑一次。
+     *
+     * 等于旧默认的视为「没改过」才重置，用户调过的值不动。
+     */
+    private fun migrateCornerRangeDefaultsIfNeeded() {
+        if (preferences.getBoolean(KEY_RANGE_MIGRATED_40_70, false)) return
+        val editor = preferences.edit()
+        val width = preferences.getInt(KEY_RANGE_DP, -1)
+        if (width in 1..LEGACY_RANGE_WIDTH_MAX) {
+            editor.putInt(KEY_RANGE_DP, DEFAULT_RANGE_WIDTH_DP)
+        }
+        val height = preferences.getInt(KEY_RANGE_HEIGHT_DP, -1)
+        if (height in 1..LEGACY_RANGE_HEIGHT_MAX) {
+            editor.putInt(KEY_RANGE_HEIGHT_DP, DEFAULT_RANGE_HEIGHT_DP)
+        }
+        editor.putBoolean(KEY_RANGE_MIGRATED_40_70, true)
+        editor.apply()
+    }
+
+    /**
+     * 扇形宽高的新默认：300 → 170，只跑一次。
+     *
+     * 300dp 的弧在小窗尺度下铺得太开，170dp 更贴近官方那种紧凑的观感。
+     * 同样只重置「还是旧默认值」的那些。
+     */
+    private fun migrateMenuDimDefaultsIfNeeded() {
+        if (preferences.getBoolean(KEY_MENU_DIM_MIGRATED_170, false)) return
+        val editor = preferences.edit()
+        if (preferences.getInt(KEY_MENU_WIDTH_DP, -1) == LEGACY_DEFAULT_MENU_DIM_DP) {
+            editor.putInt(KEY_MENU_WIDTH_DP, DEFAULT_MENU_WIDTH_DP)
+        }
+        if (preferences.getInt(KEY_MENU_HEIGHT_DP, -1) == LEGACY_DEFAULT_MENU_DIM_DP) {
+            editor.putInt(KEY_MENU_HEIGHT_DP, DEFAULT_MENU_HEIGHT_DP)
+        }
+        editor.putBoolean(KEY_MENU_DIM_MIGRATED_170, true)
+        editor.apply()
     }
 
     /**
@@ -46,13 +133,21 @@ class SettingsStore(context: Context) {
         preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_SYSTEM, true).apply()
     }
 
-    /** 触摸区宽度默认从 20 改成 30：等于旧默认 20 的视为没改过，重置为 30。 */
-    private fun migrateRangeWidthTo30IfNeeded() {
-        if (preferences.getBoolean(KEY_RANGE_WIDTH_MIGRATED_30, false)) return
-        if (preferences.getInt(KEY_RANGE_DP, -1) == LEGACY_DEFAULT_RANGE_WIDTH_DP) {
-            preferences.edit().putInt(KEY_RANGE_DP, DEFAULT_RANGE_WIDTH_DP).apply()
+    /**
+     * 把已下线的「返回键关闭」两种取值收回「上滑小横条关闭」，只跑一次。
+     *
+     * 返回键只是让应用**退一层**，并不是关闭小窗——它出现在选项里本身就是个坑：
+     * 选它的人会以为「点窗外＝关掉」，实际小窗还在。两种取值已从选项里去掉，
+     * 存量配置在这里收敛掉，免得它悄悄生效。
+     */
+    private fun migrateCloseModeAwayFromBackIfNeeded() {
+        if (preferences.getBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_BACK, false)) return
+        val mode = preferences.getString(KEY_OUTSIDE_TAP_CLOSE_MODE, null)
+        if (mode == LEGACY_CLOSE_MODE_BACK || mode == LEGACY_CLOSE_MODE_SHIZUKU) {
+            preferences.edit().putString(KEY_OUTSIDE_TAP_CLOSE_MODE, CLOSE_MODE_SWIPE_UP).apply()
+            DebugLog.info("CLOSE_MODE_MIGRATED", "返回键方式（$mode）已下线，改为上滑小横条关闭")
         }
-        preferences.edit().putBoolean(KEY_RANGE_WIDTH_MIGRATED_30, true).apply()
+        preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_BACK, true).apply()
     }
 
     /** 扇形离屏距离默认从 50% 改成 10%：等于旧默认 50 的视为没改过，重置为 10。 */
@@ -69,7 +164,7 @@ class SettingsStore(context: Context) {
     /**
      * 把触摸区旧默认（96dp 正方形）与扇形离屏距离（旧 dp）迁到新基准，只跑一次。
      *
-     * - 触摸区：旧默认是 96。等于 96 的视为「没改过」，重置成新默认（宽 20 / 高 60）。
+     * - 触摸区：旧默认是 96。等于 96 的视为「没改过」，重置成新默认（宽 40 / 高 70）。
      * - 扇形离屏距离：旧的是 dp，新的是屏幕短边百分比，语义不同，直接删旧 key 用新默认 50%。
      */
     private fun migrateTouchAndInsetIfNeeded() {
@@ -231,6 +326,8 @@ class SettingsStore(context: Context) {
         get() = preferences.getString(KEY_OUTSIDE_TAP_CLOSE_MODE, CLOSE_MODE_SWIPE_UP) ?: CLOSE_MODE_SWIPE_UP
         set(value) = preferences.edit().putString(KEY_OUTSIDE_TAP_CLOSE_MODE, value).apply()
 
+
+
     /**
      * 落点在小窗**宽度方向**上的位置，单位是百分比（0 = 贴左边缘，50 = 水平中点，100 = 贴右边缘）。
      *
@@ -251,8 +348,9 @@ class SettingsStore(context: Context) {
     /**
      * 落点相对小窗**底边**的距离，单位 dp，正数表示由底边向窗口内部量。
      *
-     * 小横条在小窗底部，所以基准取底边而不是顶边——按顶边算的话，窗口一被拉高，落点就会
-     * 停在半空。负数表示落在小窗下沿之外。
+     * 默认 **0**：紧贴底边，压在小横条上。给大了落点会跑到横条上方的应用内容里，点了没反应。
+     * 负数表示落在小窗下沿之外。基准取底边而不是顶边——小横条在窗底，按顶边算的话窗口一被拉高
+     * 落点就会停在半空。
      */
     var closeAnchorYDp: Int
         get() = preferences.getInt(KEY_CLOSE_BAR_Y_DP, DEFAULT_CLOSE_ANCHOR_Y_DP)
@@ -406,13 +504,96 @@ class SettingsStore(context: Context) {
                 )
                 .apply()
 
+    /**
+     * 「固定栏」里的项，**有序**，最多 [MAX_DOCK] 个。
+     *
+     * 和 [pinnedComponents] 是两回事：那个决定**扇形里有什么**，这个只是「更多」面板底部
+     * 那一行快捷位，点一下直接打开。两者可以放同样的东西，但互不影响。
+     */
+    var dockComponents: List<ComponentName>
+        get() =
+            preferences.getString(KEY_DOCK, null)
+                .orEmpty()
+                .lineSequence()
+                .mapNotNull(ComponentName::unflattenFromString)
+                .distinct()
+                .take(MAX_DOCK)
+                .toList()
+        set(value) =
+            preferences.edit()
+                .putString(
+                    KEY_DOCK,
+                    value.distinct().take(MAX_DOCK).joinToString("\n", transform = ComponentName::flattenToString),
+                )
+                .apply()
+
+    fun toggleDock(component: ComponentName) {
+        val current = dockComponents
+        val next =
+            if (current.any { it == component }) {
+                current.filterNot { it == component }
+            } else {
+                (current + component).take(MAX_DOCK)
+            }
+        dockComponents = next
+    }
+
+    /**
+     * 「最近使用」的应用，**有序**：最近用的排在最前面，最多 [MAX_RECENT] 个。
+     *
+     * 只记真实应用、不记内置工具——这一行属于「应用」标签页，工具自己有工具网格。
+     * 记录的是「用户点过它」而不是「它启动成功了」：启动失败也一样是最近想用的那个。
+     */
+    var recentComponents: List<ComponentName>
+        get() =
+            preferences.getString(KEY_RECENT, null)
+                .orEmpty()
+                .lineSequence()
+                .mapNotNull(ComponentName::unflattenFromString)
+                .distinct()
+                .take(MAX_RECENT)
+                .toList()
+        set(value) =
+            preferences.edit()
+                .putString(
+                    KEY_RECENT,
+                    value.distinct().take(MAX_RECENT).joinToString("\n", transform = ComponentName::flattenToString),
+                )
+                .apply()
+
+    /** 记一次使用：挪到最前、去重、截断到 [MAX_RECENT]。已经在最前的位置则什么都不写。 */
+    fun noteRecent(component: ComponentName) {
+        val current = recentComponents
+        if (current.firstOrNull() == component) return
+        recentComponents = (listOf(component) + current.filterNot { it == component }).take(MAX_RECENT)
+    }
+
+    /** 拖拽结束后整体写回固定栏顺序，规则与 [reorderPins] 相同。 */
+    fun reorderDock(ordered: List<ComponentName>) {
+        val current = dockComponents
+        if (current.size < 2) return
+        val kept = ordered.filter { candidate -> current.any { it == candidate } }
+        if (kept.isEmpty()) return
+        val missing = current.filterNot { existing -> kept.any { it == existing } }
+        val next = kept + missing
+        if (next == current) return
+        dockComponents = next
+    }
+
+    /**
+     * 加入 / 移出一个扇形固定项。
+     *
+     * **新加入的插到最前**，也就是扇形里最靠近「更多」的那一格——「更多」在弧的最低端，
+     * 所以新项落在扇形**最下面**，和用户在「已选」条里看到的一致（该条从左到右 = 扇形里自上而下，
+     * 最右那一格就是新加进来的）。
+     */
     fun togglePin(component: ComponentName) {
         val current = pinnedComponents
         val next =
             if (current.any { it == component }) {
                 current.filterNot { it == component }
             } else {
-                (current + component).take(MAX_PINS)
+                (listOf(component) + current).take(MAX_PINS)
             }
         pinnedComponents = next
     }
@@ -474,9 +655,9 @@ class SettingsStore(context: Context) {
         private const val KEY_CLOSE_ANCHOR_MARKER = "close_anchor_marker"
         private const val KEY_CLOSE_SWIPE_DISTANCE = "close_swipe_distance_percent"
         private const val KEY_CLOSE_SWIPE_DURATION = "close_swipe_duration_ms"
-        private const val KEY_SWIPE_DURATION_MIGRATED = "swipe_duration_migrated_to_80"
-        /** 迁移阈值：≤ 此值视为旧版过短，重置为新默认。 */
-        private const val LEGACY_CLOSE_SWIPE_DURATION_MAX = 55
+        private const val KEY_SWIPE_DURATION_MIGRATED = "swipe_duration_migrated_to_40"
+        /** 旧默认时长（80ms）。≤ 它的值视为「没改过」，迁移到新默认 40ms。 */
+        private const val LEGACY_DEFAULT_CLOSE_SWIPE_DURATION = 80
 
         /** 旧版「距右边缘」落点的 key，迁移时删除。 */
         private const val KEY_LEGACY_CLOSE_ANCHOR_X_DP = "close_anchor_x_dp"
@@ -496,39 +677,69 @@ class SettingsStore(context: Context) {
         const val MAX_CLOSE_ANCHOR_Y_DP = 120
 
         /**
-         * 距小窗底边的默认距离。小横条是一条很窄的带，就贴在底边内侧，所以给 8dp 而不是
-         * 更靠里的值——给大了落点会跑到小横条**上方**，点在应用内容上。
+         * 「上滑关闭」的落点距小窗底边的距离。
+         *
+         * **默认 0**——紧贴小窗底边，正好压在小横条上。
+         *
+         * 早先给的是 8dp，是按「小横条贴在底边内侧」估的；实测太靠里，落点会落到横条**上方**的
+         * 应用内容上，于是「点了窗外却没关掉」。要微调的话正数往窗内移、负数移到窗沿外。
          */
-        const val DEFAULT_CLOSE_ANCHOR_Y_DP = 8
+        const val DEFAULT_CLOSE_ANCHOR_Y_DP = 0
+
+        /** 旧默认（8dp），迁移时用来识别「没改过」。 */
+        private const val LEGACY_DEFAULT_CLOSE_ANCHOR_Y_DP = 8
+        private const val KEY_CLOSE_ANCHOR_Y_MIGRATED_0 = "close_anchor_y_migrated_to_0"
 
         const val MIN_CLOSE_SWIPE_DISTANCE = 4
-        const val MAX_CLOSE_SWIPE_DISTANCE = 40
+        const val MAX_CLOSE_SWIPE_DISTANCE = 60
         /**
-         * 上滑距离默认取屏幕短边的 16%：1080 短边上约 173px，配 55ms ≈ 3.1px/ms，
-         * 属于「甩一下」的量级，系统才会当成关闭手势而不是拖动。
+         * 上滑距离默认取屏幕短边的 40%：1080 短边上约 430px。
+         *
+         * 距离与时长一起决定系统看到的手势速度。实测 40% 配 40ms 最稳——位移够大、时间够短，
+         * 系统才会当成「甩一下关掉」，而不是先当成拖动把小窗缩一下。
          */
-        const val DEFAULT_CLOSE_SWIPE_DISTANCE = 16
+        const val DEFAULT_CLOSE_SWIPE_DISTANCE = 40
 
         const val MIN_CLOSE_SWIPE_DURATION = 10
         const val MAX_CLOSE_SWIPE_DURATION = 300
         /**
-         * 上滑时长默认 80ms。太快（如 <50ms）时 `input swipe` 会退化成「瞬移」，
-         * 系统识别不成「滑动」也就不会触发关闭；太慢则被当成拖动。80ms 是「快速甩动」的量级。
-         * 下限放开到 10ms，供个别机型/ROM 上需要更快甩动的场景手动下调。
+         * 上滑时长默认 40ms。越短越快、越像「甩」。
+         *
+         * 下限不能再低：太快时 `input swipe` 会退化成「瞬移」，系统压根不把它当滑动。
+         * 40ms 是实测能在 ColorOS 上稳定触发关闭的值，嫌不够跟手的可以往上调。
          */
-        const val DEFAULT_CLOSE_SWIPE_DURATION = 80
+        const val DEFAULT_CLOSE_SWIPE_DURATION = 40
 
         /**
-         * 默认：按坐标点小窗**底部的小横条**。
+         * 按坐标点小窗**底部的小横条**（已弃用，仅保留常量做兼容）。
          *
-         * 这是目前 ColorOS 上唯一与 `exitFlexibleTask` 语义等价、且一次就能关掉的做法——
-         * 点小窗右上角的按钮会弹出二级菜单（还要再选一次），返回键则会把应用退一层。
-         * 落点由 [closeAnchorXPercent] / [closeAnchorYDp] 描述，可以在设置页用准星校准。
+         * 它曾与 `exitFlexibleTask` 语义等价：点小窗右上角的按钮会先弹二级菜单（还要再选一次），
+         * 返回键则只会把应用退一层。
          */
         const val CLOSE_MODE_ANCHOR = "anchor"
 
         /** 在小窗底部横条上模拟一次「快速上滑」——ColorOS 手势模式自带的关闭手势。 */
         const val CLOSE_MODE_SWIPE_UP = "swipe_up"
+
+        /**
+         * 用小横条的**真实坐标**关闭（见 [FreeformCaption]）。
+         *
+         * 这个坐标不是猜的：ColorOS 自己会在用户按到小横条时打日志
+         * （`mStartHandleBottomPoint=Point(x,y)`），我们从日志里读出来即可，
+         * 所以**不需要用户拿准星一点点校准**，窗口拉伸也不会偏。
+         *
+         * 需要 Shizuku：读 logcat 与注入触摸都要 shell 身份。**默认不选它**，
+         * 因为它依赖 Shizuku，而 [CLOSE_MODE_SWIPE_UP] 不依赖任何外部条件。
+         */
+        const val CLOSE_MODE_CAPTION_AUTO = "caption_auto"
+
+        /**
+         * 在学到的小横条**真实坐标**上**单击**一次（见 [FreeformCaption.tapCaption]）。
+         *
+         * ColorOS 上点小横条就是直接关掉自由窗，比点右上角那个按钮少一步——按钮会先弹一个
+         * 二级菜单、还得再选一次。坐标来自系统日志，同样**需要 Shizuku**，默认不选。
+         */
+        const val CLOSE_MODE_TAP_AUTO = "tap_auto"
 
         /**
          * 历史遗留：尝试在小窗标题栏上找系统自己的关闭节点。
@@ -538,8 +749,9 @@ class SettingsStore(context: Context) {
          */
         const val CLOSE_MODE_SYSTEM = "system"
 
-        const val CLOSE_MODE_BACK = "back"
-        const val CLOSE_MODE_SHIZUKU = "shizuku"
+        /** 已下线的「返回键关闭」两种取值，迁移时折算成上滑。 */
+        private const val LEGACY_CLOSE_MODE_BACK = "back"
+        private const val LEGACY_CLOSE_MODE_SHIZUKU = "shizuku"
 
         /** 旧版取值，迁移时统一折算成 [CLOSE_MODE_ANCHOR]。 */
         private const val LEGACY_CLOSE_MODE_POINT = "point"
@@ -547,19 +759,25 @@ class SettingsStore(context: Context) {
 
         const val MIN_RANGE_DP = 10
         const val MAX_RANGE_DP = 200
-        const val DEFAULT_RANGE_WIDTH_DP = 30
-        const val DEFAULT_RANGE_HEIGHT_DP = 60
+        const val DEFAULT_RANGE_WIDTH_DP = 40
+        const val DEFAULT_RANGE_HEIGHT_DP = 70
 
         /** 触摸区旧默认值（正方形边长），迁移时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_RANGE_DP = 96
         private const val KEY_TOUCH_MIGRATED = "touch_range_migrated_to_20_60"
 
-        /** 触摸区宽度上一版默认（20），迁移到 30 时用来识别「没改过」。 */
-        private const val LEGACY_DEFAULT_RANGE_WIDTH_DP = 20
-        private const val KEY_RANGE_WIDTH_MIGRATED_30 = "range_width_migrated_to_30"
+        /**
+         * 触摸区宽/高历史上出现过的默认值，迁移到 40 / 70 时用来识别「没改过」。
+         * 宽度取到 30：20 是最早的默认、30 是上一版默认。
+         */
+        private const val LEGACY_RANGE_WIDTH_MAX = 30
+        private const val LEGACY_RANGE_HEIGHT_MAX = 60
+        private const val KEY_RANGE_MIGRATED_40_70 = "corner_range_migrated_to_40_70"
 
         /** 关闭方式默认从 anchor 改 system 的迁移标记。 */
         private const val KEY_CLOSE_MODE_MIGRATED_SYSTEM = "close_mode_migrated_to_system"
+        /** 「返回键关闭」下线的一次性迁移标记。 */
+        private const val KEY_CLOSE_MODE_MIGRATED_OFF_BACK = "close_mode_migrated_off_back"
 
         /** 扇形离屏距离的旧默认（50%），迁移时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT = 50
@@ -577,6 +795,14 @@ class SettingsStore(context: Context) {
 
         const val MAX_PINS = 6
 
+        /** 「更多」面板底部固定栏的容量。 */
+        const val MAX_DOCK = 4
+        private const val KEY_DOCK = "drawer_dock"
+
+        /** 「更多」面板「应用」标签页里「最近使用」一行的容量。 */
+        const val MAX_RECENT = 8
+        private const val KEY_RECENT = "recent_used"
+
         private const val KEY_MENU_RADIUS_PERCENT = "menu_radius_percent"
         private const val KEY_MENU_HAPTIC = "menu_haptic"
         private const val KEY_MENU_ICON_DP = "menu_icon_dp"
@@ -592,16 +818,20 @@ class SettingsStore(context: Context) {
         const val MAX_MENU_CORNER_INSET_PERCENT = 100
         const val DEFAULT_MENU_CORNER_INSET_PERCENT = 10
 
-        /** 扇形图标直径的调节区间。 */
+        /** 扇形图标直径的调节区间。上限放到 88dp，大屏上想要「图标更大」也能满足。 */
         const val MIN_MENU_ICON_DP = 24
-        const val MAX_MENU_ICON_DP = 52
+        const val MAX_MENU_ICON_DP = 88
         const val DEFAULT_MENU_ICON_DP = 34
 
-        /** 扇形横向/纵向半径的调节区间（dp）。默认 300 约等于之前的 70% 屏幕短边观感。 */
+        /** 扇形横向/纵向半径的调节区间（dp）。 */
         const val MIN_MENU_DIM_DP = 80
         const val MAX_MENU_DIM_DP = 460
-        const val DEFAULT_MENU_WIDTH_DP = 300
-        const val DEFAULT_MENU_HEIGHT_DP = 300
+        const val DEFAULT_MENU_WIDTH_DP = 170
+        const val DEFAULT_MENU_HEIGHT_DP = 170
+
+        /** 扇形宽高的旧默认（300），迁移到 170 时用来识别「没改过」。 */
+        private const val LEGACY_DEFAULT_MENU_DIM_DP = 300
+        private const val KEY_MENU_DIM_MIGRATED_170 = "menu_dim_migrated_to_170"
 
         /** 旧版半径百分比的 key，迁移用。 */
         private const val KEY_DIM_MIGRATED = "menu_dim_migrated_to_width_height"

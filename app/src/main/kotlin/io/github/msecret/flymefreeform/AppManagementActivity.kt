@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.content.ComponentName
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -33,7 +34,8 @@ class AppManagementActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private var catalog: List<AppEntry> = emptyList()
+    private var toolEntries: List<AppEntry> = emptyList()
+    private var appEntries: List<AppEntry> = emptyList()
     private var keyword: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,7 +67,7 @@ class AppManagementActivity : Activity() {
         )
         root.addView(
             hint(
-                "最多固定 ${SettingsStore.MAX_PINS} 个。只有这里选中的应用会出现在扇形里，其余全部走「更多」面板。" +
+                "最多固定 ${SettingsStore.MAX_PINS} 个。只有这里选中的应用与工具会出现在扇形里，其余全部走「更多」面板。" +
                     "已选中的行带序号，可用 ↑ ↓ 调整扇形里的先后——序号 1 挨着「更多」那一格。",
             ),
         )
@@ -128,10 +130,13 @@ class AppManagementActivity : Activity() {
         listContainer.removeAllViews()
         listContainer.addView(hint("正在读取应用列表…"))
         worker.execute {
+            // 工具与应用**分开存**：来源、数量级、用途都不一样，后面要分两块渲染。
+            val tools = SystemTools.load(this)
             val apps = AppCatalog.load(this)
             mainHandler.post {
-                catalog = apps
-                DebugLog.info("CATALOG_LOADED", "已安装=${apps.size}")
+                toolEntries = tools
+                appEntries = apps
+                DebugLog.info("CATALOG_LOADED", "工具=${tools.size} 应用=${apps.size}")
                 render()
             }
         }
@@ -139,36 +144,82 @@ class AppManagementActivity : Activity() {
 
     private fun render() {
         listContainer.removeAllViews()
-        if (catalog.isEmpty()) {
+        if (toolEntries.isEmpty() && appEntries.isEmpty()) {
             listContainer.addView(hint("还没有读到应用。"))
             return
         }
         val pinned = store.pinnedComponents
         val trimmed = keyword.trim()
-        val matched =
-            if (trimmed.isEmpty()) {
-                catalog
-            } else {
-                catalog.filter { it.label.contains(trimmed, ignoreCase = true) }
-            }
-        countView.text = "已固定 ${pinned.size} / ${SettingsStore.MAX_PINS}，匹配 ${matched.size} 个"
-        if (matched.isEmpty()) {
-            listContainer.addView(hint("没有匹配的应用。"))
+        // 工具和应用**分成两块**渲染：混在一张表里既难找，也不好数各自有几个。
+        val tools = filterByKeyword(toolEntries, trimmed)
+        val apps = filterByKeyword(appEntries, trimmed)
+        countView.text =
+            "已固定 ${pinned.size} / ${SettingsStore.MAX_PINS}" +
+                " · 工具 ${toolEntries.size} 个 · 应用 ${appEntries.size} 个"
+        if (tools.isEmpty() && apps.isEmpty()) {
+            listContainer.addView(hint("没有匹配的应用或工具。"))
             return
         }
-        matched.forEach { entry ->
-            val rank = pinned.indexOfFirst { it == entry.component }
-            listContainer.addView(
-                row(entry, rank, pinned.size),
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { bottomMargin = dp(8) },
-            )
+        if (tools.isNotEmpty()) {
+            listContainer.addView(sectionTitle("面板工具", tools, pinned))
+            tools.forEach { entry -> listContainer.addView(row(entry, pinned), rowParams()) }
+        }
+        if (apps.isNotEmpty()) {
+            listContainer.addView(sectionTitle("应用", apps, pinned))
+            apps.forEach { entry -> listContainer.addView(row(entry, pinned), rowParams()) }
         }
     }
 
-    private fun row(entry: AppEntry, rank: Int, pinnedCount: Int): View {
+    private fun filterByKeyword(source: List<AppEntry>, trimmed: String): List<AppEntry> =
+        if (trimmed.isEmpty()) {
+            source
+        } else {
+            source.filter { it.label.contains(trimmed, ignoreCase = true) }
+        }
+
+    /**
+     * 分块小标题，形状：`面板工具 · 12 个（已固定 2）`。
+     *
+     * 用强调色 + 加粗 + 上方一条细分隔线，让「工具」和「应用」两块**一眼就分得开**——
+     * 早先只用了灰色小字，太容易被当成普通说明文字划过去。
+     */
+    private fun sectionTitle(title: String, entries: List<AppEntry>, pinned: List<ComponentName>): View {
+        val fixed = entries.count { entry -> pinned.any { it == entry.component } }
+        val block =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(14), 0, dp(8))
+            }
+        block.addView(
+            View(this).apply {
+                setBackgroundColor(0x1A1D9E75)
+                layoutParams =
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        dp(1),
+                    ).apply { bottomMargin = dp(8) }
+            },
+        )
+        block.addView(
+            TextView(this).apply {
+                text = "$title · ${entries.size} 个（已固定 $fixed）"
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(13f))
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(ACCENT)
+                setPadding(dp(4), 0, dp(4), 0)
+            },
+        )
+        return block
+    }
+
+    private fun rowParams(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(8) }
+
+    private fun row(entry: AppEntry, pinned: List<ComponentName>): View {
+        val rank = pinned.indexOfFirst { it == entry.component }
         val selected = rank >= 0
         val row =
             LinearLayout(this).apply {
@@ -198,7 +249,7 @@ class AppManagementActivity : Activity() {
                 },
             )
             row.addView(
-                orderButton("↓", enabled = rank < pinnedCount - 1) {
+                orderButton("↓", enabled = rank < pinned.size - 1) {
                     store.movePin(entry.component, 1)
                     refreshPins()
                 },

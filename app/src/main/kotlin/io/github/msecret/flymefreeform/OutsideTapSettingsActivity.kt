@@ -48,12 +48,20 @@ class OutsideTapSettingsActivity : Activity() {
                 FreeformAccessibilityService.openSettings(this)
             },
         )
-        root.addView(
+
+        // 其余全是「一般不用动」的调参项：默认收起来，页面一进来只有上面那两项，清爽。
+        val (advancedHeader, advanced) = collapsible("高级设置（一般不用动）")
+        root.addView(advancedHeader)
+        root.addView(advanced)
+
+        advanced.addView(
             switchRow("只遮左右两边（减少误触上下）", store.outsideTapSidesOnly) { checked ->
                 store.outsideTapSidesOnly = checked
                 FreeformAccessibilityService.refreshIfRunning()
             },
         )
+
+        advanced.addView(sectionTitle("关闭方式"))
         lateinit var modeButton: TextView
         modeButton = button("关闭方式：${closeModeLabel(store.outsideTapCloseMode)}") {
             val next = nextCloseMode(store.outsideTapCloseMode)
@@ -61,75 +69,75 @@ class OutsideTapSettingsActivity : Activity() {
             modeButton.text = "关闭方式：${closeModeLabel(next)}"
             FreeformAccessibilityService.refreshIfRunning()
         }
-        root.addView(modeButton)
-        root.addView(
+        advanced.addView(modeButton)
+        advanced.addView(
             hint(
                 "默认「快速上滑小窗底部的小横条」——ColorOS 手势模式自带，不依赖任何第三方。" +
-                    "返回键只会让应用退一层，不是关闭。",
+                    "另外两种靠读系统日志拿到小横条的真实坐标，免校准，但需要装 Shizuku。",
             ),
         )
 
-        root.addView(sectionTitle("上滑手势"))
-        root.addView(
+        advanced.addView(sectionTitle("上滑手势"))
+        advanced.addView(
             seekRow("上滑距离（占屏幕短边 %）", store.closeSwipeDistancePercent,
                 SettingsStore.MIN_CLOSE_SWIPE_DISTANCE, SettingsStore.MAX_CLOSE_SWIPE_DISTANCE) { value ->
                 store.closeSwipeDistancePercent = value
             },
         )
-        root.addView(
+        advanced.addView(
             seekRow("上滑时长（ms）", store.closeSwipeDurationMs,
                 SettingsStore.MIN_CLOSE_SWIPE_DURATION, SettingsStore.MAX_CLOSE_SWIPE_DURATION) { value ->
                 store.closeSwipeDurationMs = value
             },
         )
-        root.addView(
+        advanced.addView(
             hint(
                 "系统靠「距离 ÷ 时长」判断这是甩一下还是拖动：太慢会被当成拖动，小窗先缩一下再关；" +
-                    "太快则可能识别不到。默认 16% / 55ms。若出现「先变小再关」，把时长调小或距离调大。",
+                    "太快则可能识别不到。默认值已调好，出现「先变小再关」时把时长调小、或距离调大。",
             ),
         )
 
-        root.addView(sectionTitle("校准关闭落点"))
-        root.addView(
+        advanced.addView(sectionTitle("校准关闭落点"))
+        advanced.addView(
             switchRow("显示关闭落点准星", store.closeAnchorMarkerEnabled) { checked ->
                 store.closeAnchorMarkerEnabled = checked
                 FreeformAccessibilityService.refreshIfRunning()
             },
         )
-        root.addView(
+        advanced.addView(
             seekRow("点击位置横向（占小窗宽度 %）", store.closeAnchorXPercent,
                 SettingsStore.MIN_CLOSE_ANCHOR_X_PERCENT, SettingsStore.MAX_CLOSE_ANCHOR_X_PERCENT) { value ->
                 store.closeAnchorXPercent = value
                 FreeformAccessibilityService.refreshIfRunning()
             },
         )
-        root.addView(
+        advanced.addView(
             seekRow("点击位置距小窗底边（dp）", store.closeAnchorYDp,
                 SettingsStore.MIN_CLOSE_ANCHOR_Y_DP, SettingsStore.MAX_CLOSE_ANCHOR_Y_DP) { value ->
                 store.closeAnchorYDp = value
                 FreeformAccessibilityService.refreshIfRunning()
             },
         )
-        root.addView(
+        advanced.addView(
             hint(
-                "横向用百分比（50 = 水平中点），纵向从底边向上量。打开准星后小窗底部会出现红点，" +
-                    "调到正好压在小横条上即可。",
+                "只在「按边界估算」的关闭方式下生效。横向用百分比（50 = 水平中点），纵向从底边向上量。" +
+                    "打开准星后小窗底部会出现红点，调到正好压在小横条上即可。",
             ),
         )
 
-        root.addView(sectionTitle("兜底"))
-        root.addView(
+        advanced.addView(sectionTitle("兜底与调试"))
+        advanced.addView(
             switchRow("关不掉时用 Shizuku 停掉该应用", store.outsideTapForceClose) { checked ->
                 store.outsideTapForceClose = checked
             },
         )
-        root.addView(
+        advanced.addView(
             seekRow("标题栏预留（避免挡住小窗标题栏）", store.outsideTapPaddingDp, 0, SettingsStore.MAX_OUTSIDE_TAP_PADDING_DP) { value ->
                 store.outsideTapPaddingDp = value
                 FreeformAccessibilityService.refreshIfRunning()
             },
         )
-        root.addView(
+        advanced.addView(
             switchRow("显示覆盖范围（半透明红）", store.outsideTapDebugOutline) { checked ->
                 store.outsideTapDebugOutline = checked
                 FreeformAccessibilityService.refreshIfRunning()
@@ -139,21 +147,80 @@ class OutsideTapSettingsActivity : Activity() {
         return ScrollView(this).apply { addView(root) }
     }
 
+    /**
+     * 可折叠分区的「标题行 + 内容容器」。
+     *
+     * 默认收起：这一页真正需要用户看的只有「开 / 关」和「去开无障碍」，其余全是
+     * 调参项，摊开会把页面顶得很长、也让人以为每项都必调。
+     *
+     * @return 标题行（加进父容器）与内容容器（后续 addView 都加在它上面）。
+     */
+    private fun collapsible(titleText: String): Pair<View, LinearLayout> {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(24), dp(4), dp(10))
+            isClickable = true
+        }
+        header.addView(
+            View(this).apply {
+                background = GradientDrawable().apply { cornerRadius = dp(2).toFloat(); setColor(ACCENT) }
+                layoutParams = LinearLayout.LayoutParams(dp(4), dp(16))
+            },
+        )
+        header.addView(
+            TextView(this).apply {
+                text = titleText
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(15f))
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(0xFF1A1A1A.toInt())
+                setPadding(dp(8), 0, 0, 0)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            },
+        )
+        val arrow =
+            TextView(this).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
+                setTextColor(ACCENT)
+                text = "展开 ▼"
+            }
+        header.addView(arrow)
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        header.setOnClickListener {
+            val show = body.visibility != View.VISIBLE
+            body.visibility = if (show) View.VISIBLE else View.GONE
+            arrow.text = if (show) "收起 ▲" else "展开 ▼"
+        }
+        return header to body
+    }
+
     private fun closeModeLabel(mode: String): String =
         when (mode) {
-            SettingsStore.CLOSE_MODE_SWIPE_UP -> "上滑小横条关闭（推荐）"
-            SettingsStore.CLOSE_MODE_BACK -> "无障碍返回键（会让应用退一层）"
-            SettingsStore.CLOSE_MODE_SHIZUKU -> "Shizuku 返回键"
-            // anchor 与 system 已从选项里去掉，存量值由迁移转成上滑。
-            else -> "上滑小横条关闭（推荐）"
+            SettingsStore.CLOSE_MODE_TAP_AUTO -> "轻点一下就关（需 Shizuku）"
+            SettingsStore.CLOSE_MODE_CAPTION_AUTO -> "上滑小横条关闭（自动定位，免校准，需 Shizuku）"
+            // 未知/历史取值统一按默认显示：真正生效的方式由 SettingsStore 的迁移收敛。
+            else -> "上滑小横条关闭（按边界估算）"
         }
 
+    /**
+     * 循环切换「怎么关」。
+     *
+     * 只有三种，全部是**真的把小窗关掉**的动作。早先还有「无障碍返回键 / Shizuku 返回键」两项，
+     * 已去掉：返回键只是让应用退一层，并不是关闭小窗，留着只会让人选了个关不掉的。
+     */
     private fun nextCloseMode(mode: String): String =
         when (mode) {
-            SettingsStore.CLOSE_MODE_SWIPE_UP -> SettingsStore.CLOSE_MODE_BACK
-            SettingsStore.CLOSE_MODE_BACK -> SettingsStore.CLOSE_MODE_SHIZUKU
+            SettingsStore.CLOSE_MODE_SWIPE_UP -> SettingsStore.CLOSE_MODE_CAPTION_AUTO
+            SettingsStore.CLOSE_MODE_CAPTION_AUTO -> SettingsStore.CLOSE_MODE_TAP_AUTO
             else -> SettingsStore.CLOSE_MODE_SWIPE_UP
         }
+
+    private fun toast(message: String) {
+        android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
+    }
 
     private fun title(text: String) =
         TextView(this).apply {

@@ -43,6 +43,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppContext.attach(this)
         store = SettingsStore(this)
         setContentView(buildContent())
         refreshStatus()
@@ -80,7 +81,7 @@ class MainActivity : Activity() {
             Ui.hint(
                 this,
                 "角落悬浮窗替代输入 Hook；以小窗启动沿用 ColorOS 的自有协议。" +
-                    "窗外点击关闭、上滑迷你窗、原生侧边栏面板在无 root 下没有等价实现。",
+                    "原生侧边栏面板、收迷你浮窗在无 root 下没有等价实现（迷你浮窗请用 ColorOS 自己滑小横条的手势）。",
             ),
         )
 
@@ -131,6 +132,30 @@ class MainActivity : Activity() {
             FreeformAccessibilityService.openSettings(this)
         }
         root.addView(accessibilityRow.root)
+        root.addView(
+            Ui.button(this, "用 Shizuku 把无障碍写回来") {
+                // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是 WRITE_SECURE_SETTINGS
+                // 保护的系统设置），但 Shizuku 的 shell 身份写得动。没 Shizuku 就只能跳设置页。
+                val ok = AccessibilityGrant.restore(this)
+                android.widget.Toast.makeText(
+                    this,
+                    if (ok) "已写回系统名单，稍等片刻会自动连上" else "没有 Shizuku 权限，只能手动去无障碍设置里打开",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+                mainHandler.postDelayed({ refreshStatus() }, 1_500L)
+            },
+        )
+        root.addView(
+            Ui.hint(
+                this,
+                "重启后如果发现这里的开关被系统关掉了，多半是服务在开机那一下出过错（系统会因此" +
+                    "禁用无障碍服务）。本版本已给服务启动加了保护，并会在开机/Shizuku 就绪时**自动**" +
+                    "把它写回去（记在「调试日志」页能看到的 A11Y_TRACE 里）。" +
+                    "另外可在通知栏加一个快捷磁贴「免root小窗」：状态一目了然，点一下就能修复。" +
+                    "若仍会出现，请到 系统设置 › 应用 › 应用管理 › FlymeFreeform，允许「自启动」，" +
+                    "并关掉电池优化。",
+            ),
+        )
 
         serviceButton = Ui.button(this, "启动主动呼出") { toggleService() }
         root.addView(serviceButton)

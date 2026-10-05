@@ -2,6 +2,7 @@ package io.github.msecret.flymefreeform
 
 import android.content.Context
 import android.graphics.Rect
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -62,8 +63,19 @@ class CornerTriggerView(
      * 回放期间本视图不应该再吃掉任何触摸——调用方会同时把窗口置为不可触摸，这里是第二道保险：
      * 万一属性变更还没生效、回放的那次按压又落到本视图上，**绝不能再次触发回放**。
      * 否则「注入 → 命中自己 → 再注入」会变成无限递归，用户看到的是点了完全没反应。
+     *
+     * **带自愈时限**（见 [PASSTHROUGH_MAX_MS]）：这个标记依赖调用方的回调/定时器来清除，
+     * 而两者都可能不兑现（注入回调不来、`postDelayed` 被 `removeCallbacksAndMessages` 清掉）。
+     * 一旦卡住，触摸条就会永远「吃掉触摸但什么都不做」——表现正是「小窗打开后轮盘再也呼不出来」。
+     * 所以这里不看任何外部信号，超时自己解除。
      */
     var passthroughInFlight: Boolean = false
+        set(value) {
+            if (value && !field) passthroughStartedAt = SystemClock.elapsedRealtime()
+            field = value
+        }
+
+    private var passthroughStartedAt = 0L
 
     /** 手指是否已经移动超过 touchSlop。用于区分「点击」与「滑了一下但不是手势」。 */
     private var movedBeyondSlop = false
@@ -134,7 +146,14 @@ class CornerTriggerView(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         // 回放期间让开：什么都不做，尤其不能再判定成一次「点击」而再次回放。
-        if (passthroughInFlight) return true
+        // 超过时限就当作那次回放已经死了，自己解除，绝不让它把触摸条永久冻住。
+        if (passthroughInFlight) {
+            if (SystemClock.elapsedRealtime() - passthroughStartedAt <= PASSTHROUGH_MAX_MS) {
+                return true
+            }
+            passthroughInFlight = false
+            DebugLog.warn("CORNER_TAP_THROUGH_STUCK", "回放标记超时未清除，已自动解除")
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.rawX
@@ -215,6 +234,14 @@ class CornerTriggerView(
 
         /** 回放按压的最长时长。超过这个值仍是长按语义，但不必真的按住那么久。 */
         const val MAX_TAP_DURATION_MS = 1_500L
+
+        /**
+         * 「回放中」这个标记最长信多久。
+         *
+         * 比调用方的兜底超时（`TAP_THROUGH_TIMEOUT_MS` = 700ms）宽裕一点，正常回放绝不会碰到；
+         * 一旦碰到，说明那次回放的收尾已经丢了，必须自己解除，否则这个角落永久失灵。
+         */
+        const val PASSTHROUGH_MAX_MS = 1_200L
 
         /** 预览模式的半透明色（绿），用于在设置页调整参数时标出触摸区。 */
         const val PREVIEW_COLOR = 0x6628D9A1.toInt()

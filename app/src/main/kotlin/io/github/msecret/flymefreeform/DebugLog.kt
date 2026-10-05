@@ -50,8 +50,19 @@ object DebugLog {
         listeners -= listener
     }
 
+    /** 上次运行的「无障碍事件记录」并进来了没有（只并一次）。 */
+    private var traceReplayed = false
+
     private fun append(priority: Int, code: String, detail: String?, throwable: Throwable?) {
         if (!enabled) return
+        // 第一次真正记日志时，把**上一次运行**留在文件里的无障碍关键事件并进缓冲：
+        // 要查的正是「重启后无障碍怎么没的」，而内存日志一重启就清空了。
+        if (!traceReplayed) {
+            traceReplayed = true
+            AppContext.value?.let { context ->
+                A11yTrace.read(context).forEach { line -> append(Log.INFO, "A11Y_TRACE(上次)", line, null) }
+            }
+        }
         val line =
             buildString {
                 append(formatter.format(Date()))
