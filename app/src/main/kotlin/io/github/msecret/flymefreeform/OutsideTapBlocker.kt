@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 
@@ -17,22 +18,42 @@ import android.view.WindowManager
  *
  * 已知差距（详见 docs/no-root-feasibility.md）：
  * - 小窗拖动/缩放时，遮罩重排依赖无障碍的窗口变化事件，会有短暂错位；
- * - 状态栏与导航栏区域被主动让开，那两块区域的窗外点击不会触发关闭；
+ * - 状态栏、导航栏与**软键盘**区域被主动让开，那几块的窗外点击不会触发关闭。
+ *   键盘必须让开——它正好铺在小窗下方那块遮罩上，不让开的话，在小窗里打字时点一下
+ *   键盘字母就会被当成「点了窗外」，小窗直接关掉；
  * - 小窗边界靠窗口信息推断，若小窗标题栏是独立系统窗口，需要靠外扩 padding 把它让出来。
  */
 class OutsideTapBlocker(private val context: Context) {
 
-    /** 一次布局所需的两个矩形：小窗本体，以及可以铺遮罩的安全区（已抠掉系统栏）。 */
+    /**
+     * 一次布局所需的区域。
+     *
+     * @property freeform 小窗本体
+     * @property safe 可以铺遮罩的安全区（已抠掉状态栏、导航栏与底部手势带）
+     * @property ime 软键盘窗口占据的区域，未弹出时为 null。
+     *   底部遮罩会收缩到它的上沿——键盘正好铺在小窗下方那块遮罩上，不让开的话，
+     *   用户在小窗里打字时点一下键盘字母就会被当成「点了窗外」，小窗直接被关掉。
+     */
     data class Layout(
         val freeform: Rect,
         val safe: Rect,
+        val ime: Rect? = null,
     )
 
     private val windowManager: WindowManager? = context.getSystemService(WindowManager::class.java)
     private val views = LinkedHashMap<String, View>()
 
-    /** 遮罩被点击时的回调，由 [FreeformAccessibilityService] 注入。 */
-    var onOutsideTap: (() -> Unit)? = null
+    /** 最近一次遮罩按压的屏幕坐标，供上层做键盘避让的兜底判断。 */
+    private var downX = 0f
+    private var downY = 0f
+
+    /**
+     * 遮罩被点击时的回调，参数是这次按压的屏幕坐标，由 [FreeformAccessibilityService] 注入。
+     *
+     * 坐标是给「键盘避让」兜底用的：遮罩重排依赖无障碍的窗口变化事件，键盘弹出的瞬间可能慢一拍，
+     * 拿落点再跟当前键盘区域比一次，就不会在那一拍里误关小窗。
+     */
+    var onOutsideTap: ((x: Float, y: Float) -> Unit)? = null
 
     /** 当前生效的遮罩块数，用于日志与设置页展示。 */
     val activeCount: Int get() = views.size
@@ -59,7 +80,15 @@ class OutsideTapBlocker(private val context: Context) {
     // ---- 区域计算 ----
 
     private fun computeRegions(layout: Layout, store: SettingsStore): Map<String, Rect?> {
-        val safe = layout.safe
+        // 软键盘弹出时必须把它让出来：键盘铺在屏幕底部，正好压在「小窗下方」那块遮罩上，
+        // 用户在小窗里打字、点键盘字母时会命中遮罩，被当成「点了窗外」而关掉小窗。
+        //
+        // 做法是把遮罩区域的底边收缩到键盘上沿：键盘之上、小窗之外的区域仍然算窗外，
+        // 点那里照样能关闭小窗，只是键盘本身不再被遮罩盖住。
+        val bottomLimit = layout.ime?.top?.let { minOf(it, layout.safe.bottom) } ?: layout.safe.bottom
+        val safe = Rect(layout.safe.left, layout.safe.top, layout.safe.right, bottomLimit)
+        if (safe.isEmpty) return KEYS.associateWith { null as Rect? }
+
         val pad = CornerGeometry.dp(context, store.outsideTapPaddingDp)
         // 外扩：小窗标题栏/缩放热区可能贴在边界外沿，内缩会让用户拖不动窗。
         val inner = Rect(layout.freeform).apply { inset(-pad, -pad) }
@@ -92,7 +121,16 @@ class OutsideTapBlocker(private val context: Context) {
                     isClickable = true
                     isFocusable = false
                     setBackgroundColor(if (debug) DEBUG_COLOR else Color.TRANSPARENT)
-                    setOnClickListener { onOutsideTap?.invoke() }
+                    // 记下落点后返回 false，事件继续走正常的 click 流程。
+                    // rawX/rawY 是屏幕坐标，上层用它判断这次按压是不是落在软键盘上。
+                    setOnTouchListener { _, event ->
+                        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                            downX = event.rawX
+                            downY = event.rawY
+                        }
+                        false
+                    }
+                    setOnClickListener { onOutsideTap?.invoke(downX, downY) }
                 }
             try {
                 manager.addView(view, buildParams(key, rect))

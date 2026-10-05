@@ -65,7 +65,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         DebugLog.enabled = SettingsStore(this).debugLogEnabled
-        val created = OutsideTapBlocker(this).also { it.onOutsideTap = { onOutsideTap() } }
+        val created = OutsideTapBlocker(this).also { it.onOutsideTap = { x, y -> onOutsideTap(x, y) } }
         blocker = created
         DebugLog.info("A11Y_CONNECTED", "无障碍服务已连接")
         refresh()
@@ -200,7 +200,40 @@ class FreeformAccessibilityService : AccessibilityService() {
         val freeform = best ?: return null
         lastFreeformPackage = bestPackage
         lastFreeformBounds = Rect(freeform)
-        return OutsideTapBlocker.Layout(freeform, safe)
+        // 软键盘区域一并带出去：底部遮罩会收缩到它上沿。
+        // 不这么做的话，在小窗里打字时点键盘字母会命中遮罩，小窗当场被关掉。
+        val ime = imeBounds(windowList)
+        if (ime != null) {
+            DebugLog.info("OUTSIDE_TAP_IME", "软键盘 ${ime.toShortString()}，底部遮罩已让开")
+        }
+        return OutsideTapBlocker.Layout(freeform, safe, ime)
+    }
+
+    /**
+     * 当前软键盘窗口占据的区域，未弹出时返回 null。
+     *
+     * 输入法可能拆成多个窗口（如候选栏 + 键盘本体），这里取并集，保证整块键盘都不被遮罩盖住。
+     */
+    private fun imeBounds(windowList: List<AccessibilityWindowInfo>): Rect? {
+        var result: Rect? = null
+        for (window in windowList) {
+            if (window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
+            val bounds = Rect().also { window.getBoundsInScreen(it) }
+            if (bounds.isEmpty) continue
+            val accumulated = result
+            result =
+                when (accumulated) {
+                    null -> bounds
+                    else ->
+                        Rect(
+                            minOf(accumulated.left, bounds.left),
+                            minOf(accumulated.top, bounds.top),
+                            maxOf(accumulated.right, bounds.right),
+                            maxOf(accumulated.bottom, bounds.bottom),
+                        )
+                }
+        }
+        return result
     }
 
     private fun packageOf(window: AccessibilityWindowInfo): String? =
@@ -306,8 +339,18 @@ class FreeformAccessibilityService : AccessibilityService() {
      *
      * 返回键只作为用户**显式选择**的策略存在，不会被自动回退到。
      */
-    private fun onOutsideTap() {
+    private fun onOutsideTap(x: Float, y: Float) {
         if (closing) return
+        // 兜底：遮罩重排依赖无障碍的窗口变化事件，键盘刚弹出那一刻可能还没来得及收缩到键盘上沿。
+        // 落点在键盘里就直接忽略——宁可这一次不关窗，也不能把用户打字打断。
+        val ime = runCatching { windows }.getOrNull()?.let { imeBounds(it) }
+        if (ime != null && ime.contains(x.toInt(), y.toInt())) {
+            DebugLog.info(
+                "OUTSIDE_TAP_IME_IGNORED",
+                "落点(${x.toInt()},${y.toInt()})在软键盘 ${ime.toShortString()} 上，忽略这次窗外点击",
+            )
+            return
+        }
         startCloseFlow("窗外点击")
     }
 
