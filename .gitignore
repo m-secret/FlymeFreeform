@@ -34,6 +34,10 @@ signing.properties
 secrets.properties
 google-services.json
 
+# 例外：本仓库刻意提交这一份签名密钥，让本地与 CI 签出同一个证书
+# （否则包名相同、签名不同 → 两边的包互相拒绝覆盖安装，见 gradle.properties 注释）。
+!keystore/flymefreeform.jks
+
 # Local AI / agent workspace
 .workbuddy/
 

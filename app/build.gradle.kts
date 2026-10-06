@@ -7,6 +7,16 @@ plugins {
 val flymeFreeformVersionCode = providers.gradleProperty("flymeFreeformVersionCode").get().toInt()
 val flymeFreeformVersionName = providers.gradleProperty("flymeFreeformVersionName").get()
 
+// 固定签名：本地与 CI 共用仓库里这一份密钥，签出来的证书指纹一致，
+// 否则两边的包会因「包名相同、签名不同」互相拒绝覆盖安装。
+// 用 PKCS12 存储并显式声明 storeType，避免依赖 JDK 的默认 KeyStore 类型。
+val sharedStoreFile = rootProject.file(
+    providers.gradleProperty("flymeFreeformStoreFile").getOrElse("keystore/flymefreeform.jks"),
+)
+val sharedStorePassword = providers.gradleProperty("flymeFreeformStorePassword").getOrElse("flymefreeform")
+val sharedKeyAlias = providers.gradleProperty("flymeFreeformKeyAlias").getOrElse("flymefreeform")
+val sharedKeyPassword = providers.gradleProperty("flymeFreeformKeyPassword").getOrElse("flymefreeform")
+
 android {
     namespace = "io.github.msecret.flymefreeform"
     compileSdk {
@@ -21,8 +31,26 @@ android {
         versionName = flymeFreeformVersionName
     }
 
+    // 密钥缺失时（例如只拷走了源码）退回默认调试签名，保证仍能构建，只是签名不稳定。
+    val sharedSigning = if (sharedStoreFile.exists()) {
+        signingConfigs.create("shared") {
+            storeFile = sharedStoreFile
+            storeType = "PKCS12"
+            storePassword = sharedStorePassword
+            keyAlias = sharedKeyAlias
+            keyPassword = sharedKeyPassword
+        }
+    } else {
+        logger.warn("[flymefreeform] 未找到签名密钥 ${sharedStoreFile.path}，回退到默认调试签名。")
+        null
+    }
+
     buildTypes {
+        getByName("debug") {
+            sharedSigning?.let { signingConfig = it }
+        }
         release {
+            sharedSigning?.let { signingConfig = it }
             optimization {
                 enable = true
             }
