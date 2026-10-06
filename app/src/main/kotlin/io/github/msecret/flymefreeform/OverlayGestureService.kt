@@ -5,17 +5,22 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.TypedValue
+import android.view.Display
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.TextView
@@ -33,11 +38,116 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     private val handler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "noroot-worker") }
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_SCREEN_OFF) {
+                hideDrawer()
+            }
+        }
+    }
     private lateinit var windowManager: WindowManager
     private lateinit var store: SettingsStore
     private lateinit var launcher: FreeformLauncher
 
+    /** 上一次已知的「是不是横屏」，用来过滤同一方向上的重复回调（刷新率、亮度变化也会触发）。 */
+    private var lastLandscape: Boolean = false
+
+    /**
+     * 屏幕方向变了（旋转，或横屏下上滑回竖屏桌面）时，把浮层按新屏幕重新摆一遍。
+     *
+     * 面板必须**撤掉**：它是一张铺满整屏、按「打开那一刻」的屏幕尺寸量好的自绘卡片——
+     * 卡片宽高、网格列宽、索引条位置全是写死的像素值。方向一变窗口管理器只会把窗口本身重排，
+     * 卡片内部还是旧尺寸，用户看到的就是「横屏下上滑回桌面，桌面是竖的，面板留了一截卡在屏幕上」。
+     * 直接收起，用户再点一次「更多」就是按新方向量好的一版。
+     */
+    private val displayListener =
+        object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = Unit
+
+            override fun onDisplayRemoved(displayId: Int) = Unit
+
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != Display.DEFAULT_DISPLAY) return
+                handler.post { onScreenGeometryChanged() }
+            }
+        }
+
+    /**
+     * 方向真的变了才动手。
+     *
+     * `onDisplayChanged` 的理由很多（刷新率切换、亮度、分辨率），每次全量重排会很吵；
+     * 而且它读到的 `resources.configuration` 未必已经刷新（那时会读到旧方向、这次就当没发生，
+     * 交给后面一定会到的 [onConfigurationChanged] 那次）。两次入口共用这一个函数，谁先到都行。
+     */
+    private fun onScreenGeometryChanged() {
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (landscape == lastLandscape) return
+        lastLandscape = landscape
+        // 触摸区几何、扇形预览坐标全按「当时的屏幕」算的，方向一变就得重算。
+        // [applySettings] 里已经含一次 [updateTriggerLayout]，这里再显式补一次：它幂等，
+        // 而且「方向刚变」和「尺寸真的刷新」之间系统可能隔几帧，多摆一次不亏。
+        applySettings()
+        updateTriggerLayout()
+        if (previewActive) showMenuPreview()
+        scheduleTriggerSettle()
+        val hadPanel = drawerPanels.isNotEmpty()
+        if (hadPanel) hideDrawer()
+        DebugLog.info(
+            "SCREEN_ORIENTATION_CHANGED",
+            "横屏=$landscape" + if (hadPanel) "，已收起「更多」面板" else "",
+        )
+    }
+
+    /**
+     * 旋转之后把触摸条的位置**连续校正几拍**。
+     *
+     * 方向刚变的那一瞬间，系统还没把新的显示尺寸铺开，就那一次重排可能按旧尺寸落位。
+     * 三个时刻各补一次（幂等、只改已存在窗口的位置，代价可以忽略），等系统这边稳定下来
+     * 自然就对了。`onDestroy` 里 `removeCallbacksAndMessages(null)` 会把它们一并清掉。
+     */
+    private fun scheduleTriggerSettle() {
+        triggerSettleTasks.forEachIndexed { index, task ->
+            handler.removeCallbacks(task)
+            handler.postDelayed(task, TRIGGER_SETTLE_DELAYS_MS[index])
+        }
+    }
+
+    /**
+     * 系统把「配置变了」直接派给服务。
+     *
+     * 多数 ROM 旋转时走的是这条路（[displayListener] 只保证「显示器属性」变化会通知），
+     * 两条都接上、[onScreenGeometryChanged] 自己幂等，谁先到都不会重复干活。
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        handler.post { onScreenGeometryChanged() }
+    }
+
     private val triggerViews = LinkedHashMap<CornerSide, CornerTriggerView>()
+
+    /** 旋转后的「连续校正」任务，见 [scheduleTriggerSettle]。声明一次、反复复用。 */
+    private val triggerSettleTasks: List<Runnable> =
+        TRIGGER_SETTLE_DELAYS_MS.map { Runnable { if (isRunning) updateTriggerLayout() } }
+
+    /**
+     * 触摸条健康巡检：**不依赖任何触摸回调**，自己定时把所有触摸条校正回可用状态。
+     *
+     * 为什么必须有它：触摸条一旦坏掉（窗口被系统摘掉、卡在 `FLAG_NOT_TOUCHABLE`、
+     * 或者重建那一次 addView 恰好失败），它自己**收不到任何触摸**，也就没有任何机会自愈——
+     * 用户看到的就是「小窗打开之后轮盘再也呼不出来，只有重启服务才好」。这类故障已经反复出现过，
+     * 每次都是在某一条具体路径上打补丁，而路径总还有下一条。
+     *
+     * 所以这里反过来做：**不去猜是哪里坏的，只定期检查「它还活着吗」**，坏掉就重建。
+     * 巡检本身只读几个字段（`isAttachedToWindow` / 窗口标志），没坏时一个 IPC 都不发。
+     */
+    private val triggerWatchdog =
+        object : Runnable {
+            override fun run() {
+                if (!isRunning) return
+                checkTriggers()
+                handler.postDelayed(this, TRIGGER_WATCHDOG_MS)
+            }
+        }
     private var menuView: RadialMenuView? = null
     /** 当前最上面那个「更多」面板（没有就是 null）。真正的账在 [drawerPanels] 里。 */
     private val drawerView: AppDrawerPanel? get() = drawerPanels.lastOrNull()
@@ -85,8 +195,27 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     private var activeSide: CornerSide? = null
 
+    /**
+     * 这一次「更多」面板是从哪一侧呼出来的。
+     *
+     * 不能直接用 [activeSide]：那边在 [removeMenu] 里会被置空，而打开面板前必定先撤轮盘
+     * （见 `onGestureCommit` / `onMenuTapped`），等走到 `showDrawer` 时它已经是 null 了。
+     * 横屏「跟随呼出边」要的正是这个信息（见 [resolvedLandscapeSide]），所以在撤轮盘**之前**
+     * 就把它抄下来。
+     */
+    private var drawerSide: CornerSide? = null
+
     /** 当前被临时扩展为全屏的触摸条。手势期间必须扩展，否则手指滑出角落就会收到 CANCEL。 */
     private var expandedSide: CornerSide? = null
+
+    /**
+     * [expandedSide] 是什么时候置上的。
+     *
+     * 用来给「手势进行中」加一个**时限**：这个状态本该由收尾回调清掉，而收尾回调是可以不来的
+     * （手势被系统掐断、中途跳出小窗……）。没有时限的话，巡检会把「残留的手势状态」永远当成
+     * 「用户正在用」，一个窗口都不敢碰——那正是它要防的那种永久失灵。
+     */
+    private var expandedAt = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -95,10 +224,18 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         AppContext.attach(this)
         windowManager = getSystemService(WindowManager::class.java)
         store = SettingsStore(this)
+        registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        // 先记下当前方向，之后的回调才有「变没变」的基准。
+        lastLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        getSystemService(DisplayManager::class.java)?.registerDisplayListener(displayListener, handler)
         launcher = FreeformLauncher()
         isRunning = true
         DebugLog.enabled = store.debugLogEnabled
         createNotificationChannel()
+        // 触摸条巡检随服务常驻（见 [triggerWatchdog]）：它是「轮盘忽然再也呼不出来」唯一的
+        // 系统性自愈手段，不能挂在任何一次性的路径上。`onDestroy` 的
+        // `removeCallbacksAndMessages(null)` 会把它一并停掉。
+        handler.postDelayed(triggerWatchdog, TRIGGER_WATCHDOG_MS)
         // 服务随开机/更新后重新拉起时会走这里：顺手把 Shizuku 重连监听挂上，授权能自动恢复。
         ShizukuShell.startAutoReconnect()
         DebugLog.info("SERVICE_CREATED")
@@ -130,19 +267,101 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 setTriggerPreview(intent.getBooleanExtra(EXTRA_PREVIEW, false))
                 return START_STICKY
             }
+            // 拖滑块时的**实时预览同步**：只按传来的临时参数重画预览与触摸条几何。
+            //
+            // 刻意单独开一个 action，而不是复用 ACTION_START：后者会顺带 `refreshApps()` 把整个
+            // 应用列表重枚举一遍，拖动时每帧一次根本扛不住。这里既不落库也不枚举，只有几次
+            // `updateViewLayout` + 一次 `invalidate`。
+            ACTION_PREVIEW_SYNC -> {
+                startAsForeground()
+                applyLivePreview(intent)
+                return START_STICKY
+            }
         }
+        // 走默认分支 = 一次**完整重载**（ACTION_START 或裸 startService）。此时用户已经抬手、
+        // 设置已落库，store 才是权威，把手里的临时草稿丢掉，免得它盖住刚提交的值。
+        livePreview = null
         startAsForeground()
         applySettings()
         refreshApps()
         return START_STICKY
     }
 
+    private var previewActive = false
+
+    /**
+     * 设置页**正在拖动滑块时**的临时参数（不落库）。
+     *
+     * 为什么需要它：滑块的即时反馈走的是 `onLive`，拖动过程中 `SettingsStore` 里的值**还没变**
+     * （要等抬手 `onCommit` 才写），而预览（触摸条绿块 + 扇形弧）一直读 store，于是拖动时纹丝不动、
+     * 一松手才跳到新值——用户要看的偏偏是拖动过程。
+     *
+     * 它只被 [ACTION_PREVIEW_SYNC] 写、只被预览读；抬手后走一次完整重载就会被清掉（见
+     * [onStartCommand] 的默认分支），所以它是「草稿」而不是新的一份设置。
+     */
+    private var livePreview: LivePreviewParams? = null
+
+    /** [livePreview] 的载体：设置页那一组滑块对应的七个值。 */
+    private data class LivePreviewParams(
+        val rangeWidthDp: Int,
+        val rangeHeightDp: Int,
+        val edgeInsetDp: Int,
+        val menuWidthDp: Int,
+        val menuHeightDp: Int,
+        val cornerInsetPercent: Int,
+        val iconDp: Int,
+    )
+
+    // ---- 生效值：有草稿用草稿，没草稿用落库的设置。预览与几何都从这里取。 ----
+    //
+    // 尺寸类的三个统一产出**像素**：没有草稿时仍然走 [CornerGeometry]（口径只在那一个地方定义），
+    // 有草稿时才就地换算。菜单类的几个是原始 dp（[MenuPreviewView] 自己乘 density）。
+
+    private val triggerWidthPx: Int
+        get() = livePreview?.let { CornerGeometry.dp(this, it.rangeWidthDp) }
+            ?: CornerGeometry.triggerWidth(this, store)
+
+    private val triggerHeightPx: Int
+        get() = livePreview?.let { CornerGeometry.dp(this, it.rangeHeightDp) }
+            ?: CornerGeometry.triggerHeight(this, store)
+
+    private val triggerEdgeBandPx: Int
+        get() = livePreview?.let { CornerGeometry.dp(this, it.edgeInsetDp) }
+            ?: CornerGeometry.edgeInset(this, store)
+
+    private val effectiveMenuWidthDp: Int get() = livePreview?.menuWidthDp ?: store.menuWidthDp
+    private val effectiveMenuHeightDp: Int get() = livePreview?.menuHeightDp ?: store.menuHeightDp
+    private val effectiveCornerInsetPercent: Int
+        get() = livePreview?.cornerInsetPercent ?: store.menuCornerInsetPercent
+    private val effectiveIconDp: Int get() = livePreview?.iconDp ?: store.menuIconDp
+
+    /** 收到拖滑块的实时参数：只重画预览与触摸条几何，不落库、不重枚举应用。 */
+    private fun applyLivePreview(intent: Intent) {
+        livePreview =
+            LivePreviewParams(
+                rangeWidthDp = intent.getIntExtra(EXTRA_RANGE_W, store.cornerRangeDp),
+                rangeHeightDp = intent.getIntExtra(EXTRA_RANGE_H, store.cornerRangeHeightDp),
+                edgeInsetDp = intent.getIntExtra(EXTRA_EDGE_INSET, store.edgeInsetDp),
+                menuWidthDp = intent.getIntExtra(EXTRA_MENU_W, store.menuWidthDp),
+                menuHeightDp = intent.getIntExtra(EXTRA_MENU_H, store.menuHeightDp),
+                cornerInsetPercent = intent.getIntExtra(EXTRA_CORNER_INSET, store.menuCornerInsetPercent),
+                iconDp = intent.getIntExtra(EXTRA_ICON, store.menuIconDp),
+            )
+        // 预览没开就没什么可画的（触摸条此时也不涂色），存着草稿等开启即可。
+        if (!previewActive) return
+        updateTriggerLayout()
+        refreshMenuPreview()
+    }
+
     private fun setTriggerPreview(preview: Boolean) {
+        previewActive = preview
         triggerViews.values.forEach { it.previewMode = preview }
         if (preview) {
             updateTriggerLayout()
             showMenuPreview()
         } else {
+            // 关预览时把草稿一并丢掉：下一次开启应当完全是落库后的样子。
+            livePreview = null
             removeMenuPreview()
         }
         DebugLog.info("TRIGGER_PREVIEW", if (preview) "开" else "关")
@@ -150,23 +369,65 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     /** 按当前设置更新触摸块的宽高/位置（预览时调「触摸区宽度/高度」后实时同步绿块大小）。 */
     private fun updateTriggerLayout() {
-        val metrics = resources.displayMetrics
-        triggerViews.forEach { (side, view) ->
+        // 按快照遍历：失败时会走 resyncTrigger，而它会就地增删 triggerViews。
+        triggerViews.keys.toList().forEach { side ->
+            val view = triggerViews[side] ?: return@forEach
             val params = view.layoutParams as? WindowManager.LayoutParams ?: return@forEach
-            params.width = CornerGeometry.triggerWidth(this, store)
-            params.height = CornerGeometry.triggerHeight(this, store)
-            params.x = CornerGeometry.triggerLeft(metrics.widthPixels, params.width, side == CornerSide.Left)
-            view.edgeBandPx = CornerGeometry.edgeInset(this, store)
+            // 取值一律走 trigger*Px（拖滑块时有草稿用草稿），否则拖动时绿块不跟手。
+            params.width = triggerWidthPx
+            params.height = triggerHeightPx
+            // **横向锚在自己那一边、`x` 恒为 0**（理由见 [triggerParams]）：位置不再依赖屏宽，
+            // 旋转那一瞬间取到的旧宽度也摆不歪它。
+            params.gravity = triggerGravity(side)
+            params.x = 0
+            // y 也要一起给：它是「离屏幕底边多远」，改高度时方块是从底边往上长的，
+            // 但换屏（旋转）后底边内缩值会变，这里不跟着写就会停在旧位置。
+            params.y = CornerGeometry.bottomInset(this, store)
+            view.edgeBandPx = triggerEdgeBandPx
             runCatching { windowManager.updateViewLayout(view, params) }
-                .onFailure { DebugLog.warn("TRIGGER_LAYOUT_UPDATE_FAILED", "side=$side", it) }
+                .onFailure {
+                    DebugLog.warn("TRIGGER_LAYOUT_UPDATE_FAILED", "side=$side", it)
+                    // 摆不动通常意味着这个窗口在 WindowManager 那边已经不存在了。**只记日志
+                    // 等于把这个角落放弃掉**——重建一个，它才会重新出现在屏幕上。
+                    resyncTrigger(side, "重排失败")
+                }
         }
+    }
+
+    /**
+     * 只把新参数画进**已经挂着**的预览视图；没挂着就按需新建。
+     *
+     * 拖动滑块时不能用 [showMenuPreview]——它 `removeViewImmediate` + `addView` 走一遍窗口的
+     * 添加/移除，每帧一次既闪又重。[MenuPreviewView.preview] 只是赋值 + `invalidate`，随便调。
+     */
+    private fun refreshMenuPreview() {
+        val view = menuPreviewView
+        if (view == null) {
+            showMenuPreview()
+            return
+        }
+        val screen = realScreenBounds()
+        val shortEdge = minOf(screen.width(), screen.height())
+        view.preview(
+            screenLeft = screen.left.toFloat(),
+            screenRight = screen.right.toFloat(),
+            screenBottom = screen.bottom.toFloat(),
+            cornerInset = CornerGeometry.menuCornerInset(effectiveCornerInsetPercent, shortEdge).toFloat(),
+            widthDp = effectiveMenuWidthDp,
+            heightDp = effectiveMenuHeightDp,
+            iconSizeDp = effectiveIconDp,
+            itemCount = (radialApps.size + 1).coerceAtLeast(1),
+            leftEnabled = store.leftCornerEnabled,
+            rightEnabled = store.rightCornerEnabled,
+        )
     }
 
     /** 显示扇形范围预览（椭圆弧 + 图标圆心点），供设置页调宽度/高度/离角距离时可视化。 */
     private fun showMenuPreview() {
         removeMenuPreview()
         val screen = realScreenBounds()
-        val cornerInset = CornerGeometry.menuCornerInset(store, minOf(screen.width(), screen.height()))
+        val cornerInset =
+            CornerGeometry.menuCornerInset(effectiveCornerInsetPercent, minOf(screen.width(), screen.height()))
         val view = MenuPreviewView(this)
         val params =
             WindowManager.LayoutParams(
@@ -194,10 +455,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 screenRight = screen.right.toFloat(),
                 screenBottom = screen.bottom.toFloat(),
                 cornerInset = cornerInset.toFloat(),
-                widthDp = store.menuWidthDp,
-                heightDp = store.menuHeightDp,
-                iconSizeDp = store.menuIconDp,
+                // 走 effective*：预览刚开启时草稿多半是空的（等于 store），但拖动中重开也取得到。
+                widthDp = effectiveMenuWidthDp,
+                heightDp = effectiveMenuHeightDp,
+                iconSizeDp = effectiveIconDp,
                 itemCount = (radialApps.size + 1).coerceAtLeast(1),
+                leftEnabled = store.leftCornerEnabled,
+                rightEnabled = store.rightCornerEnabled,
             )
             menuPreviewView = view
         } catch (exception: RuntimeException) {
@@ -214,6 +478,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     override fun onDestroy() {
         isRunning = false
         handler.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(screenOffReceiver) }
+        runCatching { getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(displayListener) }
         hideDrawer()
         hideScreenTextPanel()
         removeToolMessage()
@@ -227,19 +493,46 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     // ---- 前台通知 ----
 
+    /**
+     * 两条通知渠道：正常的一条（[CHANNEL_ID]）与**静默**的一条（[CHANNEL_ID_QUIET]）。
+     *
+     * 后者给设置里那个「隐藏状态栏通知」用：最低重要级（不出声、不弹横幅、不亮屏、无角标）、
+     * 不进锁屏，并且通知本身可划掉。**这是能做到的极限**——Android 要求前台服务必须挂一条通知，
+     * 强行 `cancel()` 掉它，部分 ROM 会判定这条服务失去了前台身份而把它收掉，那就变成
+     * 「主动呼出自己停了」，比多一行通知严重得多。所以这里只压低存在感，不冒那个险。
+     */
     private fun createNotificationChannel() {
         val manager = getSystemService(NotificationManager::class.java) ?: return
-        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
-        manager.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.notification_channel_name),
-                NotificationManager.IMPORTANCE_LOW,
-            ),
-        )
+        if (manager.getNotificationChannel(CHANNEL_ID) == null) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID,
+                    getString(R.string.notification_channel_name),
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+        if (manager.getNotificationChannel(CHANNEL_ID_QUIET) == null) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_ID_QUIET,
+                    getString(R.string.notification_channel_quiet_name),
+                    NotificationManager.IMPORTANCE_MIN,
+                ).apply {
+                    setShowBadge(false)
+                    enableVibration(false)
+                    enableLights(false)
+                    setSound(null, null)
+                },
+            )
+        }
     }
 
     private fun startAsForeground() {
+        // 渠道要在这儿再确保一次：服务是长活的，`onCreate` 只跑一次，而用户可能是在服务已经
+        // 跑着的时候才打开「隐藏状态栏通知」——那时静默渠道还不存在。往一条不存在的渠道发通知
+        // 在 Android 8 以上是**静默丢弃**，前台服务因此会失去那条通知，后果比没通知严重得多。
+        createNotificationChannel()
         val openApp =
             PendingIntent.getActivity(
                 this,
@@ -247,14 +540,26 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 Intent(this, MainActivity::class.java),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-        val notification: Notification =
-            Notification.Builder(this, CHANNEL_ID)
+        val quiet = store.hideForegroundNotification
+        val builder =
+            Notification.Builder(this, if (quiet) CHANNEL_ID_QUIET else CHANNEL_ID)
                 .setContentTitle(getString(R.string.notification_title))
-                .setContentText(getString(R.string.notification_text))
+                .setContentText(
+                    getString(if (quiet) R.string.notification_text_quiet else R.string.notification_text),
+                )
                 .setSmallIcon(android.R.drawable.ic_menu_compass)
                 .setContentIntent(openApp)
-                .setOngoing(true)
-                .build()
+        if (quiet) {
+            // 可划掉 + 不进锁屏 + 不显示时间。**静音由渠道保证**（[CHANNEL_ID_QUIET] 的
+            // IMPORTANCE_MIN + 关掉声音、震动、呼吸灯），不用在这里逐条设置。
+            builder
+                .setOngoing(false)
+                .setShowWhen(false)
+                .setVisibility(Notification.VISIBILITY_SECRET)
+        } else {
+            builder.setOngoing(true)
+        }
+        val notification: Notification = builder.build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
@@ -278,9 +583,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
         syncTrigger(CornerSide.Left, store.leftCornerEnabled)
         syncTrigger(CornerSide.Right, store.rightCornerEnabled)
+        // **几何参数（触摸条尺寸 / 位置 / 左右边缘预留）必须在这里无条件重刷一次。**
+        // 已存在的触摸条在上面那两个 [syncTrigger] 里走的是 `existing != null` 提前 return 的
+        // 分支，尺寸与 `edgeBandPx` 都不会更新——这正是用户反馈的「左右边缘预留改动不生效」：
+        // 那个值只在校验预览里（previewActive）才被写回，平时改了没有任何反应。
+        updateTriggerLayout()
         // 每次配置生效都校正一遍触摸条状态：卡在「不可触摸」的窗口自己收不到触摸、
         // 无法自愈，只能靠这里把它拽回来。
         resetTriggerStates()
+        if (previewActive) showMenuPreview()
     }
 
     private fun syncTrigger(side: CornerSide, enabled: Boolean) {
@@ -296,7 +607,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
         if (existing != null) return
         val view = CornerTriggerView(this, side, this)
-        view.edgeBandPx = CornerGeometry.edgeInset(this, store)
+        view.edgeBandPx = triggerEdgeBandPx
+        view.previewMode = previewActive
         try {
             windowManager.addView(view, triggerParams(side))
             triggerViews[side] = view
@@ -306,10 +618,22 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
     }
 
+    /**
+     * 触摸条窗口的重力：**左右各自锚在自己那一边**，`x` 一律 0。
+     *
+     * 早先两侧都用 `BOTTOM or LEFT`，右边那条靠 `x = 屏宽 − 宽` 摆到右边缘。它有一个致命时序：
+     * 旋转那一瞬间服务取到的窗口尺寸**可能还是旧方向的**，算出来的 x 就把右边那条摆到了屏幕
+     * 中间——用户看到的是「横竖切换后，右下角呼不出来，左下角正常」（左边 x 恒为 0，怎么算都对），
+     * 而「开一下预览」之所以能修好，是因为预览会再跑一次重排，那时尺寸已经刷新。
+     * 锚在自己那一边之后，右侧的位置**完全不再依赖屏宽**，这类时序问题从根上消失。
+     */
+    private fun triggerGravity(side: CornerSide): Int =
+        Gravity.BOTTOM or if (side == CornerSide.Left) Gravity.LEFT else Gravity.RIGHT
+
     private fun triggerParams(side: CornerSide): WindowManager.LayoutParams {
-        val metrics = resources.displayMetrics
-        val width = CornerGeometry.triggerWidth(this, store)
-        val height = CornerGeometry.triggerHeight(this, store)
+        // 走 trigger*Px：预览开着时新建的触摸条也要用草稿尺寸（见 [livePreview]）。
+        val width = triggerWidthPx
+        val height = triggerHeightPx
         return WindowManager.LayoutParams(
             width,
             height,
@@ -324,8 +648,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.BOTTOM or Gravity.LEFT
-            x = CornerGeometry.triggerLeft(metrics.widthPixels, width, side == CornerSide.Left)
+            gravity = triggerGravity(side)
+            x = 0
             y = CornerGeometry.bottomInset(this@OverlayGestureService, store)
             layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
@@ -349,14 +673,27 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      */
     private fun expandTrigger(side: CornerSide, expanded: Boolean) {
         if (!expanded) {
-            expandedSide = null
-            triggerViews.values.forEach { view -> view.exclusionSuspended = false }
+            collapseTrigger()
             return
         }
         if (expandedSide == side) return
         expandedSide = side
+        expandedAt = android.os.SystemClock.elapsedRealtime()
         val active = triggerViews[side]
         triggerViews.values.forEach { view -> view.exclusionSuspended = view === active }
+    }
+
+    /**
+     * 把手势期间的临时状态收干净：两边都不再「排除已暂停」，且不再认为有手势在进行。
+     *
+     * 单独抽出来是因为它有多个入口：正常收尾（[expandTrigger]）、轮盘压根没建起来的那条路
+     * （[onGestureCommit] 开头）、以及粘滞态里点走一个图标之后（[onMenuTapped]）。
+     * 后面那两条早先都直接 `return` 了，于是这一侧的触摸条会一直停在「手势中」上——那正是
+     * 「小窗打开后轮盘再也呼不出来」的一类残留。
+     */
+    private fun collapseTrigger() {
+        expandedSide = null
+        triggerViews.values.forEach { view -> view.exclusionSuspended = false }
     }
 
     private fun removeTriggers() {
@@ -445,7 +782,12 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     // ---- 「更多」面板 ----
 
-    private fun showDrawer() {
+    /**
+     * @param side 触发这次呼出的角落。横屏选「跟随呼出边」（默认）时，面板贴哪一侧就看它
+     *   （见 [resolvedLandscapeSide]）。**必须在撤轮盘之前取好**——`activeSide` 那时已经空了。
+     */
+    private fun showDrawer(side: CornerSide?) {
+        drawerSide = side
         hideDrawer()
         // 应用目录是**服务启动时加载的一份快照**，新装的应用不会自己出现。
         //
@@ -486,6 +828,28 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
     }
 
+    /**
+     * 这个面板在横屏时要贴屏幕哪一侧。
+     *
+     * 设置里是「跟随呼出边」（[SettingsStore.SIDE_AUTO]，默认）时，**跟着这一次手势的角落走**：
+     * 左边呼出贴左、右边呼出贴右——手指从哪个角起手，面板就落在哪一侧，不用先跑去设置页选。
+     * 显式选了左 / 右 / 居中的用户按自己的选择来（那是明确表达过的偏好，不能被默认值覆盖）。
+     *
+     * 必须在**构造面板之前**解析成一个具体取值：面板里卡片宽高、底栏排布、贴哪一边全是构造时
+     * 按这个值算死的。
+     */
+    private fun resolvedLandscapeSide(): String =
+        when (val configured = store.landscapePanelSide) {
+            SettingsStore.SIDE_LEFT, SettingsStore.SIDE_RIGHT, SettingsStore.SIDE_CENTER -> configured
+            else ->
+                when (drawerSide) {
+                    CornerSide.Left -> SettingsStore.SIDE_LEFT
+                    CornerSide.Right -> SettingsStore.SIDE_RIGHT
+                    // 认不出呼出边（理论上不会发生）时退回居中，至少不会歪到某一边去。
+                    null -> SettingsStore.SIDE_CENTER
+                }
+        }
+
     /** 真正把面板建出来（应用目录已经确保是新的）。 */
     private fun showDrawerNow() {
         // 先清干净：这一路上有好几条异步路径（目录刷新完回来、启动应用前的延迟）都能走到这里，
@@ -501,12 +865,17 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         )
         val panel =
             try {
+                // 每次打开「更多」都从应用页顶部开始，不恢复上次浏览位置。
                 AppDrawerPanel(
                     context = this,
                     apps = appEntries,
                     tools = toolEntries,
                     pinned = store.pinnedComponents,
                     dock = store.dockComponents,
+                    defaultTab = if (store.drawerDefaultTab == SettingsStore.TAB_TOOLS) AppDrawerPanel.TAB_TOOLS else AppDrawerPanel.TAB_APPS,
+                    // 横屏贴左 / 右（竖屏与「居中」都是居中显示）。见 AppDrawerPanel.sideMode。
+                    // 「跟随呼出边」在这里被解析成具体的左 / 右（见 [resolvedLandscapeSide]）。
+                    landscapeSide = resolvedLandscapeSide(),
                     recent = store.recentComponents,
                     onSelected = { entry ->
                         hideDrawer()
@@ -529,6 +898,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     },
                     onToggleDock = { entry -> toggleDock(entry) },
                     onReorderDock = { order -> store.reorderDock(order) },
+                    // 工具页拖拽排序：落盘即可。面板自身会同步本地顺序（见 commitToolReorder）。
+                    // **只影响工具页那个网格**——扇形看 pinnedComponents、底栏看 dockComponents，
+                    // 三处各管各的（用户明确不要联动）。
+                    onReorderTools = { ids -> store.toolOrder = ids },
+                    onClearRecent = { store.clearRecent() },
                     onDismiss = { hideDrawer() },
                 )
             } catch (error: Throwable) {
@@ -606,7 +980,16 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     override fun onGestureCommit() {
-        val view = menuView ?: return
+        val view = menuView
+        if (view == null) {
+            // 轮盘没建起来（应用列表为空、`addView` 抛异常……），但触摸条已经被判成「手势中」。
+            // **必须在这儿把收尾跑掉**：早先这里是裸 `return`，于是这一侧的触摸条会一直停在
+            // 「排除已暂停 / 手势中」上，直到下一次手势才可能被 onGestureStart 复位——
+            // 中途要是被小窗之类的动作打断，就再也轮不到那一次复位了。
+            DebugLog.warn("GESTURE_COMMIT_NO_MENU", "轮盘未创建，直接收尾")
+            collapseTrigger()
+            return
+        }
         val side = activeSide
         val slot = view.selectedIndex
         // 松手时手指停在某个图标上 → 直接打开（不等二次点击）。
@@ -614,11 +997,12 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             val entry = radialApps.getOrNull(view.appIndexForSlot(slot))
             val isMore = view.hasMoreItem && slot == view.moreSlotIndex
             removeMenu()
-            side?.let { expandTrigger(it, false) }
+            // 无条件收：`side` 为空时更要收（那说明连呼出边都没记下来，残留没人清）。
+            collapseTrigger()
             when {
                 isMore -> {
-                    DebugLog.info("GESTURE_COMMIT_MORE", "松手在「更多」，打开面板")
-                    showDrawer()
+                    DebugLog.info("GESTURE_COMMIT_MORE", "松手在「更多」，打开面板（$side）")
+                    showDrawer(side)
                 }
                 entry != null -> {
                     DebugLog.info("GESTURE_COMMIT", "side=$side app=${entry.label} ${entry.component.flattenToString()}")
@@ -632,7 +1016,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         view.settle()
         view.onTap = { tapped -> onMenuTapped(tapped) }
         setMenuTouchable(true)
-        side?.let { expandTrigger(it, false) }
+        // 进入粘滞态 = 这一次滑动已经结束，触摸条不该再停在「手势中」上（这里无条件收，
+        // 不当成 `side != null` 才收：side 为空时更要收，否则那一次的残留没人清）。
+        collapseTrigger()
         DebugLog.info("GESTURE_COMMIT_STICKY", "side=$side 未选中，轮盘进入粘滞态")
     }
 
@@ -643,24 +1029,33 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             // 点空白：关闭轮盘。
             DebugLog.info("MENU_TAP_BLANK", "点空白，关闭轮盘")
             removeMenu()
+            collapseTrigger()
             return
         }
         // 粘滞态只根据「点击命中的槽位」判断，不用滑动残留的 selectedIndex。
         val moreSelected = view.hasMoreItem && slot == view.moreSlotIndex
         if (moreSelected) {
-            DebugLog.info("MENU_TAP_MORE", "点「更多」，打开面板")
+            // 粘滞态下 `activeSide` 还在，趁撤轮盘之前抄下来（撤了它就空了）。
+            val side = activeSide
+            DebugLog.info("MENU_TAP_MORE", "点「更多」，打开面板（$side）")
             removeMenu()
-            showDrawer()
+            collapseTrigger()
+            showDrawer(side)
             return
         }
         val entry = radialApps.getOrNull(view.appIndexForSlot(slot))
         if (entry == null) {
             DebugLog.info("MENU_TAP_EMPTY", "槽位 $slot 无对应应用")
             removeMenu()
+            collapseTrigger()
             return
         }
         DebugLog.info("MENU_TAP", "app=${entry.label} ${entry.component.flattenToString()}")
         removeMenu()
+        // 粘滞态到这里就算结束了（轮盘已撤），触摸条的「手势中」状态必须一并收掉：
+        // 否则它会一直停在「排除已暂停」上，直到下一次手势才可能复位——而用户接下来做的
+        // 正是「小窗起来之后再去角落呼轮盘」。
+        collapseTrigger()
         worker.execute { launch(entry) }
     }
 
@@ -682,9 +1077,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     override fun onGestureCancel() {
         if (menuView != null) DebugLog.info("GESTURE_CANCEL")
-        val side = activeSide
         removeMenu()
-        side?.let { expandTrigger(it, false) }
+        collapseTrigger()
     }
 
     /**
@@ -780,7 +1174,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             return
         }
         val view = CornerTriggerView(this, side, this)
-        view.edgeBandPx = CornerGeometry.edgeInset(this, store)
+        view.edgeBandPx = triggerEdgeBandPx
+        view.previewMode = previewActive
         try {
             windowManager.addView(view, triggerParams(side))
             triggerViews[side] = view
@@ -809,6 +1204,66 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         if (!view.passthroughInFlight) return
         view.passthroughInFlight = false
         setTriggerTouchable(side, true)
+    }
+
+    /**
+     * 巡检一遍触摸条，把坏掉的修好。见 [triggerWatchdog]。
+     *
+     * 检查三件事，都是「坏了就只能靠外部救」的：
+     *
+     * 1. **窗口还在不在**：`isAttachedToWindow` 为假 = 系统把它摘掉了（或者上次重建失败），
+     *    这个角落从此彻底哑掉。直接重建。**只认这一条**，不按 `view.width` 判——那是 View
+     *    自己的字段，第一次布局跑完之前一直是 0，按它判会把刚加好的窗口误杀。
+     * 2. **有没有被卡在「不可触摸」**：只在没有回放进行中时校正（回放中那一次本来就要让开）。
+     * 3. **手势排除状态**：没有手势在进行时（[expandedSide] 为空）就不该停在「排除已暂停」。
+     *
+     * 每次只记录**真的修了什么**，没坏时不产生任何日志，免得把调试日志刷爆。
+     */
+    private fun checkTriggers() {
+        if (!store.enabled) return
+        // **正在用的时候绝不重建窗口**：重建是「移除 + 新增」，那会把一条正在进行的手势
+        // 拦腰截断（触摸流随窗口一起没了），用户看到的是轮盘凭空消失。等下一次巡检再来。
+        //
+        // 「正在用」必须带时限（见 [expandedAt]）：这个状态本身就可能因为收尾回调没跑到而残留，
+        // 拿它当永久判据，巡检就永远不敢动手——那正是它要防的那种「永久失灵」。
+        val gestureLive =
+            expandedSide != null &&
+                android.os.SystemClock.elapsedRealtime() - expandedAt < TRIGGER_GESTURE_MAX_MS
+        if (gestureLive || menuView != null) return
+        if (expandedSide != null) {
+            DebugLog.warn("TRIGGER_WATCHDOG", "手势状态残留未收尾，已复位")
+            collapseTrigger()
+        }
+        // 先按快照遍历：下面的 resyncTrigger 会就地改 triggerViews。
+        triggerViews.keys.toList().forEach { side ->
+            val view = triggerViews[side] ?: return@forEach
+            if (!view.isAttachedToWindow) {
+                resyncTrigger(side, "巡检发现窗口已失效")
+                return@forEach
+            }
+            if (!view.passthroughInFlight && !triggerTouchable(view)) {
+                DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 卡在不可触摸，已恢复")
+                setTriggerTouchable(side, true)
+            }
+            if (expandedSide == null && view.exclusionSuspended) {
+                DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 手势排除未收尾，已复位")
+                view.exclusionSuspended = false
+            }
+        }
+        // 开关是开的却没有窗口（上一次 addView 失败等）——补一个。
+        listOf(CornerSide.Left, CornerSide.Right).forEach { side ->
+            val enabled = if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
+            if (enabled && triggerViews[side] == null) {
+                DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 缺窗口，补建")
+                syncTrigger(side, true)
+            }
+        }
+    }
+
+    /** 某个触摸条的窗口现在是不是可触摸的（没有 `FLAG_NOT_TOUCHABLE`）。 */
+    private fun triggerTouchable(view: CornerTriggerView): Boolean {
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return true
+        return (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0
     }
 
     // ---- 启动与目录 ----
@@ -880,20 +1335,20 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     // ---- 内置系统工具 ----
 
     /**
-     * 切换「固定栏」成员。
+     * 切换「底栏」成员。
      *
-     * 固定栏只影响「更多」面板底部那一行，不参与扇形，所以**不需要** [applyPins]。
+     * 底栏只影响「更多」面板底部那一行，不参与扇形，所以**不需要** [applyPins]。
      * 上限同样在这里拦，好在面板上直接给出可读原因。
      */
     private fun toggleDock(entry: AppEntry): String? {
         val current = store.dockComponents
         if (!current.any { it == entry.component } && current.size >= SettingsStore.MAX_DOCK) {
-            return "固定栏最多 ${SettingsStore.MAX_DOCK} 个，先移出一个再添加"
+            return "底栏最多 ${SettingsStore.MAX_DOCK} 个，先移出一个再添加"
         }
         store.toggleDock(entry.component)
         DebugLog.info(
             if (store.dockComponents.size < current.size) "DOCK_REMOVED" else "DOCK_ADDED",
-            "${entry.label} 固定栏=${store.dockComponents.size}",
+            "${entry.label} 底栏=${store.dockComponents.size}",
         )
         return null
     }
@@ -912,13 +1367,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             // 区分两种「没连上」：从没开过 → 引导去开；设置里是开着的却没连上 → 多半是
             // 服务的配置更新过（例如新增了截屏能力），系统把旧实例作废了，关掉再打开即可。
             val enabled = FreeformAccessibilityService.isEnabledInSettings(this)
-            showToolMessage(
-                if (enabled) {
-                    "无障碍服务未连接：到系统设置里把本应用的无障碍关掉、再重新打开一次"
-                } else {
-                    "「${spec.label}」需要先开启无障碍服务"
-                },
-            )
+            // 工具执行提示保持静默；异常仍写入调试日志，避免打断当前操作。
+            DebugLog.warn("TOOL_NEEDS_ACCESSIBILITY", if (enabled) "服务未连接" else "无障碍未开启")
             return
         }
         when (id) {
@@ -932,7 +1382,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             else -> {
                 worker.execute {
                     val message = ToolActions.run(this, id)
-                    handler.post { showToolMessage(message) }
+                    handler.post { showToolMessage(message, id) }
                 }
             }
         }
@@ -957,11 +1407,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private fun runOwnScreenText() {
         val report = FreeformAccessibilityService.screenText()
         if (report == null) {
-            showToolMessage("识屏需要先开启无障碍服务")
+            // 工具提示一律静默（只留手电筒的开关提示），失败原因写调试日志即可。
+            showToolMessage("识屏需要先开启无障碍服务", SystemTools.TOOL_SCREEN_TEXT)
             return
         }
         if (report.lines.isEmpty()) {
-            showToolMessage("没读到文字：当前界面未把文字暴露给无障碍（图片、视频与网页画布读不到）")
+            showToolMessage(
+                "没读到文字：当前界面未把文字暴露给无障碍（图片、视频与网页画布读不到）",
+                SystemTools.TOOL_SCREEN_TEXT,
+            )
             return
         }
         showScreenTextPanel(report)
@@ -971,10 +1425,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 回调在无障碍服务的主线程上触发，这里再 post 一次，保证弹提示一定在主线程。
         val submitted =
             FreeformAccessibilityService.takeScreenshot(this) { ok, message ->
-                handler.post { showToolMessage(message) }
+                handler.post { showToolMessage(message, SystemTools.TOOL_SCREENSHOT) }
                 if (!ok) DebugLog.warn("TOOL_SCREENSHOT_RESULT", message)
             }
-        if (!submitted) showToolMessage("截屏未提交，请确认无障碍服务已开启")
+        if (!submitted) showToolMessage("截屏未提交，请确认无障碍服务已开启", SystemTools.TOOL_SCREENSHOT)
     }
 
     private fun showScreenTextPanel(report: FreeformAccessibilityService.ScreenTextReport) {
@@ -1034,7 +1488,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 不用 `Toast`：Android 12 起后台应用（含仅靠前台服务活着的应用）弹 Toast 会被系统丢弃，
      * 而这里本来就有悬浮窗能力，自己画一块最稳。
      */
-    private fun showToolMessage(message: String) {
+    private fun showToolMessage(message: String, toolId: String? = null) {
+        if (toolId != null &&
+            (toolId != SystemTools.TOOL_FLASHLIGHT ||
+                (message != "手电筒已打开" && message != "手电筒已关闭"))
+        ) return
         removeToolMessage()
         val view =
             TextView(this).apply {
@@ -1112,6 +1570,12 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             // 当成普通全屏应用跳过，于是遮罩挂晚了——用户这时候点「窗外」会点到下面的应用。
             // 这里让服务在接下来两秒多里密集重探几次，尽早抓住落定那一刻。
             FreeformAccessibilityService.watchForFreeformWindow()
+            // 同一段时间里**顺手把触摸条体检一遍**：用户报的「呼出小窗之后轮盘就再也呼不出来」
+            // 恰好发生在这一刻，而这是唯一一个「小窗刚起来」的确定时机——等五分钟一次的巡检
+            // 就太晚了。两次：一次在小窗展开动画结束附近，一次在系统把窗口都摆定之后。
+            LAUNCH_TRIGGER_RECHECK_MS.forEach { delay ->
+                handler.postDelayed({ checkTriggers() }, delay)
+            }
         } else {
             DebugLog.warn(
                 "LAUNCH_ALL_STRATEGIES_FAILED",
@@ -1122,6 +1586,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     companion object {
         private const val CHANNEL_ID = "noroot_corner_gesture"
+
+        /**
+         * 静默渠道（见 [createNotificationChannel]）。
+         *
+         * **必须是另一个 id**：渠道的重要性在创建之后由用户 / 系统说了算，应用再改也只会被
+         * 忽略（改了等于没改）。所以要换观感只能换一条新渠道。
+         */
+        private const val CHANNEL_ID_QUIET = "noroot_corner_gesture_quiet"
+
         private const val NOTIFICATION_ID = 1001
 
         /** 「更多」面板退场到发起启动之间的等待，用来让窗口与焦点彻底收回。 */
@@ -1134,6 +1607,33 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val CATALOG_TTL_MS = 10_000L
 
         private const val DRAWER_LAUNCH_DELAY_MS = 180L
+
+        /**
+         * 旋转之后补校正触摸条位置的时刻（ms）。
+         *
+         * 系统把「方向变了」告诉服务和它真的按新尺寸摆放窗口之间有一小段不同步，取三个时刻连打
+         * 三拍最稳：够快（第一拍几乎和系统同步）又够晚（最后一拍超过一秒，足够布局稳定下来）。
+         */
+        private val TRIGGER_SETTLE_DELAYS_MS = longArrayOf(120L, 450L, 1_000L)
+
+        /**
+         * 触摸条健康巡检的间隔（ms）。
+         *
+         * 见 [triggerWatchdog]。取值考虑三件事：触摸条坏掉是「呼不出轮盘」这种硬故障，用户能
+         * 察觉的最长容忍时间就是它；巡检本身只是几次字段读取，密一点也没什么代价；而「刚加完
+         * 窗口、还没布局」的那种瞬态又要能自然排除掉——所以既不取几百毫秒（白白折腾），也不取
+         * 半分钟（坏着等太久）。
+         */
+        private const val TRIGGER_WATCHDOG_MS = 5_000L
+
+        /**
+         * 「手势进行中」最多能信多久（ms）。超过就当那次手势的收尾丢了，按残留处理。
+         *
+         * 用户按住手指慢慢挑图标有可能拖上好一会儿，所以不能取太小；但也不能太久——这个判据
+         * 期间巡检什么都不做（见 [checkTriggers]）。10 秒足够覆盖任何一次正常挑选，
+         * 又短到用户「呼不出轮盘」时不用干等。
+         */
+        private const val TRIGGER_GESTURE_MAX_MS = 10_000L
 
         /** 工具结果提示：距屏幕底部多远、停留多久、淡入时长。 */
         private const val HUD_BOTTOM_MARGIN_DP = 96
@@ -1149,12 +1649,28 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         /** 回放的兜底恢复时间。派发回调万一不来，也不能让触摸条一直点不动。 */
         private const val TAP_THROUGH_TIMEOUT_MS = 700L
 
+        /**
+         * 小窗拉起之后补做触摸条体检的时刻（ms）。见 [launch]。
+         *
+         * 两拍：小窗的展开动画大约几百毫秒，第一拍落在它刚铺开之后；第二拍等系统把窗口、
+         * 焦点都摆定。两拍都只读几个字段，没坏时等于没跑。
+         */
+        private val LAUNCH_TRIGGER_RECHECK_MS = longArrayOf(900L, 2_500L)
+
         const val ACTION_START = "io.github.msecret.flymefreeform.action.START"
         const val ACTION_STOP = "io.github.msecret.flymefreeform.action.STOP"
         const val ACTION_REFRESH_PINS = "io.github.msecret.flymefreeform.action.REFRESH_PINS"
         const val ACTION_PREVIEW = "io.github.msecret.flymefreeform.action.PREVIEW"
+        const val ACTION_PREVIEW_SYNC = "io.github.msecret.flymefreeform.action.PREVIEW_SYNC"
         const val ACTION_REFRESH_APPS = "io.github.msecret.flymefreeform.action.REFRESH_APPS"
         const val EXTRA_PREVIEW = "preview"
+        const val EXTRA_RANGE_W = "range_w"
+        const val EXTRA_RANGE_H = "range_h"
+        const val EXTRA_EDGE_INSET = "edge_inset"
+        const val EXTRA_MENU_W = "menu_w"
+        const val EXTRA_MENU_H = "menu_h"
+        const val EXTRA_CORNER_INSET = "corner_inset"
+        const val EXTRA_ICON = "icon"
 
         @Volatile
         var isRunning: Boolean = false
@@ -1201,6 +1717,36 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 Intent(context, OverlayGestureService::class.java)
                     .setAction(ACTION_PREVIEW)
                     .putExtra(EXTRA_PREVIEW, preview),
+            )
+        }
+
+        /**
+         * 设置页拖滑块时的实时预览同步：把**还没落库**的一组参数推给预览，让它跟手。
+         *
+         * 值全部随 intent 传过去、不在服务端读设置——设置页手里的草稿才是「用户此刻看到的值」。
+         * 服务没在跑就忽略（没有悬浮窗，也就没有预览可更新）。
+         */
+        fun setPreviewLive(
+            context: Context,
+            rangeWidthDp: Int,
+            rangeHeightDp: Int,
+            edgeInsetDp: Int,
+            menuWidthDp: Int,
+            menuHeightDp: Int,
+            cornerInsetPercent: Int,
+            iconDp: Int,
+        ) {
+            if (!isRunning) return
+            context.startService(
+                Intent(context, OverlayGestureService::class.java)
+                    .setAction(ACTION_PREVIEW_SYNC)
+                    .putExtra(EXTRA_RANGE_W, rangeWidthDp)
+                    .putExtra(EXTRA_RANGE_H, rangeHeightDp)
+                    .putExtra(EXTRA_EDGE_INSET, edgeInsetDp)
+                    .putExtra(EXTRA_MENU_W, menuWidthDp)
+                    .putExtra(EXTRA_MENU_H, menuHeightDp)
+                    .putExtra(EXTRA_CORNER_INSET, cornerInsetPercent)
+                    .putExtra(EXTRA_ICON, iconDp),
             )
         }
     }

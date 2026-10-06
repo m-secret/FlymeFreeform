@@ -1,12 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+        Material 3 的「落地」主题。
+
+        原生 Activity 用 DeviceDefault.Light 作父主题即可（本模块不引 AndroidX/Material，
+        所以拿不到 Theme.Material3.*），把 M3 的几个 color role 通过 android: 属性灌进去：
+        系统控件（Switch / SeekBar / 对话框 / 文本选择柄）就会自动跟着 M3 的 primary 走，
+        不必逐个手写。
+    -->
     <style name="Theme.FlymeFreeformNoRoot" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
-        <item name="android:windowBackground">@color/page_background</item>
-        <item name="android:statusBarColor">@color/page_background</item>
+        <!-- surface：页面与状态栏同底，视觉上连成一片。 -->
+        <item name="android:windowBackground">@color/m3_surface</item>
+        <item name="android:colorBackground">@color/m3_surface</item>
+        <item name="android:statusBarColor">@color/m3_surface</item>
+        <item name="android:navigationBarColor">@color/m3_surface</item>
         <!-- 浅色背景必须配深色状态栏图标，否则白字看不清。 -->
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:colorAccent">@color/accent</item>
-        <!-- 内容避开系统栏（状态栏/手势条），title 不再贴着状态栏。 -->
+        <item name="android:windowLightNavigationBar">true</item>
+
+        <!-- primary：Switch 的打开态、SeekBar 的进度、文本选择柄都吃这两个值。 -->
+        <item name="android:colorAccent">@color/m3_primary</item>
+        <item name="android:colorControlActivated">@color/m3_primary</item>
+        <!-- state layer：系统控件的按下覆盖色。 -->
+        <item name="android:colorControlHighlight">@color/m3_state_layer</item>
+
+        <!-- M3 的对话框是 extra-large 形状（28dp 圆角）。 -->
+        <item name="android:alertDialogTheme">@style/Theme.FlymeFreeformNoRoot.Dialog</item>
+
+        <!-- 内容避开系统栏（状态栏/手势条），标题不再贴着状态栏。 -->
         <item name="android:fitsSystemWindows">true</item>
+    </style>
+
+    <style name="Theme.FlymeFreeformNoRoot.Dialog" parent="@android:style/Theme.DeviceDefault.Light.Dialog.Alert">
+        <item name="android:colorAccent">@color/m3_primary</item>
+        <item name="android:colorControlActivated">@color/m3_primary</item>
     </style>
 </resources>

@@ -190,7 +190,9 @@ object SystemTools {
     fun load(context: Context): List<AppEntry> {
         val densityDpi =
             context.resources.displayMetrics.densityDpi.takeIf { it > 0 } ?: FALLBACK_DENSITY_DPI
-        return specs.map { spec ->
+        val order = SettingsStore(context).toolOrder
+        val orderedSpecs = order.mapNotNull { id -> specs.firstOrNull { it.id == id } }
+        return orderedSpecs.map { spec ->
             AppEntry(
                 component = componentFor(spec.id),
                 label = spec.label,

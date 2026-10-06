@@ -34,7 +34,9 @@ class BootReceiver : BroadcastReceiver() {
         DebugLog.info("BOOT_RECEIVER", "action=${intent.action}")
         // 开机后无障碍有可能被系统清掉：这里先看一眼（Shizuku 若还没起来，
         // 稍后 binder 回来的那一刻 [ShizukuShell.startAutoReconnect] 里还会再查一次）。
-        if (SettingsStore(context).enabled) {
+        // 窗外点击关闭也要靠无障碍，所以只开它、没开主动呼出时，同样要把权限补回来。
+        val bootStore = SettingsStore(context)
+        if (bootStore.enabled || bootStore.outsideTapCloseEnabled) {
             AccessibilityGrant.restoreIfMissing(context)
         }
         A11yTrace.append(

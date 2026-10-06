@@ -1,24 +1,27 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.os.Bundle
-import android.util.TypedValue
-import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 
 /**
- * 「主动呼出」二级设置页。
+ * 「主动呼出」二级设置页（Material 3 版面）。
  *
  * 从主设置页拆出来：主页面被授权、手势、窗外关闭、应用管理、日志等塞得太长，
  * 这里只放与「主动呼出 / 扇形观感」相关的设置项。
+ *
+ * ## 版面
+ *
+ * 触摸区（开关与尺寸）→ 扇形观感 → 角落点击 → 图标包。每一组是一张 [CardGroup]，
+ * 组内行之间只有一条内缩分隔线，组与组之间留实缝——不会出现相邻圆角相切造成的凹陷。
  */
 class CornerSettingsActivity : Activity() {
 
@@ -27,41 +30,84 @@ class CornerSettingsActivity : Activity() {
     /** 触摸区预览开关的当前状态（不持久化，离开页面即关）。 */
     private var previewOn = false
 
+    /**
+     * 七个变量的**草稿**：拖动中先改这里、抬手才落库。
+     *
+     * 分开存是有原因的：拖动过程中 `store` 里的值还没变（只有 `onCommit` 才写），
+     * 而页面下方那张示意图和屏幕上的预览都是直接读值的——它们要是读 `store`，拖动时就一直是
+     * 旧值、纹丝不动，用户要看的偏偏就是拖动过程。所以两处都从这几个草稿读（见
+     * [renderTouchDiagram] 与 [syncPreview]）。
+     */
+    private var liveRangeW = 0
+    private var liveRangeH = 0
+    private var liveBand = 0
+    private var liveMenuW = 0
+    private var liveMenuH = 0
+    private var liveCornerInset = 0
+    private var liveIconDp = 0
+
+    private lateinit var touchDiagram: EdgeInsetPreview
+    private lateinit var touchDiagramCaption: TextView
+
+    /** 「触摸区」那一组卡片。示意图加不加要整组重画，所以得留个引用（见 [applyTouchDiagramRow]）。 */
+    private lateinit var touchGroup: CardGroup
+
+    /** 「触摸区」这一组里**除示意图之外**的行。建一次、反复复用（见 [applyTouchDiagramRow]）。 */
+    private lateinit var touchCoreRows: List<View>
+
+    /** 预览开关本体。离开页面时要把它拨回「关」，见 [onStop]。 */
+    private var previewToggle: Switch? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         setContentView(buildContent())
     }
 
+    /**
+     * 离开前台就撤掉预览。
+     *
+     * 上滑回桌面、切到别的应用时 Activity 只是 **stop**、不会被 destroy，而预览是挂在
+     * `WindowManager` 上的系统级浮层——不主动撤就会一直盖在桌面上（用户看到的是「上滑回桌面
+     * 预览还在，得退回应用的首页才消失」，那条路径才走到 `onDestroy`）。所以在这里先关掉，
+     * `onDestroy` 仍留一份兜底。
+     *
+     * 只拨开关、不直接调 `setPreview`：开关的监听器本来就负责「关预览 + 复位 [previewOn]」，
+     * 而且它会把界面同步成「关」，用户回来时看到的状态和实际一致。
+     */
+    override fun onStop() {
+        super.onStop()
+        if (previewOn) previewToggle?.isChecked = false
+    }
+
     override fun onDestroy() {
-        // 离开页面时关闭触摸区预览。
+        // 兜底：无论走哪条退出路径，都不该把预览留在屏幕上。
         if (previewOn) OverlayGestureService.setPreview(this, false)
         super.onDestroy()
     }
 
-    /** 预览开关打开时，调参数后刷新扇形预览。 */
-    /**
-     * 「图标大小」下面那行上限说明。宽度/高度一变它的数字也要跟着变，所以留个引用。
-     */
-    private var iconCapHint: TextView? = null
-
     private fun refreshPreview() {
         if (previewOn) OverlayGestureService.setPreview(this, true)
-        refreshIconCapHint()
     }
 
     /**
-     * 「图标大小」下面那行说明。
+     * 拖滑块时的实时同步：把草稿推给预览（触摸条绿块 + 扇形弧），让它跟手。
      *
-     * 图标大小和扇形几何是**完全解耦**的（见 [MenuGeometry.resolve]）：拖它只改图标本身，
-     * 轮盘的形状、位置、张角全都不动。副作用是图标调得比弧上的格子大时会相互重叠——
-     * 那是有意的，由用户自己再调小一点。
+     * 只在预览开着时才发——没开预览时屏幕上没有任何东西可更新，白跑一趟跨进程。
+     * 抬手走的仍是 [refreshPreview]（那时值已落库，按整份设置重画）。
      */
-    private fun iconCapText(): String =
-        "图标大小只改图标本身，不影响扇形的位置与张角。调得比弧上的格子大时会相互重叠，按观感自己取。"
-
-    private fun refreshIconCapHint() {
-        iconCapHint?.text = iconCapText()
+    private fun syncPreview() {
+        if (!previewOn) return
+        OverlayGestureService.setPreviewLive(
+            this,
+            rangeWidthDp = liveRangeW,
+            rangeHeightDp = liveRangeH,
+            edgeInsetDp = liveBand,
+            menuWidthDp = liveMenuW,
+            menuHeightDp = liveMenuH,
+            cornerInsetPercent = liveCornerInset,
+            iconDp = liveIconDp,
+        )
     }
 
     /** 恢复所有扇形/触摸区参数到默认值。 */
@@ -80,141 +126,360 @@ class CornerSettingsActivity : Activity() {
     }
 
     private fun buildContent(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(24), dp(20), dp(32))
-        }
-        root.addView(title("主动呼出"))
+        val root = Ui.pageRoot(this)
+        root.addView(Ui.title(this, "主动呼出"))
 
-        root.addView(switchRow("显示触摸区预览（半透明色标出位置）", previewOn) { checked ->
-            previewOn = checked
-            OverlayGestureService.setPreview(this, checked)
-        })
-        root.addView(
-            hint("打开后，屏幕左右下角会出现半透明绿色块，那就是触摸区实际覆盖的位置，调下面参数时看着它调。"),
-        )
-        root.addView(
-            Ui.button(this, "恢复默认设置") { resetToDefaults() },
-        )
+        // ---- 触摸区 ----
+        //
+        // 先把七个草稿对齐到落库值。之后每条滑块的 onLive 只改草稿：重画示意图 + 把草稿推给
+        // 屏幕预览；落库仍然等抬手（onChange）——拖动时不该反复写盘、重载服务。
+        liveRangeW = store.cornerRangeDp
+        liveRangeH = store.cornerRangeHeightDp
+        liveBand = store.edgeInsetDp
+        liveMenuW = store.menuWidthDp
+        liveMenuH = store.menuHeightDp
+        liveCornerInset = store.menuCornerInsetPercent
+        liveIconDp = store.menuIconDp
 
-        root.addView(switchRow("左下角", store.leftCornerEnabled) { checked ->
-            store.leftCornerEnabled = checked
-            OverlayGestureService.reload(this)
-        })
-        root.addView(switchRow("右下角", store.rightCornerEnabled) { checked ->
-            store.rightCornerEnabled = checked
-            OverlayGestureService.reload(this)
-        })
+        root.addView(Ui.sectionTitle(this, "触摸区"))
+        // 触摸区这一组：**除示意图之外的行**只建一次、存在 [touchCoreRows] 里复用，
+        // 最后那张示意图由 [applyTouchDiagramRow] 按预览开关决定加不加。
+        touchGroup = CardGroup(this)
+        touchCoreRows =
+            listOf(
+                previewRow(),
+                Ui.switchRow(this, "左下角", store.leftCornerEnabled) { checked ->
+                    store.leftCornerEnabled = checked
+                    OverlayGestureService.reload(this)
+                    refreshPreview()
+                },
+                Ui.switchRow(this, "右下角", store.rightCornerEnabled) { checked ->
+                    store.rightCornerEnabled = checked
+                    OverlayGestureService.reload(this)
+                    refreshPreview()
+                },
+                seekRow(
+                    label = "触摸区宽度",
+                    value = store.cornerRangeDp,
+                    min = SettingsStore.MIN_RANGE_DP,
+                    max = SettingsStore.MAX_RANGE_DP,
+                    detail = "角落方块横向的长度",
+                    onLive = {
+                        liveRangeW = it
+                        renderTouchDiagram()
+                        syncPreview()
+                    },
+                ) { value ->
+                    store.cornerRangeDp = value
+                    OverlayGestureService.reload(this)
+                    refreshPreview()
+                },
+                seekRow(
+                    label = "触摸区高度",
+                    value = store.cornerRangeHeightDp,
+                    min = SettingsStore.MIN_RANGE_DP,
+                    max = SettingsStore.MAX_RANGE_DP,
+                    detail = "角落方块纵向的长度",
+                    onLive = {
+                        liveRangeH = it
+                        renderTouchDiagram()
+                        syncPreview()
+                    },
+                ) { value ->
+                    store.cornerRangeHeightDp = value
+                    OverlayGestureService.reload(this)
+                    refreshPreview()
+                },
+                seekRow(
+                    label = "左右边缘预留",
+                    value = store.edgeInsetDp,
+                    min = 0,
+                    max = SettingsStore.MAX_EDGE_INSET_DP,
+                    detail = "方块最外侧这一条让给系统「侧滑返回」，不改变方块大小",
+                    onLive = {
+                        liveBand = it
+                        renderTouchDiagram()
+                        syncPreview()
+                    },
+                ) { value ->
+                    store.edgeInsetDp = value
+                    OverlayGestureService.reload(this)
+                    refreshPreview()
+                },
+            )
+        touchCoreRows.forEach { touchGroup.row(it) }
+        applyTouchDiagramRow()
+        root.addView(touchGroup)
         root.addView(
-            seekRow("触摸区宽度", store.cornerRangeDp, SettingsStore.MIN_RANGE_DP, SettingsStore.MAX_RANGE_DP) { value ->
-                store.cornerRangeDp = value
-                OverlayGestureService.reload(this)
-                refreshPreview()
-            },
-        )
-        root.addView(
-            seekRow("触摸区高度", store.cornerRangeHeightDp, SettingsStore.MIN_RANGE_DP, SettingsStore.MAX_RANGE_DP) { value ->
-                store.cornerRangeHeightDp = value
-                OverlayGestureService.reload(this)
-                refreshPreview()
-            },
-        )
-        root.addView(
-            seekRow("左右边缘预留", store.edgeInsetDp, 0, SettingsStore.MAX_EDGE_INSET_DP) { value ->
-                store.edgeInsetDp = value
-                OverlayGestureService.reload(this)
-                refreshPreview()
-            },
-        )
-        root.addView(
-            hint(
-                "触摸区是屏幕角落的一个方块，宽度和高度可分别调，永远贴着屏幕边缘，调多大角落都能按到。" +
-                    "「左右边缘预留」是屏幕最边上留出来给系统侧滑返回的宽度，不影响触摸区大小。",
+            Ui.hint(
+                this,
+                "**上面三条一起决定角落的行为**，拖滑块时它们会实时反映到示意图 / 屏幕预览上：\n" +
+                    "**绿** = 本应用接管触摸的部分；**橙** = 让给系统「侧滑返回」的一条边带。\n" +
+                    "「左右边缘预留」管的是后面这件事：屏幕最外侧那一条窄带留给系统，侧滑返回照常可用，" +
+                    "只有带子以内才由本应用接管。它**不改变触摸区的尺寸和位置**，所以在真机上光看是" +
+                    "看不出变化的——这条带子只决定「这一段边缘谁来接这次触摸」。\n" +
+                    "想看到真机上的实际效果，打开上面的「显示触摸区预览」，屏幕左下角 / 右下角就会" +
+                    "画出**同样的绿橙两色**（那时卡片末尾这张示意图会自动收起来，免得两张图叠在一起）；" +
+                    "那时从最边缘斜着往上滑，落在橙色里是系统返回、落在绿色里才唤出轮盘。",
             ),
         )
 
-        root.addView(sectionTitle("扇形观感"))
-        root.addView(
-            seekRow("扇形宽度（dp）", store.menuWidthDp,
-                SettingsStore.MIN_MENU_DIM_DP, SettingsStore.MAX_MENU_DIM_DP) { value ->
-                store.menuWidthDp = value
-                refreshPreview()
-            },
-        )
-        root.addView(
-            seekRow("扇形高度（dp）", store.menuHeightDp,
-                SettingsStore.MIN_MENU_DIM_DP, SettingsStore.MAX_MENU_DIM_DP) { value ->
-                store.menuHeightDp = value
-                refreshPreview()
-            },
-        )
-        root.addView(
-            seekRow("扇形离屏幕边距离（占屏幕短边 %）", store.menuCornerInsetPercent,
-                SettingsStore.MIN_MENU_CORNER_INSET_PERCENT, SettingsStore.MAX_MENU_CORNER_INSET_PERCENT) { value ->
-                store.menuCornerInsetPercent = value
-                refreshPreview()
-            },
-        )
-        root.addView(
-            seekRow("图标大小（直径 dp）", store.menuIconDp,
-                SettingsStore.MIN_MENU_ICON_DP, SettingsStore.MAX_MENU_ICON_DP) { value ->
-                store.menuIconDp = value
-                refreshPreview()
-            },
-        )
-        // 图标大小的上限由「扇形宽高 + 项数」决定，直接写出来，免得滑块拖了没反应还不知道为什么。
-        root.addView(hint(iconCapText()).also { iconCapHint = it })
-        root.addView(
-            hint("「宽度」管横向伸展、「高度」管纵向伸展，「离屏幕边距离」管扇形离角落多远——觉得图标靠边就调大它。"),
-        )
-        root.addView(
-            switchRow("划过图标时震动", store.menuHapticEnabled) { checked ->
-                store.menuHapticEnabled = checked
-            },
-        )
+        root.addView(Ui.spacer(this))
+        root.addView(Ui.outlinedButton(this, "恢复默认设置") { resetToDefaults() })
 
-        root.addView(sectionTitle("角落点击"))
+        // ---- 扇形观感 ----
+        root.addView(Ui.sectionTitle(this, "扇形观感"))
         root.addView(
-            switchRow("角落点击穿透（点角落仍能点到下层）", store.cornerTapThroughEnabled) { checked ->
-                store.cornerTapThroughEnabled = checked
-            },
+            CardGroup(this)
+                .row(
+                    seekRow(
+                        label = "扇形宽度",
+                        value = store.menuWidthDp,
+                        min = SettingsStore.MIN_MENU_DIM_DP,
+                        max = SettingsStore.MAX_MENU_DIM_DP,
+                        onLive = {
+                            liveMenuW = it
+                            syncPreview()
+                        },
+                    ) { value ->
+                        store.menuWidthDp = value
+                        refreshPreview()
+                    },
+                )
+                .row(
+                    seekRow(
+                        label = "扇形高度",
+                        value = store.menuHeightDp,
+                        min = SettingsStore.MIN_MENU_DIM_DP,
+                        max = SettingsStore.MAX_MENU_DIM_DP,
+                        onLive = {
+                            liveMenuH = it
+                            syncPreview()
+                        },
+                    ) { value ->
+                        store.menuHeightDp = value
+                        refreshPreview()
+                    },
+                )
+                .row(
+                    seekRow(
+                        label = "扇形离屏幕边距离",
+                        value = store.menuCornerInsetPercent,
+                        min = SettingsStore.MIN_MENU_CORNER_INSET_PERCENT,
+                        max = SettingsStore.MAX_MENU_CORNER_INSET_PERCENT,
+                        detail = "占屏幕短边 %",
+                        onLive = {
+                            liveCornerInset = it
+                            syncPreview()
+                        },
+                    ) { value ->
+                        store.menuCornerInsetPercent = value
+                        refreshPreview()
+                    },
+                )
+                .row(
+                    seekRow(
+                        label = "图标大小",
+                        value = store.menuIconDp,
+                        min = SettingsStore.MIN_MENU_ICON_DP,
+                        max = SettingsStore.MAX_MENU_ICON_DP,
+                        onLive = {
+                            liveIconDp = it
+                            syncPreview()
+                        },
+                    ) { value ->
+                        store.menuIconDp = value
+                        refreshPreview()
+                    },
+                )
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "划过图标时震动",
+                        store.menuHapticEnabled,
+                        detail = "沿弧线划过每个图标时给一次触感反馈",
+                    ) { checked ->
+                        store.menuHapticEnabled = checked
+                    },
+                ),
         )
         root.addView(
-            hint(
-                "触摸区会挡住角落，导致屏幕左右下角点不动。打开后，普通点击会「穿透」到下层应用，" +
-                    "长按也能正常触发。依赖无障碍服务开启。",
+            Ui.hint(
+                this,
+                "「宽度」管横向伸展、「高度」管纵向伸展，两者一起构成椭圆弧；" +
+                    "「离屏幕边距离」决定整条弧离角落多远。\n" +
+                    "图标大小与扇形几何**完全解耦**：拖它只改图标本身，轮盘形状、位置、张角都不动，" +
+                    "所以调得比弧上的格子大时会相互重叠，按观感自己取。",
             ),
         )
 
-        root.addView(sectionTitle("图标包"))
-        iconPackButton = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(14f))
-            setTextColor(0xFF1A1A1A.toInt())
-            setPadding(dp(16), dp(14), dp(16), dp(14))
-            background =
-                GradientDrawable().apply {
-                    cornerRadius = dp(12).toFloat()
-                    setColor(0xFFFFFFFF.toInt())
-                }
-            isClickable = true
-            setOnClickListener { cycleIconPack() }
+        // ---- 角落点击 ----
+        root.addView(Ui.sectionTitle(this, "角落点击"))
+        val a11yReady = FreeformAccessibilityService.isConnected
+        root.addView(
+            CardGroup(this).row(
+                Ui.switchRow(
+                    this,
+                    "角落点击穿透",
+                    store.cornerTapThroughEnabled,
+                    detail = "点角落仍能点到下层应用",
+                ) { checked ->
+                    store.cornerTapThroughEnabled = checked
+                },
+            ),
+        )
+        root.addView(
+            Ui.hint(
+                this,
+                "触摸区会挡住角落，导致屏幕左右下角点不动。打开后普通点击会穿透到下层，长按也能正常触发。" +
+                    if (a11yReady) " 无障碍服务已连接，功能可用。" else " 无障碍服务未连接，点击穿透暂不可用。",
+            ),
+        )
+        if (!a11yReady) {
+            root.addView(Ui.tonalButton(this, "前往开启无障碍服务") { FreeformAccessibilityService.openSettings(this) })
         }
-        root.addView(iconPackButton)
-        iconPackHint = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(11f))
-            setTextColor(0xFF9A9A9A.toInt())
-            setPadding(dp(4), dp(2), dp(4), dp(10))
-            text = "正在检测图标包…"
-        }
+
+        // ---- 通知 ----
+        root.addView(Ui.sectionTitle(this, "通知"))
+        root.addView(
+            CardGroup(this).row(
+                Ui.switchRow(
+                    this,
+                    "隐藏状态栏通知",
+                    store.hideForegroundNotification,
+                    detail = "把「主动呼出已开启」那条通知变成静默、可划掉",
+                ) { checked ->
+                    store.hideForegroundNotification = checked
+                    // 通知是前台服务启动时挂上去的，改完得让它按新渠道重挂一次。
+                    OverlayGestureService.reload(this)
+                },
+            ),
+        )
+        root.addView(
+            Ui.hint(
+                this,
+                "启动主动呼出后，通知栏里会常驻一条「主动呼出已开启」。**Android 要求前台服务必须" +
+                    "挂一条通知，彻底去掉是做不到的**——强行取消它，部分系统会判定这条服务失去了前台" +
+                    "身份、把它收掉，那就变成「主动呼出自己停了」，比多一行通知严重得多。\n" +
+                    "打开这个开关后它切到**静默渠道**：不出声、不弹横幅、不亮屏、不显示角标、不进锁屏，" +
+                    "并且**可以划掉**——划掉之后这一轮就不会再出现，直到服务下次重启（开机或再次" +
+                    "「启动主动呼出」）才会重新挂一条。",
+            ),
+        )
+
+        // ---- 图标包 ----
+        root.addView(Ui.sectionTitle(this, "图标包"))
+        iconPackButton =
+            Ui.entryRow(this, "图标包：正在检测…") { cycleIconPack() }
+        root.addView(CardGroup(this).row(iconPackButton))
+        iconPackHint = Ui.hint(this, "正在检测图标包…")
         root.addView(iconPackHint)
         updateIconPackLabel()
         // 图标包检测读资源很慢，放后台线程，避免进入页面卡一下。
         detectIconPacksAsync()
 
-        return ScrollView(this).apply { addView(root) }
+        renderTouchDiagram()
+        return Ui.scrollPage(this, root)
     }
 
-    private lateinit var iconPackButton: TextView
+    /**
+     * 触摸区预览那一行。
+     *
+     * 做成卡片组里的**第一行**而不是独立一张卡：它和下面的「左下角 / 右下角」同属「触摸区」，
+     * 分成两张卡就要在组内留缝，反而破坏了分组感。
+     */
+    private fun previewRow(): View =
+        Ui.row(this).apply {
+            val texts =
+                LinearLayout(this@CornerSettingsActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(Ui.rowTitle(this@CornerSettingsActivity, "显示触摸区预览"))
+                    addView(Ui.rowDetail(this@CornerSettingsActivity, "把触摸区涂成半透明色，直接看见它在哪"))
+                }
+            addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            val toggle =
+                Switch(this@CornerSettingsActivity).apply {
+                    isChecked = previewOn
+                    setOnCheckedChangeListener { _, checked ->
+                        previewOn = checked
+                        OverlayGestureService.setPreview(this@CornerSettingsActivity, checked)
+                        // 开预览时顺手把当前草稿推一遍：正常情况下草稿==落库值，但页面重进、
+                        // 手动输入过数值这类路径里，先推一次能保证屏幕上的预览和下面那张示意图
+                        // 从第一帧起就是同一份值。
+                        if (checked) syncPreview()
+                        // 预览一开一关，卡片末尾那张示意图要跟着加 / 减（见 [applyTouchDiagramRow]）。
+                        applyTouchDiagramRow()
+                    }
+                }
+            previewToggle = toggle
+            addView(toggle)
+            isClickable = true
+            setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        }
+
+    /**
+     * 触摸区示意图所在的那一行：一块画布 + 一行图注。
+     *
+     * 它排在卡片**最后一行**，因为它画的是上面宽 / 高 / 边缘预留三个值的**合并结果**——
+     * 三个滑块都在它上面，往下看就是「合起来长什么样」。
+     */
+    private fun touchDiagramRow(): View {
+        touchDiagram = EdgeInsetPreview(this)
+        touchDiagramCaption =
+            Ui.rowDetail(this, "").apply { setPadding(0, dp(8), 0, 0) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(Ui.ROW_PADDING_H), dp(6), dp(Ui.ROW_PADDING_H), dp(14))
+            addView(
+                touchDiagram,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(DIAGRAM_HEIGHT_DP),
+                ),
+            )
+            addView(touchDiagramCaption)
+        }
+    }
+
+    /**
+     * 按预览开关决定触摸区那一组里要不要那张示意图，并**整组重画**。
+     *
+     * ## 为什么预览开着时不要它
+     *
+     * 屏幕上的预览已经把同样的绿 / 橙画在真机上了（`CornerTriggerView` 涂色的那块），卡片末尾
+     * 再放一张同构的小图纯属重复；而且预览是一层半透明浮层，两张图会隔着它叠在一起——用户的原话
+     * 是「有点多余……不然重叠了，看着乱乱的」。关掉预览时它照旧在最下面：那时屏幕上什么都没有，
+     * 这张图是唯一的可视化（见 [EdgeInsetPreview]）。
+     *
+     * ## 为什么是整组重画，而不是把那一行 `visibility = GONE`
+     *
+     * [CardGroup] 是**逐行刷圆角**的（首行圆上角、末行圆下角，中间行全直角）。末行一旦隐藏，
+     * 组的下沿就变成直角、缺了两块圆角——正是用户一直在挑的那种「凹下去」的观感。所以宁可整组
+     * 重排：`setRows` 重算圆角，视觉上只有示意图那一段自然收起来。
+     */
+    private fun applyTouchDiagramRow() {
+        if (!::touchGroup.isInitialized || !::touchCoreRows.isInitialized) return
+        // 预览关着时加在最后——它是「宽 / 高 / 边缘预留」三个值的合并结果，本来就该垫在三条滑块下面。
+        val rows = if (previewOn) touchCoreRows else touchCoreRows + touchDiagramRow()
+        touchGroup.setRows(rows)
+        // 每次重建都会换一个新的 EdgeInsetPreview（旧的随 `removeAllViews` 一起走），
+        // 所以要把当前草稿重新画进去。
+        renderTouchDiagram()
+    }
+
+    /** 把三个草稿画进示意图并刷新图注。拖动中高频调用，所以这里只做纯绘制、不碰设置。 */
+    private fun renderTouchDiagram() {
+        if (!::touchDiagram.isInitialized) return
+        touchDiagram.update(liveRangeW, liveRangeH, liveBand)
+        touchDiagramCaption.text =
+            if (liveBand <= 0) {
+                "触摸区 ${liveRangeW} × ${liveRangeH}dp 全部由本应用接管（没有让给系统的边带）。"
+            } else {
+                "触摸区 ${liveRangeW} × ${liveRangeH}dp，其中最外侧 ${liveBand}dp 让给系统。"
+            }
+    }
+
+    private lateinit var iconPackButton: android.widget.LinearLayout
     private lateinit var iconPackHint: TextView
     private val iconPacks = mutableListOf<String>()
 
@@ -244,122 +509,37 @@ class CornerSettingsActivity : Activity() {
 
     private fun updateIconPackLabel() {
         val current = store.iconPackPackage
-        iconPackButton.text =
+        (iconPackButton.tag as? TextView)?.text =
             if (current.isBlank()) {
-                "图标包：不使用（默认图标）  ›"
+                "图标包：不使用（默认图标）"
             } else {
-                "图标包：${current}  ›"
+                "图标包：$current"
             }
     }
 
-    private fun title(text: String) =
-        TextView(this).apply {
-            this.text = text
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(22f))
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(0xFF1A1A1A.toInt())
-            setPadding(dp(4), dp(16), 0, dp(4))
-        }
+    // ---- 滑块（薄封装：把「点数值胶囊 → 输入具体数字」接到 Ui.seekRow 上） ----
 
-    private fun sectionTitle(text: String): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(24), 0, dp(10))
+    private fun seekRow(
+        label: String,
+        value: Int,
+        min: Int,
+        max: Int,
+        detail: String? = null,
+        onLive: ((Int) -> Unit)? = null,
+        onChange: (Int) -> Unit,
+    ): View =
+        Ui.seekRow(
+            context = this,
+            label = label,
+            value = value,
+            min = min,
+            max = max,
+            detail = detail,
+            onLive = onLive,
+            onCommit = onChange,
+        ) { inputLabel, current, lo, hi, apply ->
+            showInputDialog(inputLabel, current, lo, hi, apply)
         }
-        row.addView(
-            View(this).apply {
-                background = GradientDrawable().apply { cornerRadius = dp(2).toFloat(); setColor(ACCENT) }
-                layoutParams = LinearLayout.LayoutParams(dp(4), dp(16))
-            },
-        )
-        row.addView(
-            TextView(this).apply {
-                this.text = text
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(15f))
-                typeface = Typeface.DEFAULT_BOLD
-                setTextColor(0xFF1A1A1A.toInt())
-                setPadding(dp(8), 0, 0, 0)
-            },
-        )
-        return row
-    }
-
-    private fun hint(text: String) =
-        TextView(this).apply {
-            this.text = text
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(11f))
-            setTextColor(0xFF9A9A9A.toInt())
-            setPadding(dp(4), dp(2), dp(4), dp(10))
-            setLineSpacing(dp(2).toFloat(), 1f)
-        }
-
-    private fun switchRow(text: String, checked: Boolean, onChange: (Boolean) -> Unit): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(6), dp(12), dp(6))
-            background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(0xFFFFFFFF.toInt()) }
-        }
-        row.addView(
-            TextView(this).apply {
-                this.text = text
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(13f))
-                setTextColor(0xFF1A1A1A.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            },
-        )
-        row.addView(Switch(this).apply { isChecked = checked; setOnCheckedChangeListener { _, v -> onChange(v) } })
-        return row
-    }
-
-    private fun seekRow(label: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit): View {
-        val wrapper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(10), dp(16), dp(12))
-            background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(0xFFFFFFFF.toInt()) }
-        }
-        val caption = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(13f)); setTextColor(0xFF1A1A1A.toInt()); text = label
-        }
-        // 数值做成可点的胶囊：点一下直接输入具体数字。
-        val valueView = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
-            setTextColor(ACCENT)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(4), dp(12), dp(4))
-            background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(0x141D9E75) }
-            isClickable = true
-            text = value.toString()
-        }
-        val captionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        captionRow.addView(caption, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        captionRow.addView(valueView)
-        wrapper.addView(captionRow)
-        val bar = SeekBar(this).apply {
-            this.max = max - min
-            progress = (value - min).coerceIn(0, max - min)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    valueView.text = (min + progress).toString()
-                }
-                override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
-                override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                    onChange(min + (seekBar?.progress ?: 0))
-                }
-            })
-        }
-        valueView.setOnClickListener {
-            showInputDialog(label, min + bar.progress, min, max) { newValue ->
-                bar.progress = newValue - min
-                valueView.text = newValue.toString()
-                onChange(newValue)
-            }
-        }
-        wrapper.addView(bar)
-        return wrapper
-    }
 
     /** 手动输入数值：校验范围，越界给提示、不生效。 */
     private fun showInputDialog(
@@ -395,16 +575,100 @@ class CornerSettingsActivity : Activity() {
             .show()
     }
 
-    private val shortEdgePx: Float
-        get() = minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
-
     /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
-    private fun dp(value: Int): Int = (value / 400f * shortEdgePx).toInt()
-
-    /** 按屏幕短边比例算文字大小（px），参数是 400dp 屏上的 sp 值。 */
-    private fun scaledSp(designSp: Float): Float = designSp / 400f * shortEdgePx
+    private fun dp(value: Int): Int = Ui.dp(this, value)
 
     private companion object {
-        const val ACCENT = 0xFF1D9E75.toInt()
+        /** 示意图画布高度（400dp 短边基准下的 dp）。固定值，拖滑块时页面不会跟着上下跳。 */
+        const val DIAGRAM_HEIGHT_DP = 104
+    }
+}
+
+/**
+ * 「左右边缘预留」的示意图：屏幕左下角那一块触摸区，其中靠外的一条带子标成「让给系统」。
+ *
+ * ## 为什么需要这张图
+ *
+ * 这个值**不改变触摸区的尺寸和位置**，只决定最外侧那条窄带归谁接管。所以在真机上「看不出变化」
+ * 是必然的——单靠文字怎么解释都绕。画出来最省事：绿 = 本应用接管，橙 = 让给系统侧滑返回，
+ * 拖滑块时橙色条实时变宽变窄，一眼就懂。
+ *
+ * ## 比例
+ *
+ * 宽高都走 [Ui.dp]（按屏幕短边等比缩放），和真机同一个口径，所以两个值的**相对宽度**是准的。
+ * 触摸区被调到很大、画布放不下时整体等比缩小，比例关系仍然不变。
+ */
+private class EdgeInsetPreview(context: Context) : View(context) {
+
+    private val blockFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = BLOCK_COLOR }
+    private val reservedFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = RESERVED_COLOR }
+    private val edgeLine =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1.5f * resources.displayMetrics.density
+            color = Ui.COLOR_OUTLINE
+        }
+    private val outline =
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1f * resources.displayMetrics.density
+            color = Ui.COLOR_OUTLINE_VARIANT
+        }
+    private val clipPath = Path()
+    private val rect = RectF()
+
+    private var blockW = 0f
+    private var blockH = 0f
+    private var bandW = 0f
+
+    /** 三个值都是 400dp 基准下的设计 dp，与设置项同一口径。 */
+    fun update(rangeWidthDp: Int, rangeHeightDp: Int, edgeInsetDp: Int) {
+        blockW = Ui.dp(context, rangeWidthDp).toFloat()
+        blockH = Ui.dp(context, rangeHeightDp).toFloat()
+        bandW = Ui.dp(context, edgeInsetDp).toFloat()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (blockW <= 0f || blockH <= 0f) return
+        val density = resources.displayMetrics.density
+        val margin = 2f * density
+        val areaW = width - margin * 2
+        val areaH = height - margin * 2
+        if (areaW <= 0f || areaH <= 0f) return
+
+        // 画不下就整体等比缩小：宁可小一点，也不能把长宽比画歪——比例一歪这张图就没意义了。
+        val scale = minOf(1f, areaW / blockW, areaH / blockH)
+        val w = blockW * scale
+        val h = blockH * scale
+        val band = (bandW * scale).coerceIn(0f, w)
+        // 贴左、贴底：右下角的触摸区也长这样，只是边缘在右边（同构，不必画两份）。
+        val left = margin
+        val top = height - margin - h
+        val right = left + w
+        val bottom = height - margin
+        val radius = 5f * density
+        rect.set(left, top, right, bottom)
+
+        clipPath.reset()
+        clipPath.addRoundRect(rect, radius, radius, Path.Direction.CW)
+        canvas.save()
+        canvas.clipPath(clipPath)
+        canvas.drawRect(rect, blockFill)
+        if (band > 0f) canvas.drawRect(left, top, left + band, bottom, reservedFill)
+        canvas.restore()
+        canvas.drawRoundRect(rect, radius, radius, outline)
+
+        // 屏幕边缘：一条竖线，说明这一侧就是屏幕边（触摸区永远贴着它）。
+        canvas.drawLine(left, margin, left, height - margin, edgeLine)
+    }
+
+    private companion object {
+        /** 本应用接管的区域（绿）。 */
+        const val BLOCK_COLOR = 0xFFCFEFE0.toInt()
+
+        /** 让给系统的边带（橙）。 */
+        const val RESERVED_COLOR = 0xFFF7B267.toInt()
     }
 }

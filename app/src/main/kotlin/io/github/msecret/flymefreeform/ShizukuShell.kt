@@ -59,9 +59,10 @@ object ShizukuShell {
                     requestPermission(AUTO_REQUEST_CODE)
                 } else {
                     // 有权限了：顺手看一眼无障碍有没有被系统清掉（重启后常见），有就写回去。
-                    // 只有用户开着主开关时才动——他要是自己把功能关了，我们不该偷偷打开。
+                    // 只有用户开着主开关（或窗外点击关闭）时才动——他要是自己把功能关了，我们不该偷偷打开。
                     AppContext.value?.let { context ->
-                        if (SettingsStore(context).enabled) {
+                        val settings = SettingsStore(context)
+                        if (settings.enabled || settings.outsideTapCloseEnabled) {
                             AccessibilityGrant.restoreIfMissing(context)
                         }
                     }

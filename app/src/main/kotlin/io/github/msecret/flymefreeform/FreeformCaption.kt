@@ -27,8 +27,7 @@ import android.graphics.Point
  *
  * ## 用它能做什么
  *
- * 1. [closeSwipe]：在真实坐标上做一次**快速上滑** = ColorOS 手势模式自带的「关闭浮窗」；
- * 2. [tapCaption]：在真实坐标上**单击**一次，ColorOS 上点小横条就是直接关掉自由窗。
+ * 1. [closeSwipe]：在真实坐标上做一次**快速上滑** = ColorOS 手势模式自带的「关闭浮窗」。
  *
  * （早先还有一条「向上慢拖并停住 = 收成迷你浮窗」的用法，实测在 ColorOS 17 上得到的
  * 是**关闭**而不是迷你，已整体下线。）
@@ -151,16 +150,4 @@ object FreeformCaption {
         return ShizukuShell.injectSwipe(point.x, point.y, point.x, toY, CLOSE_SWIPE_DURATION_MS)
     }
 
-    /**
-     * 在学到的小横条坐标上**单击**一次——ColorOS 上点小横条就是直接关掉自由窗。
-     *
-     * 和小窗右上角那个按钮不同：点按钮会先弹一个二级菜单，还得再选一次。
-     *
-     * @return false 表示还没学到坐标（上层应退回按边界估算的老路子）。
-     */
-    fun tapCaption(): Boolean {
-        val point = cachedPoint ?: return false
-        DebugLog.info("CAPTION_TAP", "单击小横条 (${point.x},${point.y})")
-        return ShizukuShell.injectTap(point.x, point.y)
-    }
 }

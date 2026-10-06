@@ -1,6 +1,8 @@
 package io.github.msecret.flymefreeform
 
 import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.Rect
 import android.os.SystemClock
 import android.view.MotionEvent
@@ -92,6 +94,9 @@ class CornerTriggerView(
         set(value) {
             field = value
             updateGestureExclusion()
+            // 预览里这条带子是画出来的，值变了必须重画——不然拖完「左右边缘预留」滑块，
+            // 橙色条还停在旧宽度上，看着就像「改了没反应」。
+            invalidate()
         }
 
     /**
@@ -107,13 +112,43 @@ class CornerTriggerView(
             updateGestureExclusion()
         }
 
-    /** 预览模式：给触摸区涂半透明色，让用户在设置页调整参数时能直观看到它在哪。 */
+    /**
+     * 预览模式：给触摸区涂半透明色，让用户在设置页调整参数时能直观看到它在哪。
+     *
+     * 整块涂**绿**表示「这块归本应用接管」；再叠一条**橙色**窄带（见 [onDraw]）表示其中靠屏幕
+     * 外侧、让给系统的那一段。两条颜色必须拉开——用户问「左右边缘预留是干嘛的、看不出来」，
+     * 就是因为原来整块同色，改这个值画面毫无变化。
+     */
     var previewMode: Boolean = false
         set(value) {
             if (field == value) return
             field = value
             setBackgroundColor(if (value) PREVIEW_COLOR else android.graphics.Color.TRANSPARENT)
+            invalidate()
         }
+
+    /** 「让给系统」那条边带的预览色（橙）。 */
+    private val reservedBandPaint = Paint().apply { color = PREVIEW_RESERVED_COLOR }
+
+    /**
+     * 预览时把边缘预留带画成橙色。
+     *
+     * 画在背景（整块绿）之上，所以带子从哪里起、有多宽一目了然。注意它**只在这块触摸区内
+     * 可见**：带子比触摸区还宽时被裁掉一截是正常的，反过来说明这个值已经大到把触摸区吃满了。
+     */
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (!previewMode) return
+        val w = width.toFloat()
+        val band = edgeBandPx.coerceIn(0, width).toFloat()
+        if (band <= 0f) return
+        val h = height.toFloat()
+        if (side == CornerSide.Left) {
+            canvas.drawRect(0f, 0f, band, h, reservedBandPaint)
+        } else {
+            canvas.drawRect(w - band, 0f, w, h, reservedBandPaint)
+        }
+    }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
@@ -162,6 +197,11 @@ class CornerTriggerView(
                 movedBeyondSlop = false
                 suppressTap = false
                 engine.down(side, downX, downY)
+                // 排查「轮盘呼不出来」的第一手证据：**触摸到底有没有落到这条触摸条上**。
+                // 只有这条没有配对的下游日志（GESTURE_ACTIVATED / CORNER_TAP_DETECTED）时，
+                // 才说明是手势判定那一侧的问题；这条本身都不出现，就是窗口没收到触摸
+                // （被摘掉、被上层盖住、卡在不可触摸）——两条路的修法完全不同。
+                DebugLog.info("GESTURE_DOWN", "side=$side 坐标=(${downX.toInt()},${downY.toInt()})")
                 listener.onGestureStart(side)
                 return true
             }
@@ -245,5 +285,8 @@ class CornerTriggerView(
 
         /** 预览模式的半透明色（绿），用于在设置页调整参数时标出触摸区。 */
         const val PREVIEW_COLOR = 0x6628D9A1.toInt()
+
+        /** 预览模式的半透明色（橙），标出触摸区里让给系统侧滑返回的那条边带。 */
+        const val PREVIEW_RESERVED_COLOR = 0x99FF8A3D.toInt()
     }
 }

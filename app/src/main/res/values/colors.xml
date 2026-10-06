@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- 本项目用到的几个 color role。
+         数值与 Ui.kt 里的常量保持一致——这里是给系统控件（Switch / SeekBar / 对话框）
+         读的，Activity 自己画的 View 走 Ui.kt。
+         主色/底色就是重构前那一版（#1D9E75 / #F5F6F8）——用户两次反馈 M3 那套压深的绿
+         「没之前好看」，所以原样搬回来，不再另立一套。 -->
+    <color name="m3_surface">#F5F6F8</color>
+    <color name="m3_primary">#1D9E75</color>
+    <color name="m3_on_primary">#FFFFFF</color>
+    <color name="m3_state_layer">#1F1A1A1A</color>
+
+    <!-- 兼容旧引用 -->
     <color name="page_background">#F5F6F8</color>
-    <color name="accent">#1E88E5</color>
+    <color name="accent">#1D9E75</color>
 </resources>

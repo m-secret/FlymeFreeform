@@ -20,24 +20,32 @@ class MenuPreviewView(context: Context) : View(context) {
 
     private val density = resources.displayMetrics.density
 
+    /**
+     * 弧线与占位圆的颜色。
+     *
+     * 取 [Ui.COLOR_PRIMARY]（品牌绿）而不是自己抄一个色值——预览和设置页的强调色必须是同一个，
+     * 否则用户在预览里看到的绿和刚调过的那个绿对不上。
+     */
+    private fun withAlpha(alpha: Int): Int = (Ui.COLOR_PRIMARY and 0x00FFFFFF) or (alpha shl 24)
+
     private val arcPaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = 2f * density
-            color = 0x991D9E75.toInt()
+            color = withAlpha(0x99)
         }
 
     /** 图标占位圆：半透明填充 + 实心描边，尺寸 = 真实图标直径。 */
     private val iconFillPaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
-            color = 0x401D9E75.toInt()
+            color = withAlpha(0x40)
         }
     private val iconStrokePaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeWidth = 2f * density
-            color = 0xFF1D9E75.toInt()
+            color = Ui.COLOR_PRIMARY
         }
 
     private var screenLeft = 0f
@@ -47,6 +55,8 @@ class MenuPreviewView(context: Context) : View(context) {
     private var radiusX = 0f
     private var radiusY = 0f
     private var itemCount = 0
+    private var leftEnabled = true
+    private var rightEnabled = true
     private var layout = MenuGeometry.Layout(0f, 0f, 0f, MenuGeometry.CENTER_ANGLE_DEG)
 
     fun preview(
@@ -58,6 +68,8 @@ class MenuPreviewView(context: Context) : View(context) {
         heightDp: Int,
         iconSizeDp: Int,
         itemCount: Int,
+        leftEnabled: Boolean = true,
+        rightEnabled: Boolean = true,
     ) {
         this.screenLeft = screenLeft
         this.screenRight = screenRight
@@ -66,6 +78,8 @@ class MenuPreviewView(context: Context) : View(context) {
         this.radiusX = widthDp * density
         this.radiusY = heightDp * density
         this.itemCount = itemCount
+        this.leftEnabled = leftEnabled
+        this.rightEnabled = rightEnabled
         // 与真实扇形同一套几何：同一个图标基准半径 → 同一份布局。
         val baseIconRadius = (iconSizeDp.coerceIn(1, 200) * density) / 2f
         this.layout = MenuGeometry.resolve(itemCount, baseIconRadius)
@@ -75,9 +89,8 @@ class MenuPreviewView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (radiusX <= 0 || radiusY <= 0) return
-        // 左右两个角落都画，不管从哪侧呼出都能对上。
-        drawSide(canvas, CornerSide.Left)
-        drawSide(canvas, CornerSide.Right)
+        if (leftEnabled) drawSide(canvas, CornerSide.Left)
+        if (rightEnabled) drawSide(canvas, CornerSide.Right)
     }
 
     private fun drawSide(canvas: Canvas, side: CornerSide) {

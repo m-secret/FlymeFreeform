@@ -20,7 +20,7 @@ import android.widget.TextView
 import kotlin.math.abs
 
 /**
- * 扇形固定项的横向排列条，对应魅族「More apps」面板顶部的 Selected 区。
+ * 扇形固定项的排列条，对应魅族「More apps」面板顶部的 Selected 区。
  *
  * 为什么单独写一个而不是用 `ItemTouchHelper`：那套依赖 RecyclerView，而本模块没有任何
  * AndroidX 依赖（面板是 Service 里的普通 View）。这里把「长按拾起 → 跟手平移 → 越位换位」
@@ -34,9 +34,15 @@ import kotlin.math.abs
  * 单击、长按、拖拽三种意图都在 [onTouchEvent] 里按位移与时长区分，避免「子 View 吃掉 DOWN
  * 之后父 View 再也收不到 MOVE」这类经典冲突。
  *
- * 布局：默认条目等分整条宽度（`weight = 1`），图标尺寸由调用方按屏幕比例给定
- * （[preferredIconPx]），槽位太窄时自动缩小，所以固定 6 个也不会把窄屏撑破；
- * [packed] 打开时改成「每格刚好一个图标宽、整排居中」（卡片下方那条固定栏用）。
+ * ## 三种排布
+ *
+ * - **网格**（[columns] > 0）：「已选」条用它，每行最多 [columns] 格，超出换行。固定项最多
+ *   [SettingsStore.MAX_PINS]（6）个，单行等分会把图标压到 70%，换行后每格都有四分之一宽，
+ *   图标能保持和下面网格里一样大。拖拽是**二维**的——横着换列、竖着换行。
+ * - **紧凑**（[packed]）：卡片下方那条底栏用它，每格刚好一个图标宽，整排居中。
+ * - **竖排**（[vertical]，配 [packed] 用）：横屏时面板贴屏幕侧边，底栏改排成一列往下走，
+ *   拖拽换位的坐标轴跟着从横向换成纵向（见 [indexAt] / [refreshSiblings]）。
+ * - **单行等分**：两者之外的兜底，条目等分整条宽度。
  */
 class PinnedStripView(
     context: Context,
@@ -50,7 +56,7 @@ class PinnedStripView(
      * 紧凑排列：槽位不再等分整条宽度，而是「刚好一个图标宽」，整排居中。
      *
      * 「已选」条要的是等分槽位——它对应扇形上均匀分布的格子，铺满整条才看得出顺序。
-     * 卡片下方那条固定栏只要几个图标挨着，等分会让它们散得很开，所以那里开这个开关。
+     * 卡片下方那条底栏只要几个图标挨着，等分会让它们散得很开，所以那里开这个开关。
      */
     private val packed: Boolean = false,
     /**
@@ -62,17 +68,99 @@ class PinnedStripView(
      * 「吃掉这次点击但什么都不做」，避免点空白误开应用。
      */
     private val iconOnlyTap: Boolean = false,
+    /**
+     * 网格列数：**> 0 时按网格排布，每行最多这么多格，超出换行**；0 表示不用网格（见类注释）。
+     *
+     * 换行之后拖拽也从一维变成二维：手指落在第几行第几列，被拖项就去哪个位次。
+     */
+    private val columns: Int = 0,
+    /**
+     * 每格角标的形态（工具页网格用）。
+     *
+     * 网格里同一个图标要么「未固定」画**绿底白 ＋**、要么「已固定」画**红底白 －**，形态是逐格
+     * 决定的，不能像 [removeBadgeVisible] 那样整条一刀切。给了这个回调就按它算；没给则退回
+     * [removeBadgeVisible] 的老行为（「已选」条与底栏用）。
+     */
+    private val badgeFor: ((AppEntry) -> BadgeState)? = null,
+    /** 标签文字相对图标的大小比例。默认 0.30（沿用「已选」条）；工具页网格用面板自己那套。 */
+    private val labelTextScale: Float = 0.30f,
+    /**
+     * 是否在图标下面显示应用名。
+     *
+     * **底栏要传 false**（竖屏的卡片下方、横屏贴边时卡片外侧那一列都不显示）：那条只有图标、
+     * 横向很紧凑，名字既挤不下也没必要，而且名字那一行会把底栏撑高——横屏居中时底栏的高度是
+     * **直接从卡片高度里扣掉的**，白矮一截（用户明确要求「底栏不用显示名字，任何横屏竖屏都不用」）。
+     */
+    private val showLabel: Boolean = true,
+    /**
+     * 长按起了拖拽、但**抬手时手指还在原地没挪**：交给调用方处理（工具页用它弹管理菜单）。
+     *
+     * 一条手势因此能承载两个意图——**长按拖 = 排序，长按不动再松手 = 打开菜单**。不需要为
+     * 排序另开一个入口，也不会把原来那套「长按弹菜单」的用法弄丢。
+     */
+    private val onLongPress: ((AppEntry) -> Unit)? = null,
+    /**
+     * 嵌在可滚动容器里（工具页的 ScrollView、底栏的横向滚动条）时置 true。
+     *
+     * 开启后本视图**不再无条件拦截触摸**：进入拖拽前一律放行，让外层容器正常滚动；只有长按
+     * 真正起了拖拽，才 `requestDisallowInterceptTouchEvent(true)` 把滚动手势抢过来。
+     * 不这么分，两种手势会互相打架——要么滑不动列表，要么拖不动图标。
+     */
+    private val nestedScroll: Boolean = false,
+    /**
+     * 网格模式下**相邻两行之间**的额外间距（px）。
+     *
+     * 不设的话行与行直接贴着，只剩槽位自己那点上下内边距，密到「挤成一团」——工具页只有
+     * 十来格，一眼就能看出比应用页的网格紧凑。应用页每一行自带 8dp 上下内边距，两行之间
+     * 因此是 16dp；调用方按同一口径传进来，两页的纵向节奏才一致。
+     *
+     * 只对网格模式（[columns] > 0）有效：单行模式没有「行间距」这回事。
+     */
+    private val gridRowGapPx: Int = 0,
+    /**
+     * 把这**一条**排成竖的（横屏时底栏贴在屏幕侧边，一列往下排）。
+     *
+     * 竖排只影响排布方向与「拖拽换位」的坐标轴：命中判定、跟手平移、越位交换全部走纵向，
+     * 横向那条轴一律不管（竖排时每格的宽度本来就一样）。网格（[columns] > 0）自带竖排，
+     * 与本参数互斥——不要同时用。
+     */
+    private val vertical: Boolean = false,
 ) : LinearLayout(context) {
+
+    /** 图标右上角那个小圆标的形态。 */
+    enum class BadgeState {
+        /** 不显示。 */
+        NONE,
+
+        /** 绿底白「＋」：未固定，点它加入。 */
+        PLUS,
+
+        /** 红底白「－」：已固定，点它移出。 */
+        MINUS,
+    }
 
     private class Slot(
         val entry: AppEntry,
         val root: View,
         val iconHolder: FrameLayout,
+        /** 里面那张图（圆形图标本体）。尺寸对齐要用**它**的坐标，而不是外面那圈 holder 的。 */
+        val icon: View,
         /** 右上角的红色「－」角标，只在 [removeBadgeVisible] 时显示。 */
-        val removeBadge: TextView,
+        val removeBadge: IconBadgeView,
     )
 
     private val slots = mutableListOf<Slot>()
+
+    /**
+     * 网格模式下每个槽位所属的行容器，下标与 [slots] 一一对应。
+     *
+     * 槽位是挂在**行容器**里的，所以算它在整条里的位置时，得把行自己的偏移加上去
+     * （见 [slotOriginLeft] / [slotOriginTop]）。
+     */
+    private val slotRows = mutableListOf<LinearLayout>()
+
+    /** 网格模式下的行容器，按自上而下的顺序。 */
+    private val rowContainers = mutableListOf<LinearLayout>()
 
     /**
      * 是否在每个图标右上角画一个红底白「－」。
@@ -84,7 +172,7 @@ class PinnedStripView(
         set(value) {
             if (field == value) return
             field = value
-            refreshRemoveBadges()
+            refreshBadges()
         }
 
     /** 虚拟顺序：第 i 项是「排在第 i 位」的 slot 下标。拖动只改它，不动真实 child 顺序。 */
@@ -97,15 +185,37 @@ class PinnedStripView(
     private val iconTapPadding = dp(ICON_TAP_PADDING_DP)
 
     private var pressedIndex = -1
+
+    /**
+     * 这一次按压是不是落在**角标**上（管理模式里的红「−」/绿「＋」）。
+     *
+     * 落在角标上时会把滚动手势先从外层容器手里要过来（见 [onTouchEvent] 的 DOWN 分支）——
+     * 角标太小，手指哪怕只抖动一两个像素，横向滚动条也会把它当成「要滚」而截走手势、
+     * 给本视图发 CANCEL，用户看到的就是「红『−』点不了」。
+     */
+    private var pressedOnBadge = false
+
     private var downX = 0f
     private var downY = 0f
     private var lastX = 0f
+    private var lastY = 0f
 
     private var draggedIndex = -1
     private var draggedPointerX = 0f
+    private var draggedPointerY = 0f
 
-    /** 一个槽位的宽度，即子 View 的自然宽度（等分布局下所有槽位等宽）。 */
+    /** 单行模式下一个槽位的宽度（等分布局下所有槽位等宽）。 */
     private var slotWidth = 0
+
+    /** 竖排（[vertical]）时一个槽位的高度——纵向命中与换位都以它为单位。 */
+    private var slotHeight = 0
+
+    /** 网格模式下：内容区左上角（= padding）与每格宽高。 */
+    private var gridLeft = 0
+    private var gridTop = 0
+    private var colWidth = 0
+    private var rowHeight = 0
+
     private var iconSizePx = 0
 
     /** 内容代次。每次 [submit] 自增，用来作废那些「已经过期」的延迟回调。 */
@@ -121,12 +231,12 @@ class PinnedStripView(
         }
 
     init {
-        orientation = HORIZONTAL
+        orientation = if (columns > 0 || vertical) VERTICAL else HORIZONTAL
         gravity = Gravity.TOP
         // 拖起来的条目会因为 scale 与阴影超出边界，不裁掉才像被「拎起来」。
         clipChildren = false
         clipToPadding = false
-        setPadding(0, dp(4), 0, dp(2))
+        setPadding(0, dp(8), 0, dp(6))
     }
 
     // ---- 内容 ----
@@ -142,23 +252,73 @@ class PinnedStripView(
         contentGeneration++
         slots.clear()
         order.clear()
+        slotRows.clear()
+        rowContainers.clear()
         removeAllViews()
         pressedIndex = -1
         draggedIndex = -1
 
-        apps.forEach { entry ->
-            val slot = createSlot(entry)
-            slots += slot
-            order += slots.lastIndex
-            // 紧凑模式给固定宽度（图标宽 + 一点余量），整排靠 gravity 居中；默认模式等分整条宽度。
-            val params =
-                if (packed) {
-                    LayoutParams(preferredIconPx + dp(PACKED_SLOT_GAP_DP), ViewGroup.LayoutParams.WRAP_CONTENT)
-                } else {
-                    LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        if (columns > 0) {
+            // 网格：每行最多 columns 格，超出自动换行。
+            apps.chunked(columns).forEach { chunk ->
+                val row =
+                    LinearLayout(context).apply {
+                        orientation = HORIZONTAL
+                        gravity = Gravity.TOP
+                    }
+                chunk.forEach { entry ->
+                    val slot = createSlot(entry)
+                    slots += slot
+                    order += slots.lastIndex
+                    slotRows += row
+                    row.addView(
+                        slot.root,
+                        LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+                    )
                 }
-            addView(slot.root, params)
+                // 末行不满时补等宽占位，保证每一格宽度一致——否则最后一行的图标会被撑宽，
+                // 和上面几行的列位置对不上（和网格里 [buildGridSpacer] 是同一个道理）。
+                repeat(columns - chunk.size) {
+                    row.addView(
+                        View(context).apply { layoutParams = LayoutParams(0, 0, 1f) },
+                    )
+                }
+                rowContainers += row
+                addView(
+                    row,
+                    LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply {
+                        // 第一行不需要间距（它的上方是调用方给的内边距）。
+                        if (rowContainers.size > 1) topMargin = gridRowGapPx
+                    },
+                )
+            }
+        } else {
+            apps.forEach { entry ->
+                val slot = createSlot(entry)
+                slots += slot
+                order += slots.lastIndex
+                // 紧凑模式给固定宽度（holder 宽 + 一个格间距），整排靠 gravity 居中；默认模式等分整条宽度。
+                //
+                // **间距必须是 holder 之外额外的一段**：早先这里给的是
+                // `preferredIconPx + PACKED_SLOT_GAP_DP`，而 holder 本身宽
+                // `preferredIconPx + BADGE_INSET_DP`——两者恰好相等，于是 holder 把槽位撑满、
+                // 槽间距实际为 0，相邻两格的**角标**就贴到了一起（用户看到的「圆挤在一起」）。
+                val params =
+                    if (packed) {
+                        LayoutParams(
+                            preferredIconPx + dp(BADGE_INSET_DP) + dp(PACKED_SLOT_GAP_DP),
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                        )
+                    } else {
+                        LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    }
+                addView(slot.root, params)
+            }
         }
+
         if (packed) gravity = Gravity.CENTER_HORIZONTAL
         visibility = if (apps.isEmpty()) GONE else VISIBLE
         applySizing(width)
@@ -171,6 +331,8 @@ class PinnedStripView(
                 gravity = Gravity.CENTER_HORIZONTAL
                 setPadding(dp(2), dp(3), dp(2), dp(3))
             }
+        // holder 比图标大一圈 [BADGE_INSET_DP]：图标居中，红「－」贴在 holder 的角上，
+        // 两者之间自然留出距离，不会糊在一起。
         val holder = FrameLayout(context)
         val icon =
             ImageView(context).apply {
@@ -180,73 +342,120 @@ class PinnedStripView(
             }
         holder.addView(
             icon,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            ),
+            FrameLayout.LayoutParams(preferredIconPx, preferredIconPx, Gravity.CENTER),
         )
-        // 右上角红底白「－」：管理模式里表示「点一下就从这条里移出」，与绿色的「＋」配成一对。
-        val size = (preferredIconPx * REMOVE_BADGE_FRACTION).toInt()
+        // 右上角红底白「－」：管理模式里表示「点一下就从这条里移出」，与网格里绿色的「＋」配成一对。
+        // 符号由 [IconBadgeView] 用两条线画出来，不是文字——文字会按字体行框居中，看起来偏下。
+        val size = (preferredIconPx * BADGE_DIAMETER_FRACTION).toInt().coerceAtLeast(1)
+        val initialBadge = badgeStateOf(entry)
         val badge =
-            TextView(context).apply {
-                text = "－"
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, size * 0.62f)
-                setTextColor(0xFFFFFFFF.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                background =
-                    GradientDrawable().apply {
-                        shape = GradientDrawable.OVAL
-                        setColor(REMOVE_BADGE_COLOR)
-                        setStroke(dp(1), 0xFFFFFFFF.toInt())
-                    }
+            IconBadgeView(context).apply {
+                plus = initialBadge == BadgeState.PLUS
+                badgeColor = if (initialBadge == BadgeState.PLUS) ADD_BADGE_COLOR else REMOVE_BADGE_COLOR
+                symbolColor = 0xFFFFFFFF.toInt()
+                outlineWidth = dp(1).toFloat()
                 layoutParams = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END)
-                visibility = if (removeBadgeVisible) View.VISIBLE else View.GONE
+                visibility = if (initialBadge == BadgeState.NONE) View.GONE else View.VISIBLE
             }
         holder.addView(badge)
-        val label =
-            TextView(context).apply {
-                text = entry.label
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, preferredIconPx * 0.30f)
-                setTextColor(0xFF1A1A1A.toInt())
-                gravity = Gravity.CENTER
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-                setPadding(0, dp(4), 0, 0)
-            }
         // 初始就按和网格一致的尺寸放置，避免首帧偏大。
-        root.addView(holder, LayoutParams(preferredIconPx, preferredIconPx))
-        root.addView(
-            label,
-            LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
-        )
-        return Slot(entry, root, holder, badge)
+        val holderPx = preferredIconPx + dp(BADGE_INSET_DP)
+        root.addView(holder, LayoutParams(holderPx, holderPx))
+        // 名字是**可选**的：底栏只留图标（见 [showLabel]）。不建这个 TextView 也顺带省下
+        // 它自带的 4dp 上内边距——底栏的高度直接决定卡片多高。
+        if (showLabel) {
+            val label =
+                TextView(context).apply {
+                    text = entry.label
+                    setTextSize(TypedValue.COMPLEX_UNIT_PX, preferredIconPx * labelTextScale)
+                    setTextColor(0xFF1A1A1A.toInt())
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                    setPadding(0, dp(4), 0, 0)
+                }
+            root.addView(
+                label,
+                LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
+        }
+        return Slot(entry, root, holder, icon, badge)
     }
 
-    /** 把 [removeBadgeVisible] 同步到已建好的角标上（切换管理模式时调用）。 */
-    private fun refreshRemoveBadges() {
-        val visibility = if (removeBadgeVisible) View.VISIBLE else View.GONE
-        slots.forEach { slot -> slot.removeBadge.visibility = visibility }
+    /** 每格角标当前该是什么形态：有 [badgeFor] 就逐格问它，否则退回 [removeBadgeVisible]。 */
+    private fun badgeStateOf(entry: AppEntry): BadgeState =
+        badgeFor?.invoke(entry) ?: if (removeBadgeVisible) BadgeState.MINUS else BadgeState.NONE
+
+    /**
+     * 把角标形态同步到已建好的视图上。
+     *
+     * 两条路径会走到这里：切管理模式时改 [removeBadgeVisible]（「已选」条 / 底栏），
+     * 或 [badgeFor] 依赖的外部状态变了（工具页整条重建）。
+     */
+    private fun refreshBadges() {
+        slots.forEach { slot ->
+            val state = badgeStateOf(slot.entry)
+            val badge = slot.removeBadge
+            badge.visibility = if (state == BadgeState.NONE) View.GONE else View.VISIBLE
+            badge.plus = state == BadgeState.PLUS
+            badge.badgeColor = if (state == BadgeState.PLUS) ADD_BADGE_COLOR else REMOVE_BADGE_COLOR
+        }
+    }
+
+    /**
+     * 第一个**图标本体**（那张圆形图）的上边缘在窗口里的纵坐标，写进 [out]；没有条目时返回 false。
+     *
+     * 右侧索引条顶部那颗星要**和圆的上边缘对齐**（用户的要求）。量的是图标自己的坐标，
+     * 不是外面那圈 holder 的：holder 比图标大 [BADGE_INSET_DP]（角标要贴在外面），
+     * 拿 holder 的顶边当基准会整体高出一个余量，星就飘到圆上面去了。
+     */
+    fun firstIconTopInWindow(out: IntArray): Boolean {
+        val icon = slots.firstOrNull()?.icon ?: return false
+        icon.getLocationInWindow(out)
+        return true
+    }
+
+    /** 返回第一枚图标本体相对指定祖先 View 的顶部坐标，不受窗口缩放和 translationY 影响。 */
+    fun firstIconTopRelativeTo(ancestor: View): Int? {
+        val icon = slots.firstOrNull()?.icon ?: return null
+        var top = 0
+        var current: View = icon
+        while (current !== ancestor) {
+            top += current.top
+            val parent = current.parent as? View ?: return null
+            current = parent
+        }
+        return top
     }
 
     /**
      * 图标尺寸 = 调用方给的 [preferredIconPx]（和下面网格里的一致）；槽位太窄时自动缩小，
      * 最多缩到 [preferredIconPx] 的 70%，不溢出。
      *
-     * 紧凑模式（[packed]）不用算：槽位宽度在建子 View 时就按图标宽定死了，图标永远是
-     * [preferredIconPx]（固定栏最多 4 个，怎么都放得下）。
+     * 用来算槽宽的「一格」：网格模式是 `可用宽 / columns`，单行模式是 `可用宽 / 条目数`。
+     * 两种模式都只走这一处，图标尺寸的收敛规则因此完全一致。
      */
     private fun applySizing(availableWidth: Int) {
         if (packed) return
         if (slots.isEmpty() || availableWidth <= 0) return
         val usable = (availableWidth - paddingLeft - paddingRight).coerceAtLeast(1)
-        val slot = usable / slots.size
+        val slot = if (columns > 0) usable / columns else usable / slots.size
         val icon =
             minOf(preferredIconPx, slot - dp(SLOT_GAP_DP))
                 .coerceAtLeast((preferredIconPx * 0.7f).toInt())
         if (icon == iconSizePx) return
         iconSizePx = icon
-        slots.forEach { s -> s.iconHolder.layoutParams = LayoutParams(icon, icon) }
+        // holder 始终比图标大一圈，图标居中，角标就永远和图标保持着距离。
+        val holder = icon + dp(BADGE_INSET_DP)
+        // **角标必须跟着一起缩**：早先这里只换了 holder 的尺寸、没管角标，图标缩小时角标仍是
+        // 建 slot 时那枚大圆，顶出 holder 的边角、被父容器裁掉一块——用户看到的「减号的圆被截断」。
+        // 这里按缩放后的图标重算，尺寸口径与 createSlot 里那份完全一致。
+        val badge = (icon * BADGE_DIAMETER_FRACTION).toInt().coerceAtLeast(1)
+        slots.forEach { s ->
+            s.iconHolder.layoutParams = LayoutParams(holder, holder)
+            s.removeBadge.layoutParams =
+                FrameLayout.LayoutParams(badge, badge, Gravity.TOP or Gravity.END)
+        }
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -254,15 +463,52 @@ class PinnedStripView(
         if (w != oldw) applySizing(w)
     }
 
+    // ---- 坐标 ----
+
+    /**
+     * 第 [index] 个槽位在本视图坐标系里的左边缘。
+     *
+     * 网格模式要把**行容器**自己的偏移算上；单行 / 竖排模式槽位就是本视图的直接子 View。
+     * 两条路径都别忘掉**条自己的内边距**——`root.top/left` 是相对内容区的，而本视图的
+     * 内边距（`setPadding`）会把内容整体推下去，命中判定和跟手平移都必须按真实坐标算，
+     * 少算这一段就会出现「角标偏上几个像素、要往上去按才中」（底栏原本就有这个毛病）。
+     */
+    private fun slotOriginLeft(index: Int): Int {
+        val slot = slots.getOrNull(index) ?: return 0
+        val rowLeft = if (columns > 0) slotRows.getOrNull(index)?.left ?: 0 else 0
+        return rowLeft + slot.root.left
+    }
+
+    /** 第 [index] 个槽位在本视图坐标系里的上边缘（道理同 [slotOriginLeft]）。 */
+    private fun slotOriginTop(index: Int): Int {
+        val slot = slots.getOrNull(index) ?: return 0
+        val rowTop = if (columns > 0) slotRows.getOrNull(index)?.top ?: 0 else 0
+        return rowTop + slot.root.top
+    }
+
+    /** 网格落点 → 槽位下标；落在网格外时按边界夹住。 */
+    private fun gridIndexAt(x: Float, y: Float): Int {
+        if (colWidth <= 0 || rowHeight <= 0 || rowContainers.isEmpty()) return -1
+        val col = ((x - gridLeft) / colWidth).toInt().coerceIn(0, columns - 1)
+        val row = ((y - gridTop) / rowHeight).toInt().coerceIn(0, rowContainers.lastIndex)
+        return row * columns + col
+    }
+
     // ---- 触摸：单击 / 长按 / 拖拽 ----
 
     /**
-     * 一律拦截。
+     * 顶层（「已选」条、底栏各占一块）**一律拦截**。
      *
      * 条目上没有任何点击监听，事件留在本视图里处理最省心：否则子 View 会消费掉 DOWN，
      * 父视图再也收不到 MOVE，「长按后拖动」就不可能实现。
+     *
+     * 嵌在可滚动容器里（[nestedScroll]）时例外：进入拖拽前一律放行，让外层容器正常滚动；
+     * 只有拖拽真正起来了（[draggedIndex] >= 0）才把事件接管过来。
      */
-    override fun onInterceptTouchEvent(event: MotionEvent): Boolean = true
+    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+        if (!nestedScroll) return true
+        return draggedIndex >= 0
+    }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
@@ -270,37 +516,67 @@ class PinnedStripView(
                 downX = event.x
                 downY = event.y
                 lastX = event.x
-                pressedIndex = indexAt(event.x)
-                if (pressedIndex >= 0) handler.postDelayed(longPress, LONG_PRESS_MS)
+                lastY = event.y
+                // 角标优先：它有一小半伸在图标本体之外，[iconOnlyTap] 覆盖不到。
+                val badgeHit = badgeHitIndex(event.x, event.y)
+                pressedOnBadge = badgeHit >= 0
+                pressedIndex = if (pressedOnBadge) badgeHit else indexAt(event.x, event.y)
+                if (pressedIndex >= 0) {
+                    // 落在角标上**不进长按计时**——角标是个按钮，按它就是要「点一下」。
+                    //
+                    // 这一点是「红『−』点不了」的根因之一：角标只有图标的一半大，用户按上去
+                    // 手自然会多停一会儿，一旦超过 [LONG_PRESS_MS] 就走 [beginDrag]，
+                    // 抬手时既不排序（手指没挪）也不触发点击（`draggedIndex >= 0` 那条分支只
+                    // 认 [onLongPress]），整个按压被吃掉。取消计时之后，按住多久都算点击。
+                    if (!pressedOnBadge) handler.postDelayed(longPress, LONG_PRESS_MS)
+                    // 只在**落在角标上**时先把拦截权要过来：底栏套在横向滚动条里，角标又小，
+                    // 不给这一下底气，手指稍有横向抖动就被滚动条截走，点击收不回来。
+                    // 手指一旦真的划开（下面的 MOVE 分支）会立刻还回去，不影响正常滑动。
+                    if (pressedOnBadge) parent?.requestDisallowInterceptTouchEvent(true)
+                }
                 return true
             }
 
             MotionEvent.ACTION_MOVE -> {
                 lastX = event.x
+                lastY = event.y
                 if (draggedIndex >= 0) {
                     draggedPointerX = event.x
+                    draggedPointerY = event.y
                     applyDraggedTranslation()
-                    moveDraggedTo(positionAt(event.x))
+                    moveDraggedTo(positionAt(event.x, event.y))
                     refreshSiblings(animate = true)
                     return true
                 }
                 // 长按判定期间手指走远了，说明用户想干别的，撤销这次长按。
                 if (abs(event.x - downX) > touchSlop || abs(event.y - downY) > touchSlop) {
                     handler.removeCallbacks(longPress)
+                    // 真的是在划，不是在点角标：把拦截权还给外层滚动条，这一下交给它滚。
+                    if (pressedOnBadge) {
+                        pressedOnBadge = false
+                        pressedIndex = -1
+                        parent?.requestDisallowInterceptTouchEvent(false)
+                    }
                 }
                 return true
             }
 
             MotionEvent.ACTION_UP -> {
                 handler.removeCallbacks(longPress)
+                val moved =
+                    abs(event.x - downX) > touchSlop || abs(event.y - downY) > touchSlop
                 if (draggedIndex >= 0) {
+                    val index = draggedIndex
                     finishDrag()
+                    // 长按起了拖拽、但抬手时手指还在原地：当成一次「长按」交给调用方（工具页弹管理菜单）。
+                    if (!moved && onLongPress != null) {
+                        slots.getOrNull(index)?.let { onLongPress(it.entry) }
+                    }
                 } else {
-                    val moved =
-                        abs(event.x - downX) > touchSlop || abs(event.y - downY) > touchSlop
                     val index = pressedIndex
                     if (!moved && index in slots.indices) onTap(slots[index].entry)
                 }
+                releaseBadgeIntercept()
                 pressedIndex = -1
                 return true
             }
@@ -309,6 +585,7 @@ class PinnedStripView(
                 handler.removeCallbacks(longPress)
                 // 被系统打断时也提交当前位置：用户已经把图标拖到那儿了，回滚反而莫名其妙。
                 if (draggedIndex >= 0) finishDrag()
+                releaseBadgeIntercept()
                 pressedIndex = -1
                 return true
             }
@@ -319,32 +596,107 @@ class PinnedStripView(
     /**
      * 落点命中的槽位下标。
      *
-     * [iconOnlyTap] 打开时只认图标本身：横向落点必须落在图标范围内（两侧各留
+     * [iconOnlyTap] 打开时只认图标本身：落点必须落在图标范围内（两侧各留
      * [ICON_TAP_PADDING_DP] 的容差），落在槽位里的空白处返回 -1。这样点空白不会误开应用，
      * 而空白处的事件仍会被本视图消费掉，不会穿透到下层去触发「点面板外关闭」。
+     *
+     * 单行模式按**横轴**分格，竖排模式（[vertical]）按**纵轴**分格——两边的「一格」分别是
+     * 槽宽和槽高，取哪个由排布方向决定。
      */
-    private fun indexAt(x: Float): Int {
-        if (slots.isEmpty() || slotWidth <= 0) return -1
-        val base = slots.first().root.left
-        val index = ((x - base) / slotWidth).toInt()
+    private fun indexAt(x: Float, y: Float): Int {
+        if (slots.isEmpty()) return -1
+        val index =
+            when {
+                vertical -> {
+                    if (slotHeight <= 0) return -1
+                    val base = slots.first().root.top
+                    ((y - base) / slotHeight).toInt()
+                }
+
+                columns > 0 -> gridIndexAt(x, y)
+
+                else -> {
+                    if (slotWidth <= 0) return -1
+                    val base = slots.first().root.left
+                    ((x - base) / slotWidth).toInt()
+                }
+            }
         if (index !in slots.indices) return -1
         if (!iconOnlyTap) return index
+        // holder 比图标大一圈，所以要把那一圈减掉，只认图标本身（两侧再加一点容差）。
         val holder = slots[index].iconHolder
-        val left = slots[index].root.left + holder.left - iconTapPadding
-        val right = slots[index].root.left + holder.left + holder.width + iconTapPadding
-        return if (x >= left && x <= right) index else -1
+        val inset = dp(BADGE_INSET_DP)
+        val origin = if (vertical) slotOriginTop(index) else slotOriginLeft(index)
+        val start = if (vertical) holder.top else holder.left
+        val extent = if (vertical) holder.height else holder.width
+        val point = if (vertical) y else x
+        val low = origin + start + inset - iconTapPadding
+        val high = origin + start + extent - inset + iconTapPadding
+        return if (point >= low && point <= high) index else -1
+    }
+
+    /**
+     * 落点命中哪个**可见角标**，没命中返回 -1。
+     *
+     * 为什么要在 [indexAt] 之外单独判一次：角标贴在 holder 的右上角，有一小半伸在图标本体
+     * 之外（holder 比图标大 [BADGE_INSET_DP]），而 [iconOnlyTap] 只认图标本身；再加上底栏
+     * 整个套在滚动条里，手指稍有抖动就会被滚动条截走手势。两件事叠起来，用户看到的
+     * 就是「管理模式下红『−』点不了」。这里把角标单独圈出来，落上去就算数。
+     *
+     * 坐标一律用 [slotOriginLeft] / [slotOriginTop]（含条自己的内边距）取真实位置：
+     * 少算那一段，判定框就会整体偏上、手指得往角标**上面**一点才中。
+     */
+    private fun badgeHitIndex(x: Float, y: Float): Int {
+        slots.forEachIndexed { index, slot ->
+            val badge = slot.removeBadge
+            if (badge.visibility != View.VISIBLE || badge.width <= 0) return@forEachIndexed
+            val left = slotOriginLeft(index) + slot.iconHolder.left + badge.left
+            val top = slotOriginTop(index) + slot.iconHolder.top + badge.top
+            val pad = dp(BADGE_HIT_PADDING_DP)
+            if (x >= left - pad &&
+                x <= left + badge.width + pad &&
+                y >= top - pad &&
+                y <= top + badge.height + pad
+            ) {
+                return index
+            }
+        }
+        return -1
+    }
+
+    /** 把「角标按下时借走的拦截权」还回去（抬手与取消两条路径都要走，别漏）。 */
+    private fun releaseBadgeIntercept() {
+        if (!pressedOnBadge) return
+        pressedOnBadge = false
+        parent?.requestDisallowInterceptTouchEvent(false)
     }
 
     /** 手指所在的虚拟位次，也就是被拖项应当占据的位置。 */
-    private fun positionAt(x: Float): Int {
-        if (slots.isEmpty() || slotWidth <= 0) return 0
-        val base = slots.first().root.left
-        return ((x - base) / slotWidth).toInt().coerceIn(0, slots.size - 1)
+    private fun positionAt(x: Float, y: Float): Int {
+        if (slots.isEmpty()) return 0
+        val index =
+            when {
+                vertical -> {
+                    if (slotHeight <= 0) return 0
+                    val base = slots.first().root.top
+                    ((y - base) / slotHeight).toInt()
+                }
+
+                columns > 0 -> gridIndexAt(x, y)
+
+                else -> {
+                    if (slotWidth <= 0) return 0
+                    val base = slots.first().root.left
+                    ((x - base) / slotWidth).toInt()
+                }
+            }
+        return index.coerceIn(0, slots.size - 1)
     }
 
     private fun beginDrag(index: Int) {
         draggedIndex = index
         draggedPointerX = lastX
+        draggedPointerY = lastY
         val root = slots[index].root
         root.animate().cancel()
         root.scaleX = DRAG_SCALE
@@ -355,14 +707,23 @@ class PinnedStripView(
                 cornerRadius = dp(14).toFloat()
                 setColor(DRAG_BACKGROUND)
             }
+        // 嵌在可滚动容器里时，此刻才把滚动手势从外层抢回来——否则手指一横移就被外层滚走。
+        if (nestedScroll) requestDisallowInterceptTouchEvent(true)
         Haptics.confirm(context)
     }
 
-    /** 被拖项的中心始终跟着手指。 */
+    /**
+     * 被拖项的中心始终跟着手指（网格与竖排模式下横竖都要跟）。
+     *
+     * 自然中心必须按**真实布局坐标**取（[slotOriginLeft] / [slotOriginTop] 已含条的内边距
+     * 与行容器偏移）——否则「拎起来」的那一下会先跳一段，因为手指位置是绝对坐标。
+     */
     private fun applyDraggedTranslation() {
         val root = slots.getOrNull(draggedIndex)?.root ?: return
-        val naturalCenter = root.left + root.width / 2f
-        root.translationX = draggedPointerX - naturalCenter
+        val naturalCenterX = slotOriginLeft(draggedIndex) + root.width / 2f
+        val naturalCenterY = slotOriginTop(draggedIndex) + root.height / 2f
+        root.translationX = draggedPointerX - naturalCenterX
+        root.translationY = draggedPointerY - naturalCenterY
     }
 
     /** 把被拖项挪到虚拟位次 [target]。只动 [order]，真实 child 顺序不变。 */
@@ -377,21 +738,58 @@ class PinnedStripView(
     /**
      * 其余条目按「虚拟位次 − 自然位次」平移。
      *
-     * 自然位次就是它的 child index——因为拖拽期间从未重排 children，这个值恒等于初始顺序。
+     * 自然位次就是它的下标——因为拖拽期间从未重排 children，这个值恒等于初始顺序。
+     * 网格模式下目标位置是二维的（第几行第几列），竖排模式下是一维的纵向，所以位移要按
+     * 排布方向分开算。
+     *
+     * 位移量取的是**差值**，[slotOriginLeft] / [slotOriginTop] 里那一段公共偏移会自然约掉，
+     * 所以这里用原点函数和用旧的 `slotLeft` / `slotTop` 结果一致。
      */
     private fun refreshSiblings(animate: Boolean) {
-        if (slotWidth <= 0) return
         slots.forEachIndexed { index, slot ->
             if (index == draggedIndex) return@forEachIndexed
             val position = order.indexOf(index)
             if (position < 0) return@forEachIndexed
-            val target = (position - index) * slotWidth.toFloat()
-            if (abs(slot.root.translationX - target) < 0.5f) return@forEachIndexed
+
+            val targetLeft: Float
+            val targetTop: Float
+            when {
+                vertical -> {
+                    if (slotHeight <= 0) return@forEachIndexed
+                    targetLeft = slotOriginLeft(index).toFloat()
+                    targetTop = slotOriginTop(0) + position * slotHeight.toFloat()
+                }
+
+                columns > 0 -> {
+                    val col = position % columns
+                    val row = position / columns
+                    targetLeft = gridLeft + col * colWidth.toFloat()
+                    targetTop = gridTop + row * rowHeight.toFloat()
+                }
+
+                else -> {
+                    if (slotWidth <= 0) return@forEachIndexed
+                    targetLeft = slots.first().root.left + position * slotWidth.toFloat()
+                    targetTop = slotOriginTop(index).toFloat()
+                }
+            }
+
+            val dx = targetLeft - slotOriginLeft(index)
+            val dy = targetTop - slotOriginTop(index)
+            if (abs(slot.root.translationX - dx) < 0.5f && abs(slot.root.translationY - dy) < 0.5f) {
+                return@forEachIndexed
+            }
             if (animate) {
-                slot.root.animate().translationX(target).setDuration(SWAP_ANIM_MS).start()
+                slot.root
+                    .animate()
+                    .translationX(dx)
+                    .translationY(dy)
+                    .setDuration(SWAP_ANIM_MS)
+                    .start()
             } else {
                 slot.root.animate().cancel()
-                slot.root.translationX = target
+                slot.root.translationX = dx
+                slot.root.translationY = dy
             }
         }
     }
@@ -399,6 +797,8 @@ class PinnedStripView(
     private fun finishDrag() {
         val index = draggedIndex
         draggedIndex = -1
+        // 拖拽结束，把滚动手势还给外层容器（与 beginDrag 里那次 disallow 配对）。
+        if (nestedScroll) requestDisallowInterceptTouchEvent(false)
         slots.getOrNull(index)?.root?.let { root ->
             root.animate().cancel()
             root.scaleX = 1f
@@ -409,6 +809,7 @@ class PinnedStripView(
         slots.forEach { slot ->
             slot.root.animate().cancel()
             slot.root.translationX = 0f
+            slot.root.translationY = 0f
         }
         val reordered = order.mapNotNull { slots.getOrNull(it)?.entry?.component }
         // 顺序没变就别惊动上层：空跑一次会让面板白白重建一回。
@@ -426,7 +827,20 @@ class PinnedStripView(
 
     override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
         super.onLayout(changed, l, t, r, b)
-        if (slots.isNotEmpty()) slotWidth = slots.first().root.width
+        if (slots.isNotEmpty()) {
+            if (columns > 0) {
+                gridLeft = paddingLeft
+                gridTop = paddingTop
+                val usable = (width - paddingLeft - paddingRight).coerceAtLeast(1)
+                colWidth = usable / columns
+                rowHeight = rowContainers.firstOrNull()?.height ?: 0
+            } else if (vertical) {
+                // 竖排：一格的高度就是斜向命中和换位的单位（槽位高矮一致，取第一个即可）。
+                slotHeight = slots.first().root.height
+            } else {
+                slotWidth = slots.first().root.width
+            }
+        }
         if (draggedIndex >= 0) {
             applyDraggedTranslation()
             refreshSiblings(animate = false)
@@ -439,7 +853,12 @@ class PinnedStripView(
 
     private fun dp(value: Int): Int = (value / 400f * shortEdgePx).toInt()
 
-    private companion object {
+    /**
+     * `internal` 而不是 `private`：角标的尺寸（[BADGE_DIAMETER_FRACTION] / [BADGE_INSET_DP]）
+     * 网格那边也要用——两处的角标必须一样大，所以只能有一份定义，出处就是这里。
+     * 圆圈里那个符号的比例由 [IconBadgeView] 自己按半径算，不在这里。
+     */
+    internal companion object {
         /** 长按多久算「要拖了」。比系统默认的 500ms 短一点，手感更跟手。 */
         const val LONG_PRESS_MS = 320L
 
@@ -456,9 +875,34 @@ class PinnedStripView(
         /** [iconOnlyTap] 模式下图标两侧各留的可点容差。给一点点余量，但远小于槽位空白。 */
         const val ICON_TAP_PADDING_DP = 3
 
-        /** 删除角标：直径为图标的这个比例；底色用系统常见的警示红。 */
-        const val REMOVE_BADGE_FRACTION = 0.36f
+        /**
+         * 角标可点区域在角标本身之外额外放宽的边距（dp）。
+         *
+         * 角标直径只有图标的一半不到，严格按它的边界判定，用户就得瞄准那个小圆点——
+         * 手指覆盖面本来就有十几 dp，严格判定等于「点不到」。这里给足容差，让「照着角标点」
+         * 这个直觉动作稳定命中。
+         */
+        const val BADGE_HIT_PADDING_DP = 6
+
+        /**
+         * 角标直径 = 图标的这个比例；底色用系统常见的警示红。
+         *
+         * **网格里的绿色「＋/－」共用这一个值**（见 AppDrawerPanel.buildGridItem）——
+         * 同一个图标出现在网格和「已选」条两处时，角标必须一样大，否则一眼就看得出大小不一。
+         *
+         * 圆圈里那个符号的比例不在这儿：[IconBadgeView] 自己用「半径的百分比」画，
+         * 所以改直径时符号会跟着缩放，不需要第二个常量。
+         */
+        const val BADGE_DIAMETER_FRACTION = 0.46f
+
+        /** 图标 holder 比图标本身大出的余量（dp）：角标贴在外圈，自然和图标拉开距离。 */
+        const val BADGE_INSET_DP = 8
+
+        /** 红底白「－」：已固定，点它移出。与网格里的绿「＋」配成一对。 */
         const val REMOVE_BADGE_COLOR = 0xFFE53935.toInt()
+
+        /** 绿底白「＋」：未固定，点它加入。取值与面板的 `ACCENT_COLOR` 保持一致。 */
+        const val ADD_BADGE_COLOR = 0xFF1D9E75.toInt()
 
         const val DRAG_BACKGROUND = 0xFFF0F0F0.toInt()
     }

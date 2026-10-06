@@ -27,15 +27,30 @@ class LockScreenAdmin : DeviceAdminReceiver()
 object LockScreen {
 
     fun lock(context: Context): String {
+        // 与 Pano 一样，优先通过 Shizuku/shell 发送 KEYCODE_SLEEP（223）。
+        // 这会让屏幕休眠而非调用 DevicePolicyManager.lockNow()；后者在部分 ColorOS
+        // 设备上会要求下一次解锁必须输入密码。设备行为因 ROM/安全策略而异，需真机验证。
+        if (ShizukuShell.hasPermission) {
+            val result = ShizukuShell.run("input keyevent 223")
+            if (result.isSuccess) {
+                DebugLog.info("TOOL_LOCK_SLEEP_KEY", "通过 Shizuku 发送 KEYCODE_SLEEP")
+                return "已发送锁屏指令"
+            }
+            DebugLog.warn(
+                "TOOL_LOCK_SLEEP_KEY_FAILED",
+                (result.stderr + result.stdout).trim().ifEmpty { "exit=${result.exitCode}" },
+            )
+        }
+
         val manager =
             runCatching { context.getSystemService(DevicePolicyManager::class.java) }.getOrNull()
-                ?: return "这台设备没有设备管理服务"
+                ?: return "Shizuku 不可用，且这台设备没有设备管理服务"
         val admin = ComponentName(context, LockScreenAdmin::class.java)
 
         if (runCatching { manager.isAdminActive(admin) }.getOrDefault(false)) {
             return runCatching {
                 manager.lockNow()
-                "已锁屏"
+                "已锁屏（设备管理方式）"
             }.getOrElse { error ->
                 DebugLog.warn("TOOL_LOCK_FAILED", null, error)
                 "锁屏失败：${error.javaClass.simpleName}"

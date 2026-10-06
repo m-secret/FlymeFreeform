@@ -244,6 +244,7 @@ class FreeformAccessibilityService : AccessibilityService() {
     fun refresh() {
         val store = SettingsStore(this)
         val target = blocker ?: return
+        target.clickMode = store.outsideTapClickMode
         if (closing) {
             // 兜底：万一某次关闭流程没能走到收尾（注入抛异常、手势被系统掐断……），
             // `closing` 会永远停在 true，`refresh()` 就永远从这里返回——遮罩再也挂不回来。
@@ -261,7 +262,12 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         // 每次都探一遍窗口：标记需要它，校准后的关闭也需要最新的小窗边界。
         val layout = observeLayout()
-        val needMask = store.enabled && store.outsideTapCloseEnabled
+        // **只看窗外关闭自己的开关**，不再要求主开关 [SettingsStore.enabled]（「主动呼出」）。
+        //
+        // 两者本来就是独立的功能：遮罩由**无障碍服务**铺，跟角落触摸条跑不跑没关系；关闭动作
+        // 也全在无障碍这边（[startCloseFlow]），不经过 `OverlayGestureService`。早先把它们绑在
+        // 一起，用户单独打开「启用窗外点击关闭」时遮罩永远不铺——他看到的正是「这个开关不生效」。
+        val needMask = store.outsideTapCloseEnabled
         when {
             !needMask -> {
                 if (target.activeCount > 0) {
@@ -850,9 +856,6 @@ class FreeformAccessibilityService : AccessibilityService() {
             // 用小横条的**真实坐标**关闭（坐标来自系统日志，不用校准）。见 [closeViaCaption]。
             SettingsStore.CLOSE_MODE_CAPTION_AUTO -> closeViaCaption(isRetry)
 
-            // 同样用真实坐标，但是**单击**小横条——ColorOS 上点它就是直接关掉自由窗。
-            SettingsStore.CLOSE_MODE_TAP_AUTO -> tapViaCaption(isRetry)
-
             // 默认（含未知取值、含已下线的「返回键」两种取值）：模拟一次「快速上滑」。
             else -> swipeUpOnCaption(isRetry)
         }
@@ -881,72 +884,6 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (FreeformCaption.closeSwipe()) return true
         DebugLog.warn("CLOSE_CAPTION_INJECT_FAILED", "注入失败，退回按边界估算")
         return swipeUpOnCaption(isRetry)
-    }
-
-    /**
-     * 「轻点一下就关」的关闭方式。
-     *
-     * ## 为什么底层是**很短的快速上滑**，不是 `input tap`
-     *
-     * 用户最初要的是「单击小横条关闭」，我第一版真的用了 `input tap`。实测下来是**两段式**：
-     * 第一下点在小横条上 ColorOS 不认（它把按下当成了「准备拖动标题栏」），窗口没关，
-     * 于是走复检重试、第二下才关掉——用户看到的就是「点一下没反应，得再点一次」。
-     *
-     * 而**快速上滑小横条**是唯一实测一次就生效的动作（日志里
-     * `CLOSE_SWIPE_UP (635,1871)->(635,1362) 48ms` 一次成功）。所以这条路改成用一次
-     * **很短**的快速上滑来实现「点一下」的体感：距离只有常规关闭的 [TAP_SWIPE_FRACTION] 倍，
-     * 时长 [TAP_SWIPE_DURATION_MS]ms。
-     */
-    private fun tapViaCaption(isRetry: Boolean): Boolean {
-        val bounds = lastFreeformBounds ?: run {
-            DebugLog.warn("CLOSE_TAP_NO_BOUNDS", "还不知道小窗边界，跳过", null)
-            return false
-        }
-        // 落点：真实坐标优先，拿不到就用按边界估算的（那条落点已经被证明能压中横条）。
-        val point = usableCaptionPoint(bounds, "CLOSE_TAP")
-        val startX: Int
-        val startY: Int
-        if (point != null) {
-            startX = point.x
-            startY = point.y
-            DebugLog.info("CLOSE_TAP_USE", "落点=小横条真实坐标 ($startX,$startY)")
-        } else {
-            val estimated = closeAnchorPoint(bounds, SettingsStore(this))
-            startX = estimated.first.toInt()
-            startY = estimated.second.toInt()
-            DebugLog.info("CLOSE_TAP_USE_ESTIMATED", "落点=按边界估算 ($startX,$startY) 窗口=$bounds")
-        }
-        val shortEdge =
-            minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
-        val factor = if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f
-        val distance = (shortEdge * TAP_SWIPE_FRACTION * factor).toInt()
-        val toY = (startY - distance).coerceAtLeast(0)
-        val durationMs = TAP_SWIPE_DURATION_MS
-        if (ShizukuShell.hasPermission) {
-            DebugLog.info("CLOSE_TAP_SWIPE", "(Shizuku) ($startX,$startY)->($startX,$toY) ${durationMs}ms")
-            return ShizukuShell.injectSwipe(startX, startY, startX, toY, durationMs)
-        }
-        val path =
-            Path().apply {
-                moveTo(startX.toFloat(), startY.toFloat())
-                lineTo(startX.toFloat(), toY.toFloat())
-            }
-        val dispatched =
-            runCatching {
-                dispatchGesture(
-                    GestureDescription.Builder()
-                        .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMs.toLong()))
-                        .build(),
-                    null,
-                    null,
-                )
-            }.onFailure { DebugLog.warn("CLOSE_TAP_SWIPE_FAILED", "($startX,$startY)", it) }
-                .getOrDefault(false)
-        DebugLog.info(
-            "CLOSE_TAP_SWIPE",
-            "(无障碍) ($startX,$startY)->($startX,$toY) ${durationMs}ms 提交=$dispatched",
-        )
-        return dispatched
     }
 
     /**
@@ -981,7 +918,7 @@ class FreeformAccessibilityService : AccessibilityService() {
      *
      * 是一条从横条位置**向上、时长很短**的滑动轨迹，系统会把手势识别成「关闭浮窗」。
      * 优点是不碰横条的拖动功能，而且这是 ColorOS 上唯一实测「一次就生效」的关闭动作
-     * （所以 [tapViaCaption] 的「轻点一下关闭」底下用的也是它，只是距离更短）。
+     * 。
      *
      * 重试时把上滑距离放大一点，给窗口状态刷新留余量。
      */
@@ -1239,7 +1176,8 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private fun recheck() {
         val store = SettingsStore(this)
-        if (!store.enabled || !store.outsideTapCloseEnabled) {
+        // 同 [refresh]：重试只看窗外关闭自己的开关，与「主动呼出」主开关无关。
+        if (!store.outsideTapCloseEnabled) {
             closing = false
             return
         }
@@ -1377,14 +1315,6 @@ class FreeformAccessibilityService : AccessibilityService() {
 
         /** 校验「学到的小横条坐标」是否属于当前小窗时给的容错余量（px）。 */
         private const val CLOSE_CAPTION_SLACK_PX = 48
-
-        /**
-         * 「轻点一下关闭」（[tapViaCaption]）那次上滑的距离——占屏幕短边的比例，以及时长。
-         *
-         * 只有常规关闭（默认 40%）的一半，时长也短，所以体感上就是「点了一下」而不是「划了一下」。
-         */
-        private const val TAP_SWIPE_FRACTION = 0.20f
-        private const val TAP_SWIPE_DURATION_MS = 60
 
         /** 撤掉捕获层/遮罩后到注入之间的等待（约一帧），让 WindowManager 真正移除窗口。 */
         private const val INJECT_HANDOFF_MS = 40L

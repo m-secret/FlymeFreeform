@@ -78,6 +78,12 @@
             android:exported="false"
             android:label="窗外点击关闭" />
 
+        <!-- 「更多」面板的行为参数（默认页 / 工具顺序 / 底栏沉底）。 -->
+        <activity
+            android:name=".DrawerSettingsActivity"
+            android:exported="false"
+            android:label="更多面板" />
+
         <service
             android:name=".OverlayGestureService"
             android:exported="false"

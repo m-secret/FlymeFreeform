@@ -18,7 +18,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import java.util.concurrent.Executors
 
@@ -27,6 +26,14 @@ import java.util.concurrent.Executors
  *
  * 刻意做成「手机上直接可见」：状态、每个启动策略的结果、原始命令、实时日志都在这里，
  * 不依赖 adb 就能判断哪一步走通了。
+ *
+ * ## 版面（重排后）
+ *
+ * 标题 → 一句话说明 → 「基础权限」组 → 两个操作按钮 → 「设置」组 → 「调试」组。
+ *
+ * 每一组都是**一张卡**（[CardGroup]），组内行之间只有分隔线、没有缝；组与组之间留实缝。
+ * 早先每行都是独立圆角小卡、行距只有几 dp，相邻两行的圆角在缝里相对，整页边缘全是
+ * 凹进去的缺口——那是这一版重排要解决的主要问题。
  */
 class MainActivity : Activity() {
 
@@ -34,7 +41,7 @@ class MainActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private lateinit var appManageButton: TextView
+    private lateinit var appManageButton: LinearLayout
     private lateinit var serviceButton: TextView
     private lateinit var overlayRow: PermissionRow
     private lateinit var notificationRow: PermissionRow
@@ -71,69 +78,71 @@ class MainActivity : Activity() {
     // ---- 界面构建 ----
 
     private fun buildContent(): View {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(28), dp(20), dp(32))
-        }
+        val root = Ui.pageRoot(this)
 
         root.addView(Ui.title(this, "Flyme 小窗"))
         root.addView(
             Ui.hint(
                 this,
-                "角落悬浮窗替代输入 Hook；以小窗启动沿用 ColorOS 的自有协议。" +
-                    "原生侧边栏面板、收迷你浮窗在无 root 下没有等价实现（迷你浮窗请用 ColorOS 自己滑小横条的手势）。",
+                "免 root 的角落呼出 + 小窗工具集。以小窗启动沿用 ColorOS 自有协议；" +
+                    "原生侧边栏面板、收迷你浮窗在无 root 下没有等价实现。",
             ),
         )
 
-        root.addView(Ui.sectionTitle(this, "授权与状态"))
+        // ---- 基础权限 ----
+        root.addView(Ui.sectionTitle(this, "基础权限"))
 
-        // 每个权限一行卡片：左侧状态（已授权绿✓ / 未授权红·），右侧操作按钮（未授权才显示）。
-        overlayRow = permissionRow(
-            label = "悬浮窗权限",
-            grantedText = "已授予",
-            deniedText = "未授予（必须）",
-            actionText = "去授权",
-        ) {
-            startActivity(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
-            )
-        }
-        root.addView(overlayRow.root)
-
-        notificationRow = permissionRow(
-            label = "通知权限",
-            grantedText = "已授予",
-            deniedText = "未授权",
-            actionText = "去授权",
-        ) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION)
+        overlayRow =
+            permissionRow(
+                label = "悬浮窗权限",
+                grantedText = "已授予",
+                deniedText = "未授予（必须）",
+                actionText = "去授权",
+            ) {
+                startActivity(
+                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                )
             }
-        }
-        root.addView(notificationRow.root)
-
-        shizukuRow = permissionRow(
-            label = "Shizuku",
-            grantedText = "已授权",
-            deniedText = "未授权（可选）",
-            actionText = "去授权",
-        ) {
-            ShizukuShell.requestPermission(REQUEST_SHIZUKU)
-            mainHandler.postDelayed({ refreshStatus() }, 1_000L)
-        }
-        root.addView(shizukuRow.root)
-
-        accessibilityRow = permissionRow(
-            label = "无障碍服务",
-            grantedText = "已开启",
-            deniedText = "未开启",
-            actionText = "去开启",
-        ) {
-            FreeformAccessibilityService.openSettings(this)
-        }
-        root.addView(accessibilityRow.root)
+        notificationRow =
+            permissionRow(
+                label = "通知权限",
+                grantedText = "已授予",
+                deniedText = "未授权",
+                actionText = "去授权",
+            ) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION)
+                }
+            }
+        shizukuRow =
+            permissionRow(
+                label = "Shizuku",
+                grantedText = "已授权",
+                deniedText = "未授权（可选）",
+                actionText = "去授权",
+            ) {
+                ShizukuShell.requestPermission(REQUEST_SHIZUKU)
+                mainHandler.postDelayed({ refreshStatus() }, 1_000L)
+            }
+        accessibilityRow =
+            permissionRow(
+                label = "无障碍服务",
+                grantedText = "已开启",
+                deniedText = "未开启",
+                actionText = "去开启",
+            ) {
+                FreeformAccessibilityService.openSettings(this)
+            }
         root.addView(
-            Ui.button(this, "用 Shizuku 把无障碍写回来") {
+            CardGroup(this)
+                .row(overlayRow.root)
+                .row(notificationRow.root)
+                .row(shizukuRow.root)
+                .row(accessibilityRow.root),
+        )
+        root.addView(Ui.spacer(this))
+        root.addView(
+            Ui.tonalButton(this, "用 Shizuku 把无障碍写回来") {
                 // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是 WRITE_SECURE_SETTINGS
                 // 保护的系统设置），但 Shizuku 的 shell 身份写得动。没 Shizuku 就只能跳设置页。
                 val ok = AccessibilityGrant.restore(this)
@@ -148,47 +157,59 @@ class MainActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "重启后如果发现这里的开关被系统关掉了，多半是服务在开机那一下出过错（系统会因此" +
-                    "禁用无障碍服务）。本版本已给服务启动加了保护，并会在开机/Shizuku 就绪时**自动**" +
-                    "把它写回去（记在「调试日志」页能看到的 A11Y_TRACE 里）。" +
-                    "另外可在通知栏加一个快捷磁贴「免root小窗」：状态一目了然，点一下就能修复。" +
-                    "若仍会出现，请到 系统设置 › 应用 › 应用管理 › FlymeFreeform，允许「自启动」，" +
-                    "并关掉电池优化。",
+                "重启后如果发现开关被系统关掉了，多半是服务在开机那一下出过错。" +
+                    "本版本会在开机 / Shizuku 就绪时自动写回（记在「调试日志」页的 A11Y_TRACE 里）。" +
+                    "也在通知栏放了快捷磁贴「免root小窗」。若仍出现，请允许本应用「自启动」并关掉电池优化。",
             ),
         )
 
-        serviceButton = Ui.button(this, "启动主动呼出") { toggleService() }
+        root.addView(Ui.spacer(this))
+        // 一屏只有一个 filled button，它是这一页的主行动。
+        serviceButton = Ui.filledButton(this, "启动主动呼出") { toggleService() }
         root.addView(serviceButton)
 
+        // ---- 设置 ----
         root.addView(Ui.sectionTitle(this, "设置"))
+        appManageButton =
+            Ui.entryRow(this, "管理扇形应用") {
+                startActivity(Intent(this, AppManagementActivity::class.java))
+            }
         root.addView(
-            Ui.entryButton(this, "主动呼出与扇形观感") {
-                startActivity(Intent(this, CornerSettingsActivity::class.java))
-            },
+            CardGroup(this)
+                .row(
+                    Ui.entryRow(this, "更多面板", "默认页 / 工具顺序") {
+                        startActivity(Intent(this, DrawerSettingsActivity::class.java))
+                    },
+                )
+                .row(
+                    Ui.entryRow(this, "主动呼出与扇形观感") {
+                        startActivity(Intent(this, CornerSettingsActivity::class.java))
+                    },
+                )
+                .row(
+                    Ui.entryRow(this, "窗外点击关闭") {
+                        startActivity(Intent(this, OutsideTapSettingsActivity::class.java))
+                    },
+                )
+                .row(appManageButton),
         )
-        root.addView(
-            Ui.entryButton(this, "窗外点击关闭") {
-                startActivity(Intent(this, OutsideTapSettingsActivity::class.java))
-            },
-        )
-        appManageButton = Ui.entryButton(this, "管理扇形应用") {
-            startActivity(Intent(this, AppManagementActivity::class.java))
-        }
-        root.addView(appManageButton)
 
+        // ---- 调试 ----
         root.addView(Ui.sectionTitle(this, "调试"))
         root.addView(
-            Ui.entryButton(this, "运行日志") {
-                startActivity(Intent(this, LogActivity::class.java))
-            },
+            CardGroup(this).row(
+                Ui.entryRow(this, "运行日志") {
+                    startActivity(Intent(this, LogActivity::class.java))
+                },
+            ),
         )
 
-        return ScrollView(this).apply { addView(root) }
+        return Ui.scrollPage(this, root)
     }
 
     // ---- 权限状态行 ----
 
-    /** 一行权限状态：左侧状态文字，右侧「去授权」按钮（仅未授权时显示）。 */
+    /** 一行权限状态：左侧「名称 + 状态」，右侧「去授权」胶囊（仅未授权时显示）。 */
     private class PermissionRow(
         val root: LinearLayout,
         val statusText: TextView,
@@ -202,46 +223,36 @@ class MainActivity : Activity() {
         actionText: String,
         onAction: () -> Unit,
     ): PermissionRow {
-        val row = Ui.card(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams =
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                ).apply { bottomMargin = dp(Ui.SPACE_CARD) }
-        }
+        val container = Ui.row(this)
         val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        left.addView(
+        left.addView(Ui.rowTitle(this, label))
+        val status =
             TextView(this).apply {
-                text = label
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(14f))
-                setTextColor(Ui.COLOR_TEXT_PRIMARY)
-            },
-        )
-        val status = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(11f))
-            setTextColor(Ui.COLOR_TEXT_SECONDARY)
-        }
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(11.5f))
+                setPadding(0, scaledSp(3f).toInt(), 0, 0)
+            }
         left.addView(status)
-        row.addView(left, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(left, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
-        val action = TextView(this).apply {
-            text = actionText
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
-            setTextColor(Ui.COLOR_ACCENT)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            background =
-                GradientDrawable().apply {
-                    cornerRadius = dp(20).toFloat()
-                    setColor(0x1428D9A1.toInt())
-                }
-            isClickable = true
-            setOnClickListener { onAction() }
-        }
-        row.addView(action)
-        return PermissionRow(row, status, action)
+        // 状态未达成时才出现的次要动作：M3 里它就是一枚 tonal 小按钮。
+        val action =
+            TextView(this).apply {
+                text = actionText
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
+                setTextColor(Ui.COLOR_ON_PRIMARY_CONTAINER)
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                gravity = Gravity.CENTER
+                setPadding(scaledSp(14f).toInt(), scaledSp(8f).toInt(), scaledSp(14f).toInt(), scaledSp(8f).toInt())
+                background =
+                    GradientDrawable().apply {
+                        cornerRadius = scaledSp(20f)
+                        setColor(Ui.COLOR_PRIMARY_CONTAINER)
+                    }
+                isClickable = true
+                setOnClickListener { onAction() }
+            }
+        container.addView(action)
+        return PermissionRow(container, status, action)
     }
 
     /** 刷新某行权限状态。 */
@@ -258,14 +269,22 @@ class MainActivity : Activity() {
         val notifications = getSystemService(NotificationManager::class.java)?.areNotificationsEnabled() != false
         val shizukuGranted = ShizukuShell.hasPermission
         val a11yEnabled = FreeformAccessibilityService.isEnabledInSettings(this@MainActivity)
+        val a11yConnected = FreeformAccessibilityService.isConnected
 
-        updatePermissionRow(overlayRow, overlayGranted, "已授予", "未授予（必须）")
+        updatePermissionRow(overlayRow, overlayGranted, "已授予 · 主动呼出可用", "未授予（主动呼出必需）")
         updatePermissionRow(notificationRow, notifications, "已授予", "未授权")
-        updatePermissionRow(shizukuRow, shizukuGranted, "已授权", "未授权（可选）")
-        updatePermissionRow(accessibilityRow, a11yEnabled, "已开启", "未开启")
+        updatePermissionRow(shizukuRow, shizukuGranted, "已授权 · 自动定位/增强功能可用", "未授权 · 基础功能仍可用")
+        updatePermissionRow(
+            accessibilityRow,
+            a11yEnabled && a11yConnected,
+            if (a11yConnected) "已连接 · 窗外关闭/点击透传/识屏/截屏可用" else "开关${if (a11yEnabled) "已开但未连接" else "未开"} · 相关功能暂不可用",
+            "未开启 · 相关功能暂不可用",
+        )
+        accessibilityRow.actionButton.text = if (a11yEnabled && !a11yConnected) "重新连接" else "去开启"
+        accessibilityRow.actionButton.visibility = if (a11yConnected) View.GONE else View.VISIBLE
 
         serviceButton.text = if (OverlayGestureService.isRunning) "停止主动呼出" else "启动主动呼出"
-        appManageButton.text =
+        (appManageButton.tag as? TextView)?.text =
             "管理扇形应用（已固定 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}）"
     }
 
@@ -288,9 +307,6 @@ class MainActivity : Activity() {
         get() = minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
 
     /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
-    private fun dp(value: Int): Int = (value / 400f * shortEdgePx).toInt()
-
-    /** 按屏幕短边比例算文字大小（px），参数是 400dp 屏上的 sp 值。 */
     private fun scaledSp(designSp: Float): Float = designSp / 400f * shortEdgePx
 
     override fun onRequestPermissionsResult(

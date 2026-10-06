@@ -43,9 +43,22 @@ class OutsideTapBlocker(private val context: Context) {
     private val windowManager: WindowManager? = context.getSystemService(WindowManager::class.java)
     private val views = LinkedHashMap<String, View>()
 
+    /**
+     * 判定「这一击要不要真的关窗」时**直接问它**，不看 [clickMode] 那个缓存字段。
+     *
+     * [clickMode] 是 [FreeformAccessibilityService.refresh] 刷进来的，而那个刷新挂在无障碍的
+     * 窗口变化事件上：设置页改完值到遮罩窗口重新装配之间隔着消息队列和事件，字段完全可能还是
+     * 上一次的值。用户报的「窗外点击选了双击，单击照样把小窗关掉」就是这么来的——派发那一刻
+     * `clickMode` 还是 single。SharedPreferences 的读是从内存里取的，一次点击读一回，代价可以忽略。
+     */
+    private val store = SettingsStore(context.applicationContext)
+
     /** 最近一次遮罩按压的屏幕坐标，供上层做键盘避让的兜底判断。 */
     private var downX = 0f
     private var downY = 0f
+    private var pendingSingleTap = false
+    private val tapHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val doubleTapTimeout = android.view.ViewConfiguration.getDoubleTapTimeout().toLong()
 
     /**
      * 遮罩被点击时的回调，参数是这次按压的屏幕坐标，由 [FreeformAccessibilityService] 注入。
@@ -54,6 +67,7 @@ class OutsideTapBlocker(private val context: Context) {
      * 拿落点再跟当前键盘区域比一次，就不会在那一拍里误关小窗。
      */
     var onOutsideTap: ((x: Float, y: Float) -> Unit)? = null
+    var clickMode: String = SettingsStore.CLICK_MODE_SINGLE
 
     /** 当前生效的遮罩块数，用于日志与设置页展示。 */
     val activeCount: Int get() = views.size
@@ -139,8 +153,8 @@ class OutsideTapBlocker(private val context: Context) {
         return mapOf(
             KEY_TOP to if (store.outsideTapSidesOnly) emptyList() else listOf(top),
             KEY_BOTTOM to if (store.outsideTapSidesOnly) emptyList() else listOf(bottom),
-            KEY_LEFT to listOf(left),
-            KEY_RIGHT to listOf(right),
+            KEY_LEFT to if (store.outsideTapVerticalOnly) emptyList() else listOf(left),
+            KEY_RIGHT to if (store.outsideTapVerticalOnly) emptyList() else listOf(right),
         )
     }
 
@@ -156,14 +170,22 @@ class OutsideTapBlocker(private val context: Context) {
                     setBackgroundColor(if (debug) DEBUG_COLOR else Color.TRANSPARENT)
                     // 记下落点后返回 false，事件继续走正常的 click 流程。
                     // rawX/rawY 是屏幕坐标，上层用它判断这次按压是不是落在软键盘上。
+                    val tapGesture = TapGesture(context)
                     setOnTouchListener { _, event ->
-                        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                            downX = event.rawX
-                            downY = event.rawY
+                        when (event.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> {
+                                downX = event.rawX
+                                downY = event.rawY
+                            }
+                            MotionEvent.ACTION_UP -> {
+                                if (tapGesture.onEvent(event)) dispatchOutsideClick()
+                                return@setOnTouchListener true
+                            }
+                            MotionEvent.ACTION_CANCEL -> tapGesture.reset()
                         }
-                        false
+                        tapGesture.onEvent(event)
+                        true
                     }
-                    setOnClickListener { onOutsideTap?.invoke(downX, downY) }
                 }
             try {
                 manager.addView(view, buildParams(key, rect))
@@ -192,6 +214,39 @@ class OutsideTapBlocker(private val context: Context) {
         params.height = rect.height()
         runCatching { manager.updateViewLayout(existing, params) }
             .onFailure { DebugLog.error("OUTSIDE_TAP_MASK_UPDATE_FAILED", key, it) }
+    }
+
+    private fun dispatchOutsideClick() {
+        // **读设置，不信字段**（见 [store] 的说明）：窗口事件晚一拍，字段就可能还是旧值。
+        val double = store.outsideTapClickMode == SettingsStore.CLICK_MODE_DOUBLE
+        clickMode = store.outsideTapClickMode
+        if (!double) {
+            pendingSingleTap = false
+            tapHandler.removeCallbacksAndMessages(null)
+            DebugLog.info("OUTSIDE_TAP_DISPATCH", "单击模式：直接关闭")
+            onOutsideTap?.invoke(downX, downY)
+            return
+        }
+        if (pendingSingleTap) {
+            // 第二次点击落在系统双击间隔里，这一击才算数。
+            pendingSingleTap = false
+            tapHandler.removeCallbacksAndMessages(null)
+            DebugLog.info("OUTSIDE_TAP_DISPATCH", "双击模式：第二击 → 关闭")
+            onOutsideTap?.invoke(downX, downY)
+            return
+        }
+        // 第一次点击只起头，等 [doubleTapTimeout] 内有没有第二击；没有就什么都不做。
+        pendingSingleTap = true
+        val x = downX
+        val y = downY
+        DebugLog.info("OUTSIDE_TAP_DISPATCH", "双击模式：第一击，等待第二击")
+        tapHandler.postDelayed({
+            pendingSingleTap = false
+            // 等待期间用户可能又把模式改回单击——那一击就该立刻生效，别再吞掉。
+            if (store.outsideTapClickMode != SettingsStore.CLICK_MODE_DOUBLE) {
+                onOutsideTap?.invoke(x, y)
+            }
+        }, doubleTapTimeout)
     }
 
     private fun detach(key: String) {

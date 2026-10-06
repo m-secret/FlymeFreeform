@@ -16,8 +16,10 @@ class SettingsStore(context: Context) {
         migrateMenuDimDefaultsIfNeeded()
         migrateCloseModeToSystemIfNeeded()
         migrateCloseModeAwayFromBackIfNeeded()
+        migrateTapCloseModeToSwipe()
         migrateSwipeDurationIfNeeded()
         migrateCloseAnchorYToZeroIfNeeded()
+        migrateLandscapeSideToAutoIfNeeded()
         dropRetiredTools()
     }
 
@@ -44,7 +46,7 @@ class SettingsStore(context: Context) {
         val keptDock = dock.filterNot { retired.contains(it) }
         if (keptDock.size != dock.size) {
             dockComponents = keptDock
-            DebugLog.info("DOCK_RETIRED_TOOL_DROPPED", "固定栏里摘掉已下线工具：${dock.size} -> ${keptDock.size}")
+            DebugLog.info("DOCK_RETIRED_TOOL_DROPPED", "底栏里摘掉已下线工具：${dock.size} -> ${keptDock.size}")
         }
     }
 
@@ -150,6 +152,16 @@ class SettingsStore(context: Context) {
         preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_BACK, true).apply()
     }
 
+    /** 已下线轻点关闭：将旧配置安全迁移到两种允许的上滑方式之一。 */
+    private fun migrateTapCloseModeToSwipe() {
+        if (preferences.getBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_TAP, false)) return
+        if (preferences.getString(KEY_OUTSIDE_TAP_CLOSE_MODE, null) == CLOSE_MODE_TAP_AUTO) {
+            preferences.edit().putString(KEY_OUTSIDE_TAP_CLOSE_MODE, CLOSE_MODE_CAPTION_AUTO).apply()
+            DebugLog.info("CLOSE_MODE_MIGRATED", "轻点方式已下线，改为 Shizuku 自动定位上滑")
+        }
+        preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_TAP, true).apply()
+    }
+
     /** 扇形离屏距离默认从 50% 改成 10%：等于旧默认 50 的视为没改过，重置为 10。 */
     private fun migrateInsetDefaultTo10IfNeeded() {
         if (preferences.getBoolean(KEY_INSET_MIGRATED_TO_10, false)) return
@@ -179,6 +191,21 @@ class SettingsStore(context: Context) {
         editor.remove(KEY_LEGACY_MENU_CORNER_INSET_DP)
         editor.putBoolean(KEY_TOUCH_MIGRATED, true)
         editor.apply()
+    }
+
+    /**
+     * 横屏面板位置的老默认「居中」迁到新默认「跟随呼出边」，只跑一次。
+     *
+     * 值等于旧默认（空 / `center`）的视为「没改过」，跟着新默认走；用户显式选过左 / 右的**保持不动**
+     * ——那是明确表达过的偏好，不能被「更新默认值」覆盖掉。
+     */
+    private fun migrateLandscapeSideToAutoIfNeeded() {
+        if (preferences.getBoolean(KEY_LANDSCAPE_SIDE_MIGRATED_AUTO, false)) return
+        val current = preferences.getString(KEY_LANDSCAPE_PANEL_SIDE, null)
+        if (current == null || current == SIDE_CENTER) {
+            preferences.edit().putString(KEY_LANDSCAPE_PANEL_SIDE, SIDE_AUTO).apply()
+        }
+        preferences.edit().putBoolean(KEY_LANDSCAPE_SIDE_MIGRATED_AUTO, true).apply()
     }
 
     /**
@@ -286,20 +313,64 @@ class SettingsStore(context: Context) {
 
     // ---- 窗外点击关闭（无障碍近似方案，实验特性） ----
 
+    /** 窗外触发方式：单击（默认）或双击。 */
+    var outsideTapClickMode: String
+        get() = preferences.getString(KEY_OUTSIDE_TAP_CLICK_MODE, CLICK_MODE_SINGLE) ?: CLICK_MODE_SINGLE
+        set(value) = preferences.edit().putString(KEY_OUTSIDE_TAP_CLICK_MODE, if (value == CLICK_MODE_DOUBLE) value else CLICK_MODE_SINGLE).apply()
+
     /** 是否启用「点击小窗外任意位置关闭小窗」。默认关闭。 */
     var outsideTapCloseEnabled: Boolean
         get() = preferences.getBoolean(KEY_OUTSIDE_TAP, false)
         set(value) = preferences.edit().putBoolean(KEY_OUTSIDE_TAP, value).apply()
 
     /**
-     * 只铺左右两块遮罩，不铺上下。
+     * 遮罩铺哪几边，取值见 [MASK_ALL] / [MASK_SIDES] / [MASK_VERTICAL]。
      *
-     * 上下两块虽然已经把状态栏/导航栏区域让开了，但仍会吃掉应用自己的顶部与底部内容区，
-     * 遇到误伤时可以打开这个开关收敛到只遮左右。
+     * 少铺一边是为了**少误触**，两种取向的理由不一样：
+     * - 上下两块虽然让开了状态栏/导航栏，但仍会吃掉应用自己的顶部与底部内容区；
+     * - 左右两块压在系统「返回」手势的两侧热区上，单手拿着或横屏时很容易被碰掉。
+     *
+     * 这两种取向是**同一件事的两端**（不能同时成立），所以背后共用这一个值：
+     * 界面上做成两个互斥的开关（[outsideTapSidesOnly] / [outsideTapVerticalOnly]），
+     * 都关 = 四边都遮。这样就不会出现「两个都开、结果哪边都不遮」的怪状态。
      */
+    var outsideTapMask: String
+        get() {
+            val saved = preferences.getString(KEY_OUTSIDE_TAP_MASK, null)
+            if (saved != null && saved in OUTSIDE_TAP_MASKS) return saved
+            // 从旧版本升级上来：以前只有一个「只遮左右」的布尔开关，按它折算一次。
+            return if (preferences.getBoolean(KEY_OUTSIDE_TAP_SIDES_ONLY, false)) MASK_SIDES else MASK_ALL
+        }
+        set(value) {
+            preferences
+                .edit()
+                .putString(KEY_OUTSIDE_TAP_MASK, if (value in OUTSIDE_TAP_MASKS) value else MASK_ALL)
+                .apply()
+        }
+
+    /** 「只遮左右两边」：等价于遮罩范围 = [MASK_SIDES]。 */
     var outsideTapSidesOnly: Boolean
-        get() = preferences.getBoolean(KEY_OUTSIDE_TAP_SIDES_ONLY, false)
-        set(value) = preferences.edit().putBoolean(KEY_OUTSIDE_TAP_SIDES_ONLY, value).apply()
+        get() = outsideTapMask == MASK_SIDES
+        set(value) {
+            outsideTapMask =
+                when {
+                    value -> MASK_SIDES
+                    outsideTapMask == MASK_SIDES -> MASK_ALL
+                    else -> outsideTapMask
+                }
+        }
+
+    /** 「只遮上下两边」：等价于遮罩范围 = [MASK_VERTICAL]。 */
+    var outsideTapVerticalOnly: Boolean
+        get() = outsideTapMask == MASK_VERTICAL
+        set(value) {
+            outsideTapMask =
+                when {
+                    value -> MASK_VERTICAL
+                    outsideTapMask == MASK_VERTICAL -> MASK_ALL
+                    else -> outsideTapMask
+                }
+        }
 
     /** 遮罩相对小窗边界外扩的距离（dp）。用于避免盖住小窗标题栏导致拖不动。 */
     var outsideTapPaddingDp: Int
@@ -458,6 +529,19 @@ class SettingsStore(context: Context) {
                 )
                 .apply()
 
+    /**
+     * 把前台服务那条「主动呼出已开启」的通知做成**静默、可划掉**的。
+     *
+     * 默认关闭（保持原样）。Android 要求前台服务必须挂一条通知，**彻底不显示是做不到的**：
+     * 强行 `cancel()` 掉它，部分 ROM 会判定这条服务失去了前台身份而把它收掉——那是
+     * 「主动呼出自己停了」这种最坏的结果，比多一行通知严重得多，所以不冒这个险。
+     *
+     * 打开后切到静默渠道：最低重要级（不出声、不弹横幅、不亮屏、无角标）+ 不进锁屏 + 可划掉。
+     */
+    var hideForegroundNotification: Boolean
+        get() = preferences.getBoolean(KEY_HIDE_NOTIFICATION, false)
+        set(value) = preferences.edit().putBoolean(KEY_HIDE_NOTIFICATION, value).apply()
+
     /** 调试日志开关。默认关闭，只在排查问题时打开（否则 WINDOW_SCAN 等日志会刷爆）。 */
     var debugLogEnabled: Boolean
         get() = preferences.getBoolean(KEY_DEBUG_LOG, false)
@@ -486,6 +570,68 @@ class SettingsStore(context: Context) {
                 .putInt(KEY_MENU_ICON_DP, value.coerceIn(MIN_MENU_ICON_DP, MAX_MENU_ICON_DP))
                 .apply()
 
+    /** 更多面板默认页：apps / tools。 */
+    var drawerDefaultTab: String
+        get() = preferences.getString(KEY_DRAWER_DEFAULT_TAB, TAB_APPS) ?: TAB_APPS
+        set(value) = preferences.edit().putString(KEY_DRAWER_DEFAULT_TAB, if (value == TAB_TOOLS) value else TAB_APPS).apply()
+
+    /**
+     * 横屏时面板贴屏幕哪一侧：
+     * [SIDE_AUTO]（默认，**跟着呼出边**）/ [SIDE_LEFT] / [SIDE_RIGHT] / [SIDE_CENTER]。
+     *
+     * **只管横屏**：竖屏永远是居中的那张小窗、底栏永远在卡片下方——用户明确要求竖屏逻辑不动。
+     *
+     * `AUTO` 的意思是「从哪个角呼出就贴哪一侧」：左下角呼出贴左、右下角呼出贴右。逻辑在
+     * `OverlayGestureService.resolvedLandscapeSide()`——它必须在**打开面板那一刻**解析成一个
+     * 具体取值再传进面板，因为面板自身的几何全是按构造时的取值算死的。
+     *
+     * 横屏选左 / 右（含 AUTO 解析出来的）之后：
+     *
+     * - 整块面板贴到那一侧（另一侧留出遮罩，点一下照样关面板）；
+     * - 底栏从「卡片下面一行」改成「卡片**外侧**一列」，正好落在贴边的那一边——
+     *   侧边模式下面板本来就窄，再横铺一行会把卡片挤得更窄，竖着一列反而正好。
+     */
+    var landscapePanelSide: String
+        get() =
+            preferences.getString(KEY_LANDSCAPE_PANEL_SIDE, SIDE_AUTO)?.takeIf { it in LANDSCAPE_SIDES }
+                ?: SIDE_AUTO
+        set(value) =
+            preferences.edit()
+                .putString(
+                    KEY_LANDSCAPE_PANEL_SIDE,
+                    if (value in LANDSCAPE_SIDES) value else SIDE_AUTO,
+                )
+                .apply()
+
+    /**
+     * **工具页网格**里工具显示顺序，缺失/新加入的工具按系统默认顺序补齐。
+     *
+     * ## 它只管工具页这一处
+     *
+     * 工具在三个地方出现：工具页网格、扇形（连同「已选」条）、底栏。**三处的顺序互不相干，
+     * 各拖各的**：这里改的是工具页网格；扇形与「已选」看 [pinnedComponents]；底栏看
+     * [dockComponents]。用户明确要的就是这种「各管各的」，**不要**把三处联动起来。
+     *
+     * 所以改这里时不要顺手去重排另外两个列表——那正是被否掉的做法。
+     */
+    var toolOrder: List<String>
+        get() {
+            // 历史值是用**字面量** `\n`（反斜杠 + n）拼的，这里两种分隔都认，免得读旧值时整串
+            // 认不出来、顺序被打回默认。
+            val saved =
+                preferences.getString(KEY_TOOL_ORDER, null)
+                    .orEmpty()
+                    .split("\n", "\\n")
+                    .filter { it.isNotBlank() }
+            val valid = SystemTools.specs.map { it.id }
+            return (saved.filter { it in valid }.distinct() + valid.filterNot { it in saved }).toList()
+        }
+        set(value) {
+            val valid = SystemTools.specs.map { it.id }
+            val ordered = value.filter { it in valid }.distinct() + valid.filterNot { it in value }
+            preferences.edit().putString(KEY_TOOL_ORDER, ordered.joinToString("\n")).apply()
+        }
+
     /** 用换行分隔的字符串保存，保证固定顺序在扇形里稳定。 */
     var pinnedComponents: List<ComponentName>
         get() =
@@ -505,7 +651,7 @@ class SettingsStore(context: Context) {
                 .apply()
 
     /**
-     * 「固定栏」里的项，**有序**，最多 [MAX_DOCK] 个。
+     * 「底栏」里的项，**有序**，最多 [MAX_DOCK] 个。
      *
      * 和 [pinnedComponents] 是两回事：那个决定**扇形里有什么**，这个只是「更多」面板底部
      * 那一行快捷位，点一下直接打开。两者可以放同样的东西，但互不影响。
@@ -568,7 +714,12 @@ class SettingsStore(context: Context) {
         recentComponents = (listOf(component) + current.filterNot { it == component }).take(MAX_RECENT)
     }
 
-    /** 拖拽结束后整体写回固定栏顺序，规则与 [reorderPins] 相同。 */
+    /** 清空「最近使用」——面板上那个「清除」按钮走的就是这里。 */
+    fun clearRecent() {
+        preferences.edit().remove(KEY_RECENT).apply()
+    }
+
+    /** 拖拽结束后整体写回底栏顺序，规则与 [reorderPins] 相同。 */
     fun reorderDock(ordered: List<ComponentName>) {
         val current = dockComponents
         if (current.size < 2) return
@@ -646,10 +797,53 @@ class SettingsStore(context: Context) {
         private const val KEY_PINS = "corner_pins"
         private const val KEY_OUTSIDE_TAP = "outside_tap_close_enabled"
         private const val KEY_OUTSIDE_TAP_SIDES_ONLY = "outside_tap_sides_only"
+        private const val KEY_OUTSIDE_TAP_MASK = "outside_tap_mask"
         private const val KEY_OUTSIDE_TAP_PADDING_DP = "outside_tap_padding_dp"
         private const val KEY_OUTSIDE_TAP_DEBUG = "outside_tap_debug"
         private const val KEY_OUTSIDE_TAP_CLOSE_MODE = "outside_tap_close_mode"
+        private const val KEY_OUTSIDE_TAP_CLICK_MODE = "outside_tap_click_mode"
+        private const val KEY_DRAWER_DEFAULT_TAB = "drawer_default_tab"
+        private const val KEY_LANDSCAPE_PANEL_SIDE = "landscape_panel_side"
+        private const val KEY_LANDSCAPE_SIDE_MIGRATED_AUTO = "landscape_side_migrated_to_auto"
+        private const val KEY_HIDE_NOTIFICATION = "hide_foreground_notification"
+        private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
+        const val CLICK_MODE_SINGLE = "single"
+        const val CLICK_MODE_DOUBLE = "double"
+        const val TAB_APPS = "apps"
+        const val TAB_TOOLS = "tools"
+
+        /**
+         * 横屏面板位置：**跟随呼出边**（默认）。
+         *
+         * 左边角落呼出贴左、右边呼出贴右。老版本默认是「居中」，存量配置由
+         * [migrateLandscapeSideToAutoIfNeeded] 迁到这里——用户要的就是「不用先去设置页选」。
+         */
+        const val SIDE_AUTO = "auto"
+
+        /** 横屏面板位置：居中（和竖屏一样的小窗，底栏仍在卡片下方）。 */
+        const val SIDE_CENTER = "center"
+
+        /** 横屏面板位置：贴左侧（底栏同时改排成左侧一列）。 */
+        const val SIDE_LEFT = "left"
+
+        /** 横屏面板位置：贴右侧（底栏同时改排成右侧一列）。 */
+        const val SIDE_RIGHT = "right"
+
+        /** 遮罩范围：四边都遮（默认）。 */
+        const val MASK_ALL = "all"
+
+        /** 遮罩范围：只遮左右两块（上下不接点击）。 */
+        const val MASK_SIDES = "sides"
+
+        /** 遮罩范围：只遮上下两块（左右不接点击，避免蹭到系统返回手势那条边）。 */
+        const val MASK_VERTICAL = "vertical"
+
+        private val OUTSIDE_TAP_MASKS = setOf(MASK_ALL, MASK_SIDES, MASK_VERTICAL)
+
+        /** [landscapePanelSide] 的合法取值。写入时照它校验，读到不认识的脏值一律回到 [SIDE_AUTO]。 */
+        private val LANDSCAPE_SIDES = setOf(SIDE_AUTO, SIDE_CENTER, SIDE_LEFT, SIDE_RIGHT)
+
         private const val KEY_CLOSE_BAR_X_PERCENT = "close_bar_x_percent"
         private const val KEY_CLOSE_BAR_Y_DP = "close_bar_y_dp"
         private const val KEY_CLOSE_ANCHOR_MARKER = "close_anchor_marker"
@@ -733,13 +927,8 @@ class SettingsStore(context: Context) {
          */
         const val CLOSE_MODE_CAPTION_AUTO = "caption_auto"
 
-        /**
-         * 在学到的小横条**真实坐标**上**单击**一次（见 [FreeformCaption.tapCaption]）。
-         *
-         * ColorOS 上点小横条就是直接关掉自由窗，比点右上角那个按钮少一步——按钮会先弹一个
-         * 二级菜单、还得再选一次。坐标来自系统日志，同样**需要 Shizuku**，默认不选。
-         */
-        const val CLOSE_MODE_TAP_AUTO = "tap_auto"
+        /** 旧版轻点模式的存量配置值，仅供迁移识别；不再提供或执行。 */
+        private const val CLOSE_MODE_TAP_AUTO = "tap_auto"
 
         /**
          * 历史遗留：尝试在小窗标题栏上找系统自己的关闭节点。
@@ -778,6 +967,8 @@ class SettingsStore(context: Context) {
         private const val KEY_CLOSE_MODE_MIGRATED_SYSTEM = "close_mode_migrated_to_system"
         /** 「返回键关闭」下线的一次性迁移标记。 */
         private const val KEY_CLOSE_MODE_MIGRATED_OFF_BACK = "close_mode_migrated_off_back"
+        /** 「轻点关闭」下线的一次性迁移标记。 */
+        private const val KEY_CLOSE_MODE_MIGRATED_OFF_TAP = "close_mode_migrated_off_tap"
 
         /** 扇形离屏距离的旧默认（50%），迁移时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT = 50
@@ -795,8 +986,8 @@ class SettingsStore(context: Context) {
 
         const val MAX_PINS = 6
 
-        /** 「更多」面板底部固定栏的容量。 */
-        const val MAX_DOCK = 4
+        /** 「更多」面板底栏的容量。 */
+        const val MAX_DOCK = 10
         private const val KEY_DOCK = "drawer_dock"
 
         /** 「更多」面板「应用」标签页里「最近使用」一行的容量。 */
