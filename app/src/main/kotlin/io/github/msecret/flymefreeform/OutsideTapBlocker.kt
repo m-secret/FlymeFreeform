@@ -73,7 +73,15 @@ class OutsideTapBlocker(private val context: Context) {
     val activeCount: Int get() = views.size
 
     /** 现在是不是「全屏兜住」状态（见 [captureAll]）。 */
-    val capturing: Boolean get() = views.containsKey(KEY_CAPTURE)
+    val capturing: Boolean get() = views.keys.any { it.startsWith(KEY_CAPTURE) }
+
+    /**
+     * 这一轮遮罩从哪些区域让开了（触摸条那两块，见 [computeRegions]）。
+     *
+     * 只用于自检：抠洞之后遮罩上不该再压着触摸条，真压到就说明让位没生效，
+     * 那正是「小窗打开后轮盘呼不出来」的成因，必须留下证据。
+     */
+    private var avoided: List<Rect> = emptyList()
 
     /**
      * 先拿**一整块全屏遮罩**把屏幕兜住。
@@ -88,16 +96,22 @@ class OutsideTapBlocker(private val context: Context) {
      * 这段时间宁可整屏都别穿透：那个还在长大的窗口本来也点不着。等它长到能被识别出来，
      * 下一次 [apply] 会自然把这块换成正常的上/下/左/右四块。
      */
-    fun captureAll(screen: Rect, debug: Boolean) {
+    fun captureAll(screen: Rect, debug: Boolean, avoid: List<Rect> = emptyList()) {
         val manager = windowManager ?: return
         if (screen.isEmpty) return
-        views.keys.toList().forEach { key -> if (key != KEY_CAPTURE) detach(key) }
-        place(manager, KEY_CAPTURE, screen, debug)
+        avoided = avoid
+        views.keys.toList().forEach { key -> if (!key.startsWith(KEY_CAPTURE)) detach(key) }
+        // 兜底那一块同样要给触摸条让路：用户完全可能在「小窗刚弹出来」的这几百毫秒里再从角落
+        // 起手（换一个应用），那一刻正落在整屏兜住的开头。见 [computeRegions]。
+        subtractHoles(screen, avoid).forEachIndexed { index, rect ->
+            if (!rect.isEmpty) place(manager, captureKey(index), rect, debug)
+        }
     }
 
-    fun apply(layout: Layout, store: SettingsStore) {
+    fun apply(layout: Layout, store: SettingsStore, avoid: List<Rect> = emptyList()) {
         val manager = windowManager ?: return
-        val regions = computeRegions(layout, store)
+        avoided = avoid
+        val regions = computeRegions(layout, store, avoid)
         val debug = store.outsideTapDebugOutline
         // 每块遮罩可能被「挖洞」切成好几片（见 [subtractHoles]），所以这里按 `key#序号` 记账。
         val wanted = LinkedHashMap<String, Rect>()
@@ -119,14 +133,32 @@ class OutsideTapBlocker(private val context: Context) {
     // ---- 区域计算 ----
 
     /**
-     * 算出四块遮罩：小窗的上、下、左、右。
+     * 算出四块遮罩：小窗的上、下、左、右，并**把 [avoid] 那些区域抠出去**。
      *
-     * **不要在遮罩上挖洞**（哪怕是为了给角落触摸条让路）。挖掉的地方就是「点下去会穿透到
-     * 下面的应用」的地方——那比轮盘难呼出严重得多。触摸条和遮罩都是悬浮窗，触摸条这一层
-     * 本来就更高（`TYPE_APPLICATION_OVERLAY` 2038 > `TYPE_ACCESSIBILITY_OVERLAY` 2032），
-     * 靠层序就够了；真出问题也该去调层序，不是在这里开口子。
+     * 抠洞的唯一对象是**角落触摸条**（[FreeformAccessibilityService.triggerBarRects] 算出来传给这里）。
+     *
+     * **为什么必须抠，而不是靠层序。** 早先这里的注释写着「触摸条那一层本来就更高
+     * （`TYPE_APPLICATION_OVERLAY` 2038 > `TYPE_ACCESSIBILITY_OVERLAY` 2032），靠层序就够了」——
+     * **那是错的**：类型号大小跟层级无关。WMS 里真正决定 z 序的是
+     * `WindowManagerPolicy.getWindowLayerFromTypeLw()`，它返回
+     * `TYPE_APPLICATION_OVERLAY` → **11**、`TYPE_ACCESSIBILITY_OVERLAY` → **31**
+     * （注释原文：*overlay put by accessibility services to intercept user interaction*）。
+     * 也就是说遮罩（无障碍悬浮窗）**压在触摸条和状态栏之上**。
+     *
+     * 后果就是用户反复报的那个 bug：小窗一开、遮罩铺上，角落触摸条就被整个盖住 ——
+     * 从角落起手的手势全部落进遮罩，被当成「点了窗外」，**小窗直接关掉，轮盘根本出不来**。
+     * 证据（2026-10-06 用户日志）：同一位置连点三次，前两次没有遮罩 → 正常出轮盘；
+     * 中间那次遮罩正铺着 → 没有 `GESTURE_DOWN`，只有 `OUTSIDE_TAP_DISPATCH 单击模式：直接关闭`。
+     *
+     * **抠掉不会让点击穿透到下层应用**：抠掉的正是触摸条自己的矩形，那一下由触摸条接住——
+     * 手势照常出轮盘，普通点击按「窗外点击」处理（见 `OverlayGestureService.onTapThrough`），
+     * 语义和原来落在遮罩上完全一致。
      */
-    private fun computeRegions(layout: Layout, store: SettingsStore): Map<String, List<Rect>> {
+    private fun computeRegions(
+        layout: Layout,
+        store: SettingsStore,
+        avoid: List<Rect>,
+    ): Map<String, List<Rect>> {
         // 软键盘弹出时必须把它让出来：键盘铺在屏幕底部，正好压在「小窗下方」那块遮罩上，
         // 用户在小窗里打字、点键盘字母时会命中遮罩，被当成「点了窗外」而关掉小窗。
         //
@@ -151,11 +183,42 @@ class OutsideTapBlocker(private val context: Context) {
         val right = Rect(innerRight, innerTop, safe.right, innerBottom)
 
         return mapOf(
-            KEY_TOP to if (store.outsideTapSidesOnly) emptyList() else listOf(top),
-            KEY_BOTTOM to if (store.outsideTapSidesOnly) emptyList() else listOf(bottom),
-            KEY_LEFT to if (store.outsideTapVerticalOnly) emptyList() else listOf(left),
-            KEY_RIGHT to if (store.outsideTapVerticalOnly) emptyList() else listOf(right),
+            KEY_TOP to if (store.outsideTapSidesOnly) emptyList() else subtractHoles(top, avoid),
+            KEY_BOTTOM to if (store.outsideTapSidesOnly) emptyList() else subtractHoles(bottom, avoid),
+            KEY_LEFT to if (store.outsideTapVerticalOnly) emptyList() else subtractHoles(left, avoid),
+            KEY_RIGHT to if (store.outsideTapVerticalOnly) emptyList() else subtractHoles(right, avoid),
         )
+    }
+
+    /**
+     * 把 [holes] 从 [rect] 里抠掉，返回剩下的若干块（可能被切成 2~3 片）。
+     *
+     * 每块遮罩本来就按 `key#序号` 分开记账（见 [apply]），所以这里返回多块是天然的，
+     * 不需要额外的窗口管理逻辑。
+     */
+    private fun subtractHoles(rect: Rect, holes: List<Rect>): List<Rect> {
+        if (rect.isEmpty) return emptyList()
+        var pieces: List<Rect> = listOf(Rect(rect))
+        for (hole in holes) {
+            if (hole.isEmpty) continue
+            val next = ArrayList<Rect>(pieces.size + 3)
+            for (piece in pieces) {
+                val cut = Rect()
+                // 不相交就原样留着；相交则切成上下两条整宽 + 左右两条只占洞的高度。
+                if (!cut.setIntersect(piece, hole)) {
+                    next += piece
+                    continue
+                }
+                if (cut.top > piece.top) next += Rect(piece.left, piece.top, piece.right, cut.top)
+                if (cut.bottom < piece.bottom) {
+                    next += Rect(piece.left, cut.bottom, piece.right, piece.bottom)
+                }
+                if (cut.left > piece.left) next += Rect(piece.left, cut.top, cut.left, cut.bottom)
+                if (cut.right < piece.right) next += Rect(cut.right, cut.top, piece.right, cut.bottom)
+            }
+            pieces = next
+        }
+        return pieces.filter { it.width() > 0 && it.height() > 0 }
     }
 
     // ---- 窗口管理 ----
@@ -217,6 +280,14 @@ class OutsideTapBlocker(private val context: Context) {
     }
 
     private fun dispatchOutsideClick() {
+        // 自检：遮罩本该已经给触摸条让开了（见 [computeRegions]），这一击却打在触摸条的矩形里。
+        // 出现这条就说明让位没生效/没算对——那正是「轮盘呼不出来」的成因，必须留证。
+        avoided.firstOrNull { it.contains(downX.toInt(), downY.toInt()) }?.let { rect ->
+            DebugLog.warn(
+                "OUTSIDE_TAP_OVER_TRIGGER",
+                "落点(${downX.toInt()},${downY.toInt()})压在触摸条 ${rect.toShortString()} 上，遮罩没让开",
+            )
+        }
         // **读设置，不信字段**（见 [store] 的说明）：窗口事件晚一拍，字段就可能还是旧值。
         val double = store.outsideTapClickMode == SettingsStore.CLICK_MODE_DOUBLE
         clickMode = store.outsideTapClickMode
@@ -282,12 +353,15 @@ class OutsideTapBlocker(private val context: Context) {
         private const val KEY_RIGHT = "right"
 
         /**
-         * 「全屏兜住」那一块的键名，见 [captureAll]。
+         * 「全屏兜住」那一块的键名前缀，见 [captureAll]。
          *
-         * 它不参与四块遮罩的记账（[apply] 找不到这个键就会把它 detach 掉），
+         * 按 `capture#序号` 记账：整屏兜住也要给角落触摸条抠洞，抠完可能不止一块。
+         * 它同样不参与四块遮罩的记账（[apply] 找不到这些键就会把它们 detach 掉），
          * 所以两者天然互斥、不会同时挂着。
          */
         private const val KEY_CAPTURE = "capture"
+
+        private fun captureKey(index: Int): String = "$KEY_CAPTURE#$index"
 
         private val KEYS = listOf(KEY_TOP, KEY_BOTTOM, KEY_LEFT, KEY_RIGHT)
 

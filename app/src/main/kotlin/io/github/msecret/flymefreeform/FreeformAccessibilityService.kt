@@ -60,6 +60,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     /** 上一次打过的窗口快照，用来跳掉内容完全相同的重复日志（见 observeLayout）。 */
     private var lastWindowScan = ""
 
+    /**
+     * 最近一次探测到的窗口列表。
+     *
+     * 给 [triggerBarRects] 用：遮罩要不要给触摸条让路，取决于**触摸条窗口此刻真的在不在**，
+     * 而复用 [observeLayout] 刚查过的那一份就不必再打一次 IPC（无障碍主线程上每一次都算钱）。
+     */
+    private var lastWindows: List<AccessibilityWindowInfo> = emptyList()
+
     /** 最近一次识别到的小窗包名，用于「强力关闭」兜底。 */
     private var lastFreeformPackage: String? = null
 
@@ -267,12 +275,25 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 两者本来就是独立的功能：遮罩由**无障碍服务**铺，跟角落触摸条跑不跑没关系；关闭动作
         // 也全在无障碍这边（[startCloseFlow]），不经过 `OverlayGestureService`。早先把它们绑在
         // 一起，用户单独打开「启用窗外点击关闭」时遮罩永远不铺——他看到的正是「这个开关不生效」。
-        val needMask = store.outsideTapCloseEnabled
+        //
+        // 另有一条**必须让开**的情形：本项目自己的可触摸全屏悬浮窗（「更多」面板、识屏面板）铺着的时候。
+        // 它们是 `TYPE_APPLICATION_OVERLAY`（WMS 层级 11），而遮罩是 `TYPE_ACCESSIBILITY_OVERLAY`
+        // （层级 31）——**遮罩一定压在面板之上**。面板没法像触摸条那样「抠洞让路」（它铺满整屏），
+        // 所以只能整体撤下遮罩；面板撤下时 [OverlayGestureService.hideDrawer] 会主动催一次重排。
+        // 不这么做的话，面板会变成「点哪儿都在点窗外」：每点一下就关掉一个本来就开着的小窗。
+        val panelShown = OverlayGestureService.fullScreenSurfaceShown
+        val needMask = store.outsideTapCloseEnabled && !panelShown
+        val screen = screenBounds()
+        val avoid = if (needMask) triggerBarRects(screen, store) else emptyList()
+        logTriggerAvoid(avoid, needMask && (store.leftCornerEnabled || store.rightCornerEnabled))
         when {
             !needMask -> {
                 if (target.activeCount > 0) {
                     target.detachAll()
-                    DebugLog.info("OUTSIDE_TAP_DISABLED", "窗外关闭已关闭，撤下遮罩")
+                    DebugLog.info(
+                        "OUTSIDE_TAP_DISABLED",
+                        if (panelShown) "「更多」/识屏面板铺着，撤下遮罩" else "窗外关闭已关闭，撤下遮罩",
+                    )
                 }
             }
 
@@ -307,14 +328,14 @@ class FreeformAccessibilityService : AccessibilityService() {
                             "小窗还在展开动画里（面积过小识别不出），先全屏兜住防穿透",
                         )
                     }
-                    target.captureAll(screenBounds(), store.outsideTapDebugOutline)
+                    target.captureAll(screen, store.outsideTapDebugOutline, avoid)
                 } else if (target.activeCount > 0) {
                     target.detachAll()
                     DebugLog.info("OUTSIDE_TAP_NO_WINDOW", "未识别到小窗，撤下遮罩")
                 }
             }
 
-            else -> target.apply(layout, store)
+            else -> target.apply(layout, store, avoid)
         }
         updateCloseAnchorMarker(store, layout?.freeform)
     }
@@ -356,7 +377,9 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     private fun observeLayout(): OutsideTapBlocker.Layout? {
-        val windowList = runCatching { windows }.getOrNull() ?: return null
+        val windowList = runCatching { windows }.getOrNull()
+        lastWindows = windowList.orEmpty()
+        if (windowList == null) return null
         val screen = screenBounds()
         val safe = safeArea(screen, windowList)
         if (safe.isEmpty) return null
@@ -531,6 +554,93 @@ class FreeformAccessibilityService : AccessibilityService() {
         bottom = minOf(bottom, screen.bottom - gestureInset)
         if (bottom <= top) return Rect(screen.left, screen.top, screen.right, screen.bottom)
         return Rect(screen.left, top, screen.right, bottom)
+    }
+
+    // ---- 触摸条让位 ----
+
+    /** 上一轮让位结果的摘要，只在内容变化时打日志（[refresh] 会被窗口事件高频触发）。 */
+    private var lastTriggerAvoidLog = ""
+
+    /**
+     * 记下这一轮遮罩给触摸条让开了哪些地方。
+     *
+     * **关键证据**：[expectHoles] 为真却一个洞都没抠出来，就意味着小窗开着时角落触摸条
+     * 被整块盖住——那正是「小窗呼出后轮盘再也呼不出来」。所以这种情况必须留一条告警，
+     * 不能静默跳过。
+     */
+    private fun logTriggerAvoid(avoid: List<Rect>, expectHoles: Boolean) {
+        val text = avoid.joinToString(" ") { it.toShortString() }
+        val summary = if (expectHoles) text else "off"
+        if (summary == lastTriggerAvoidLog) return
+        lastTriggerAvoidLog = summary
+        if (!expectHoles) return
+        if (text.isEmpty()) {
+            DebugLog.warn(
+                "OUTSIDE_TAP_AVOID",
+                "没定位到触摸条窗口，本轮遮罩不抠洞：小窗开着时角落会被盖住",
+            )
+        } else {
+            DebugLog.info("OUTSIDE_TAP_AVOID", "给触摸条让开 ${avoid.size} 块：$text")
+        }
+    }
+
+    /**
+     * 角落触摸条此刻占着的屏幕矩形（左、右各一块），供遮罩抠洞用。
+     *
+     * 遮罩是 `TYPE_ACCESSIBILITY_OVERLAY`、触摸条是 `TYPE_APPLICATION_OVERLAY`，而这两种类型的
+     * WMS 层级是 **31 : 11**（见 [OutsideTapBlocker.computeRegions] 里的说明）——
+     * **遮罩一定压在触摸条之上**，小窗一开触摸条就被盖住，从角落起手的手势全部变成「点了窗外」。
+     * 修法就是让遮罩把这两块抠出来，所以这里的矩形必须和 [OverlayGestureService.triggerParams]
+     * 摆出来的窗口**完全对齐**：同一个 [CornerGeometry] 口径、同样 `BOTTOM` 重力 + `x = 0` + `y = bottomInset`。
+     *
+     * 两个前提都满足才让位，缺一不可：
+     * 1. 设置里这个角落是开的；
+     * 2. **窗口列表里真的找到了那块窗口** —— 触摸条窗口不存在（服务没起、刚重建、addView 失败）
+     *    时抠出来的就是「点下去穿透到下层应用」的洞，比轮盘难呼出更糟。
+     */
+    private fun triggerBarRects(screen: Rect, store: SettingsStore): List<Rect> {
+        val width = CornerGeometry.triggerWidth(this, store)
+        val height = CornerGeometry.triggerHeight(this, store)
+        if (width <= 0 || height <= 0) return emptyList()
+        val bottom = screen.bottom - CornerGeometry.bottomInset(this, store)
+        val top = bottom - height
+        val expected = ArrayList<Rect>(2)
+        if (store.leftCornerEnabled) expected += Rect(screen.left, top, screen.left + width, bottom)
+        if (store.rightCornerEnabled) expected += Rect(screen.right - width, top, screen.right, bottom)
+        return expected.mapNotNull { candidate -> actualTriggerBounds(candidate) }
+    }
+
+    /**
+     * 找到真的压在 [expected] 上的那块触摸条窗口，**返回它的真实矩形**。
+     *
+     * 拿估算值直接当洞是危险的：洞比窗口大出来的那一圈就是「点下去穿透到下层应用」的地方
+     * （`CornerGeometry.bottomInset` 兜了 20dp 下限、预览模式还另有一套草稿尺寸，估算值和
+     * 真实窗口常常差十几像素）。所以这里一律以窗口列表报上来的 bounds 为准——
+     * 洞和窗口严丝合缝，多一个像素都不让。
+     *
+     * 三重筛选，缺一不可：
+     * 1. 类型必须是 `TYPE_SYSTEM`（无障碍视角里悬浮窗报的是它；遮罩自己是 `TYPE_ACCESSIBILITY_OVERLAY`）；
+     * 2. 包名必须是自己（屏幕底部那条导航栏也是 `TYPE_SYSTEM`，只看位置就会把它当成触摸条）；
+     * 3. **主体**要落在角落矩形里：本应用还有别的可触摸悬浮窗（HUD 提示条等），它们跟角落
+     *    那两块几乎不相交，用「相交面积 ≥ 自身一半」挡掉。
+     */
+    private fun actualTriggerBounds(expected: Rect): Rect? {
+        var best: Rect? = null
+        var bestArea = 0
+        for (window in lastWindows) {
+            if (window.type != AccessibilityWindowInfo.TYPE_SYSTEM) continue
+            if (packageOf(window) != packageName) continue
+            val bounds = Rect().also { window.getBoundsInScreen(it) }
+            if (bounds.isEmpty) continue
+            val overlap = Rect().also { it.setIntersect(bounds, expected) }
+            val area = overlap.width() * overlap.height()
+            if (area * 2 < bounds.width() * bounds.height()) continue
+            if (area > bestArea) {
+                bestArea = area
+                best = bounds
+            }
+        }
+        return best
     }
 
     // ---- 角落点击透传 ----
@@ -1397,6 +1507,26 @@ class FreeformAccessibilityService : AccessibilityService() {
 
         /** 服务实例是否存活（用于设置页状态显示）。 */
         val isConnected: Boolean get() = instance != null
+
+        /**
+         * 「窗外点击」的遮罩此刻是否铺着。
+         *
+         * 触摸条靠它判断「角落这一下」该怎么算——遮罩铺着就说明**小窗开着**，那遮罩上必然
+         * 给触摸条抠了洞（见 [triggerBarRects]），落在洞里的这一击是触摸条接住的，
+         * 语义仍然是「点了小窗外面」。详见 [OverlayGestureService.onTapThrough]。
+         */
+        fun outsideMaskActive(): Boolean = (instance?.blocker?.activeCount ?: 0) > 0
+
+        /**
+         * 把触摸条接住的一次普通点击按「窗外点击」处理（坐标就是那一次真实按压的坐标）。
+         *
+         * 返回 false 表示无障碍服务没连上，调用方应退回原本的透传行为。
+         */
+        fun dispatchOutsideTapFromCorner(x: Float, y: Float): Boolean {
+            val service = instance ?: return false
+            service.onOutsideTap(x, y)
+            return true
+        }
 
         /**
          * 把一次按压按回指定坐标。服务未连接时返回 false，调用方应据此提示用户。

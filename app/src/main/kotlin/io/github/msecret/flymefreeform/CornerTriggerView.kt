@@ -79,6 +79,22 @@ class CornerTriggerView(
 
     private var passthroughStartedAt = 0L
 
+    /**
+     * 「回放中」这个标记已经持续了多久（ms）；没在回放时恒为 0。
+     *
+     * 服务端的巡检靠它判断标记是不是已经死了。**这条判据必须由服务端来读**：
+     * [onTouchEvent] 里那条自愈只有在「还能收到触摸」时才跑得到，而回放期间调用方会把窗口
+     * 置成不可触摸 —— 一旦收尾回调丢失，本视图就永远收不到事件、自愈永远不执行。
+     * 上一轮「回放标记」和「恢复可触摸」互相挡住的死锁就是这么来的。
+     */
+    val passthroughAgeMs: Long
+        get() =
+            if (passthroughInFlight) {
+                SystemClock.elapsedRealtime() - passthroughStartedAt
+            } else {
+                0L
+            }
+
     /** 手指是否已经移动超过 touchSlop。用于区分「点击」与「滑了一下但不是手势」。 */
     private var movedBeyondSlop = false
 

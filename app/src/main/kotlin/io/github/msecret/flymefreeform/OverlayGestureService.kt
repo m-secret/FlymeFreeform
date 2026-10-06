@@ -143,8 +143,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private val triggerWatchdog =
         object : Runnable {
             override fun run() {
-                if (!isRunning) return
-                checkTriggers()
+                if (isRunning) checkTriggers()
+                // **无条件续期。** 早先是 `if (!isRunning) return`——只要有一次 `isRunning`
+                // 提前变成 false（服务被系统原地重启、`onCreate` 还没跑到），这条链就**断掉且
+                // 再也接不回来**，之后所有故障都只能靠重启服务。服务真的销毁时 `onDestroy` 的
+                // `removeCallbacksAndMessages(null)` 会把它清掉，不会空转。
                 handler.postDelayed(this, TRIGGER_WATCHDOG_MS)
             }
         }
@@ -182,7 +185,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private var catalogLoadedAt = 0L
 
     /** 后台是不是已经有一次目录重读在跑（避免连点几次「更多」叠出好几趟）。 */
-    private var catalogRefreshing = false    /**
+    private var catalogRefreshing = false
+
+    /**
      * 工具 + 已安装应用。
      *
      * 扇形固定项与面板反查统一以它为准——工具用伪组件编码（见 [SystemTools]），
@@ -222,6 +227,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     override fun onCreate() {
         super.onCreate()
         AppContext.attach(this)
+        runningService = this
         windowManager = getSystemService(WindowManager::class.java)
         store = SettingsStore(this)
         registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
@@ -477,6 +483,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     override fun onDestroy() {
         isRunning = false
+        runningService = null
         handler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(screenOffReceiver) }
         runCatching { getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(displayListener) }
@@ -940,6 +947,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 "DRAWER_SHOWN",
                 "应用 ${appEntries.size} 个 · 工具 ${toolEntries.size} 个",
             )
+            // 面板铺上了就立刻催一次无障碍重排，把「窗外点击」的遮罩撤掉。
+            // 不这么做的话，遮罩（层级 31）会压在面板（层级 11）之上，
+            // 面板里每点一下都被当成「点了窗外」→ 关掉一个本来就开着的小窗。
+            FreeformAccessibilityService.refreshIfRunning()
         } catch (exception: RuntimeException) {
             DebugLog.error("DRAWER_ADD_FAILED", null, exception)
         }
@@ -955,6 +966,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 .onFailure { DebugLog.warn("DRAWER_REMOVE_FAILED", null, it) }
         }
         DebugLog.info("DRAWER_HIDDEN", "撤下面板 ${closing.size} 个")
+        // 面板撤下 = 「点哪儿都不再是点窗外」，遮罩该铺回来了。
+        // 主动催一次而不是等下一个窗口变化事件：事件可能根本不来（面板撤下本身不产生窗口变化），
+        // 那遮罩就一直挂着不铺，用户得等到下一次别的窗口变动才恢复。
+        FreeformAccessibilityService.refreshIfRunning()
     }
 
     // ---- 手势回调（主线程） ----
@@ -1102,6 +1117,25 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             DebugLog.warn("CORNER_TAP_THROUGH_REPLAY", "回放期间又命中触摸条，已忽略以免递归")
             return
         }
+        // **小窗开着时，角落这一下要按「点了小窗外面」处理，不能按坐标回放。**
+        //
+        // 小窗一开，无障碍就把四块遮罩铺上了；遮罩给角落触摸条抠了洞（见
+        // `OutsideTapBlocker.computeRegions`），所以这一下才轮得到触摸条接住——
+        // 它落在的那块地方，语义上本来就是「小窗外面」，跟直接点在遮罩上完全一样。
+        //
+        // 若在这里照常回放（把这一击按回原坐标），注入出去的事件会打在小窗以外的区域上，
+        // 表现为「从角落点一下，底下的应用动了一下，小窗却没关」；更糟的是回放前还要把
+        // 触摸条让开，那一瞬间真的会穿透到下层应用。交给无障碍走「窗外点击」的既有流程，
+        // 单击/双击两种模式的判定也能一并沿用。
+        if (FreeformAccessibilityService.outsideMaskActive() &&
+            FreeformAccessibilityService.dispatchOutsideTapFromCorner(x, y)
+        ) {
+            DebugLog.info(
+                "CORNER_TAP_OUTSIDE",
+                "side=$side 坐标=(${x.toInt()},${y.toInt()}) 小窗开着，按窗外点击处理",
+            )
+            return
+        }
         setTriggerTouchable(side, false)
         view?.passthroughInFlight = true
         // 等窗口属性真正生效（约两帧）再注入，否则注入的事件仍会命中还没让开的触摸条。
@@ -1209,18 +1243,31 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /**
      * 巡检一遍触摸条，把坏掉的修好。见 [triggerWatchdog]。
      *
-     * 检查三件事，都是「坏了就只能靠外部救」的：
+     * 检查四件事，都是「坏了就只能靠外部救」的：
      *
      * 1. **窗口还在不在**：`isAttachedToWindow` 为假 = 系统把它摘掉了（或者上次重建失败），
      *    这个角落从此彻底哑掉。直接重建。**只认这一条**，不按 `view.width` 判——那是 View
      *    自己的字段，第一次布局跑完之前一直是 0，按它判会把刚加好的窗口误杀。
      * 2. **有没有被卡在「不可触摸」**：只在没有回放进行中时校正（回放中那一次本来就要让开）。
-     * 3. **手势排除状态**：没有手势在进行时（[expandedSide] 为空）就不该停在「排除已暂停」。
+     * 3. **几何还对不对**：窗口活着、也可触摸，但尺寸/位置停在旧设置上时，用户从屏幕角落起手
+     *    就会落在触摸区之外——**这种情况上面两条一条都测不出来**，而用户的体感与「窗口没了」
+     *    完全一样。
+     * 4. **手势排除状态**：没有手势在进行时（[expandedSide] 为空）就不该停在「排除已暂停」。
      *
      * 每次只记录**真的修了什么**，没坏时不产生任何日志，免得把调试日志刷爆。
      */
     private fun checkTriggers() {
         if (!store.enabled) return
+        // **先把「轮盘」这条死引用清掉。** 下面的早退本意是「用户正在挑图标，别去打扰」，
+        // 但 `removeMenu` 里那次 `removeViewImmediate` 是 `runCatching` 的，静默失败时窗口已经
+        // 没了、`menuView` 却还在——那巡检就**永远**走不到下面的修复逻辑。
+        // 自愈机制自己变成故障的一部分，是这套东西最不该犯的错。
+        menuView?.let { menu ->
+            if (!menu.isAttachedToWindow) {
+                DebugLog.warn("TRIGGER_WATCHDOG", "轮盘窗口已不在，清掉残留引用")
+                removeMenu()
+            }
+        }
         // **正在用的时候绝不重建窗口**：重建是「移除 + 新增」，那会把一条正在进行的手势
         // 拦腰截断（触摸流随窗口一起没了），用户看到的是轮盘凭空消失。等下一次巡检再来。
         //
@@ -1234,6 +1281,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             DebugLog.warn("TRIGGER_WATCHDOG", "手势状态残留未收尾，已复位")
             collapseTrigger()
         }
+        var needsRelayout = false
         // 先按快照遍历：下面的 resyncTrigger 会就地改 triggerViews。
         triggerViews.keys.toList().forEach { side ->
             val view = triggerViews[side] ?: return@forEach
@@ -1241,15 +1289,46 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 resyncTrigger(side, "巡检发现窗口已失效")
                 return@forEach
             }
+            // 「回放中」的死信处理。**必须排在恢复可触摸之前**：回放期间窗口是被置成不可触摸的，
+            // 本视图收不到任何触摸，它自己那条超时自愈（见 [CornerTriggerView.passthroughAgeMs]）
+            // 永远跑不到；而下面那条恢复分支又要看这个标记——两者叠加就是一个**互相挡住的死锁**，
+            // 只能由这里按时间打破。
+            if (view.passthroughInFlight && view.passthroughAgeMs > PASSTHROUGH_STALE_MS) {
+                DebugLog.warn(
+                    "TRIGGER_WATCHDOG",
+                    "side=$side 回放标记超时（${view.passthroughAgeMs}ms），已强制解除",
+                )
+                view.passthroughInFlight = false
+            }
             if (!view.passthroughInFlight && !triggerTouchable(view)) {
                 DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 卡在不可触摸，已恢复")
                 setTriggerTouchable(side, true)
+            }
+            // 几何：**只在没在用的时候查**。尺寸/位置跟设置对不上，说明上一次重排没落地
+            // （或旋转后 `bottomInset` 变了没跟着写），此时窗口「活着、可触摸」但用户够不着它。
+            val params = view.layoutParams as? WindowManager.LayoutParams
+            if (!view.passthroughInFlight && params != null) {
+                val expectedY = CornerGeometry.bottomInset(this, store)
+                if (params.width != triggerWidthPx ||
+                    params.height != triggerHeightPx ||
+                    params.y != expectedY
+                ) {
+                    DebugLog.warn(
+                        "TRIGGER_WATCHDOG",
+                        "side=$side 几何与设置不符" +
+                            "（${params.width}x${params.height}@y${params.y} → " +
+                            "${triggerWidthPx}x${triggerHeightPx}@y$expectedY），已重排",
+                    )
+                    needsRelayout = true
+                }
             }
             if (expandedSide == null && view.exclusionSuspended) {
                 DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 手势排除未收尾，已复位")
                 view.exclusionSuspended = false
             }
         }
+        // 重排放在遍历之后：它自己会遍历一遍并可能 resync，套在循环里等于边遍历边改。
+        if (needsRelayout) updateTriggerLayout()
         // 开关是开的却没有窗口（上一次 addView 失败等）——补一个。
         listOf(CornerSide.Left, CornerSide.Right).forEach { side ->
             val enabled = if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
@@ -1461,6 +1540,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             windowManager.addView(panel, params)
             screenTextPanel = panel
             DebugLog.info("TOOL_SCREEN_TEXT_SHOWN", "${report.lines.size} 行 来源=${report.sourcePackage}")
+            // 同 [showDrawerNow]：面板铺满整屏，遮罩压在它之上会把每一次点击都当成「点窗外」。
+            FreeformAccessibilityService.refreshIfRunning()
         } catch (exception: RuntimeException) {
             DebugLog.error("TOOL_SCREEN_TEXT_FAILED", null, exception)
             screenTextPanel = null
@@ -1471,6 +1552,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val view = screenTextPanel ?: return
         screenTextPanel = null
         runCatching { windowManager.removeViewImmediate(view) }
+        FreeformAccessibilityService.refreshIfRunning()
     }
 
     /** 包名 → 应用名，用于识屏面板上的「来自 XX」。读不到就返回 null。 */
@@ -1650,6 +1732,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val TAP_THROUGH_TIMEOUT_MS = 700L
 
         /**
+         * 巡检判定「回放标记已经死了」的时限（ms）。
+         *
+         * 必须明显大于 [TAP_THROUGH_TIMEOUT_MS]（700）：正常回放有两道收尾，绝不会拖到这里来；
+         * 拖到了就说明两次收尾都丢了，只能由巡检强制解除。**这个值是打破死锁的唯一出口**
+         * （见 [checkTriggers] 第 2 条），取小了会误伤一次正常的透传，取大了用户就得多等。
+         */
+        private const val PASSTHROUGH_STALE_MS = 2_000L
+
+        /**
          * 小窗拉起之后补做触摸条体检的时刻（ms）。见 [launch]。
          *
          * 两拍：小窗的展开动画大约几百毫秒，第一拍落在它刚铺开之后；第二拍等系统把窗口、
@@ -1675,6 +1766,31 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        /**
+         * 活着的那个服务实例。没有就是 null。
+         *
+         * 给 [fullScreenSurfaceShown] 用：无障碍服务要判断「本项目自己的可触摸全屏悬浮窗
+         * （「更多」面板、识屏面板）此刻铺着没有」，而这些窗口都挂在这个服务里，只能问它。
+         * 用 `onDestroy` 里的置 null 兜住，避免服务死了还留着旧引用（那样会把遮罩永久撤掉）。
+         */
+        @Volatile
+        private var runningService: OverlayGestureService? = null
+
+        /**
+         * 本项目自己的**可触摸全屏悬浮窗**此刻铺着没有（「更多」面板 / 识屏面板）。
+         *
+         * 无障碍服务用它决定撤不撤「窗外点击」的遮罩，原因见
+         * `FreeformAccessibilityService.refresh` 那条注释：遮罩是
+         * `TYPE_ACCESSIBILITY_OVERLAY`（WMS 层级 31），面板是 `TYPE_APPLICATION_OVERLAY`
+         * （层级 11）——**遮罩一定压在面板之上**。面板铺满整屏，没法像触摸条那样抠洞让路，
+         * 只能整体撤下遮罩；否则面板会变成「点哪儿都在点窗外」，每点一下就关掉一个开着的小窗。
+         */
+        val fullScreenSurfaceShown: Boolean
+            get() {
+                val service = runningService ?: return false
+                return service.drawerPanels.isNotEmpty() || service.screenTextPanel != null
+            }
 
         fun start(context: Context) {
             val intent = Intent(context, OverlayGestureService::class.java).setAction(ACTION_START)
