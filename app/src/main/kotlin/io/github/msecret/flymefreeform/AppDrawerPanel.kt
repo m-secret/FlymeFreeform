@@ -1173,6 +1173,21 @@ class AppDrawerPanel(
         performIndexJump(targetLetter)
     }
 
+    /**
+     * 一次索引跳转要把分组表头对齐到的 y —— 也就是**当前真正能看见的内容顶边**
+     * （ListView 自己的坐标系：它的顶边就是 [bodyLayer] 顶边，见 [syncHeaderInset]）。
+     *
+     * - **正常模式**：跳转必然把列表滚很远，「已选」整块滑走、标签栏钉到内容顶上
+     *   → 可见顶边 = 标签栏下沿（[tabBarHeightPx]）；
+     * - **管理模式**：「已选」被**钉住不滑**（见 [applySelectorScroll]，要在它上面点红「−」），
+     *   它始终盖着内容最上面那一段，可见顶边还得再低一整个「已选」的高度。
+     *
+     * 少算管理模式这一段，表头就会被摆到「已选」**下面看不见的地方**，用户看到的是
+     * 再往下的那一行分组 —— 也就是「管理时滑动索引，和应用区域对不上」。
+     */
+    private fun indexAlignTopPx(): Int =
+        tabBarHeightPx.coerceAtLeast(0) + if (manageMode) selectorFullHeight else 0
+
     /** 执行一次索引跳转；旧的异步校正通过 generation 自动失效。 */
     private fun performIndexJump(letter: String) {
         val position = flatItems.indexOfFirst { it is Header && it.letter == letter }
@@ -1186,11 +1201,12 @@ class AppDrawerPanel(
         if (visibleTarget != null && headerAlignListener == null) {
             // Header 已经在屏幕上时，仅按真实位置做必要的滚动；到达底部边界时 delta
             // 会稳定为 0，不会触发 ListView 的整批子项重排。
-            val delta = visibleTarget.top - tabBarHeightPx.coerceAtLeast(0)
+            val delta = visibleTarget.top - indexAlignTopPx()
             if (delta != 0) listView.scrollListBy(delta)
             DebugLog.info(
                 "INDEX_JUMP",
-                "letter=$letter position=$position 就地校正 top=${visibleTarget.top} delta=$delta",
+                "letter=$letter position=$position 就地校正 top=${visibleTarget.top} delta=$delta" +
+                    " align=${indexAlignTopPx()} manage=$manageMode",
             )
             indexJumpInProgress = false
             applySelectorScroll(selectorFullHeight)
@@ -1245,12 +1261,13 @@ class AppDrawerPanel(
                         finishHeaderAlign()
                         return true
                     }
-                    val delta = target.top - tabBarHeightPx.coerceAtLeast(0)
+                    val delta = target.top - indexAlignTopPx()
                     if (delta != 0) listView.scrollListBy(delta)
                     DebugLog.info(
                         "INDEX_JUMP",
                         "letter=$letter position=$position 布局后校正 first=$first " +
-                            "top=${target.top} delta=$delta bar=$tabBarHeightPx",
+                            "top=${target.top} delta=$delta align=${indexAlignTopPx()} " +
+                            "bar=$tabBarHeightPx selector=$selectorFullHeight manage=$manageMode",
                     )
                     finishHeaderAlign()
                     return true
