@@ -41,10 +41,12 @@ android {
 
 androidComponents {
     onVariants(selector().all()) { variant ->
-        val suffix = if (variant.buildType == "debug") "-Debug" else ""
+        // **产物名不带 buildType 后缀**（用户 2026-10-06 发 1.0.0 时要求：「1.0.0 就不要加 debug 了」）。
+        // 两种 buildType 落在各自的 `outputs/apk/<type>/` 目录里，同名不会互相覆盖；
+        // 名字只跟 versionName 走，发出去的包（Release 附件）就叫 `FlymeFreeform-<version>.apk`。
         variant.outputs.forEach { output ->
             output.outputFileName.set(
-                output.versionName.map { version -> "FlymeFreeform-$version$suffix.apk" },
+                output.versionName.map { version -> "FlymeFreeform-$version.apk" },
             )
         }
     }
