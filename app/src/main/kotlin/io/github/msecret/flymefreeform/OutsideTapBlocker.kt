@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.view.Gravity
 import android.view.MotionEvent
+import android.os.SystemClock
 import android.view.View
 import android.view.WindowManager
 
@@ -38,6 +39,15 @@ class OutsideTapBlocker(private val context: Context) {
         val freeform: Rect,
         val safe: Rect,
         val ime: Rect? = null,
+        /**
+         * 屏上**其它**自由窗的矩形（不含 [freeform] 那一扇）。
+         *
+         * 屏上可以同时开着两扇以上的小窗，而 [freeform] 只装得下一扇。只按它算四块遮罩的话，
+         * 其余几扇会被遮罩整块盖住——对用户来说那扇窗「点哪儿都在点窗外」：既点不动它，
+         * 又会误触发一次关闭（真机实测：横屏两扇并排时，`left` 遮罩 `[0,216][2346,1962]`
+         * 把左边那扇 `[1312,221][2289,1957]` 整个盖在里面）。所以这些矩形也要一并当洞抠掉。
+         */
+        val others: List<Rect> = emptyList(),
     )
 
     private val windowManager: WindowManager? = context.getSystemService(WindowManager::class.java)
@@ -108,7 +118,19 @@ class OutsideTapBlocker(private val context: Context) {
         }
     }
 
-    fun apply(layout: Layout, store: SettingsStore, avoid: List<Rect> = emptyList()) {
+    /**
+     * @param holdIfEmpty 这一轮算出来的遮罩**是空的**（一块都没有）时，是否保持现有遮罩不动。
+     *
+     * 关闭流程中必须传 `true`。小窗正在播**收起动画**时，它的 bounds 是中间态，拿它算出来的
+     * 遮罩可能一块都不剩；照常理撤下就等于「一扇窗在关、另一扇窗的遮罩也跟着没了」，
+     * 那段时间点窗外会直接穿到下层应用。空形状多半只是一帧的中间态，下一轮 [apply] 就正常了。
+     */
+    fun apply(
+        layout: Layout,
+        store: SettingsStore,
+        avoid: List<Rect> = emptyList(),
+        holdIfEmpty: Boolean = false,
+    ) {
         val manager = windowManager ?: return
         avoided = avoid
         val regions = computeRegions(layout, store, avoid)
@@ -120,9 +142,29 @@ class OutsideTapBlocker(private val context: Context) {
                 if (!rect.isEmpty) wanted["$key#$index"] = rect
             }
         }
-        // 先撤掉这一轮不再需要的（含同一块遮罩被切分后多出来的那些），再摆新的。
-        views.keys.toList().forEach { key -> if (!wanted.containsKey(key)) detach(key) }
+        if (wanted.isEmpty() && holdIfEmpty && views.isNotEmpty()) {
+            DebugLog.info("OUTSIDE_TAP_MASK_HOLD", "这一轮形状为空（多半是收起动画的中间态），保持现有遮罩")
+            return
+        }
+        // **先摆新的，再撤旧的**——顺序反了会在切换中途留下空档。
+        //
+        // 形状一变（比如小窗被关掉、剩下那扇的遮罩从「两扇切出来的碎块」合回「四块」），
+        // 同一片区域可能从 `left#1` 换到 `left#0` 承担。若先撤后摆，从撤下 `left#1`
+        // 到摆好 `left#0` 之间那一小段，那块区域**没有任何遮罩**：用户此刻的点击会直接
+        // 穿到下层应用。真机实测（手机竖屏连点两次）第二下正好落进这段空档，
+        // 遮罩没接住，日志里连 `OUTSIDE_TAP_DISPATCH` 都没有。
+        //
+        // 反过来先摆后撤，重叠期间新旧两块同时存在——遮罩是全透明的，多一块看不出差别，
+        // 但那块区域**始终**有遮罩兜着。
+        val startedAt = SystemClock.elapsedRealtime()
         wanted.forEach { (key, rect) -> place(manager, key, rect, debug) }
+        views.keys.toList().forEach { key -> if (!wanted.containsKey(key)) detach(key) }
+        // 慢路径留痕：遮罩重排跑在无障碍主线程上，慢一点就会推迟关闭流程的复检回调。
+        // 正常一轮（十来块）只花几毫秒；越线的实测成因是 `removeViewImmediate` 同步阻塞。
+        val cost = SystemClock.elapsedRealtime() - startedAt
+        if (cost >= 60) {
+            DebugLog.warn("OUTSIDE_TAP_APPLY_SLOW", "apply 耗时 ${cost}ms，本轮 ${wanted.size} 块")
+        }
     }
 
     fun detachAll() {
@@ -172,6 +214,15 @@ class OutsideTapBlocker(private val context: Context) {
         // 外扩：小窗标题栏/缩放热区可能贴在边界外沿，内缩会让用户拖不动窗。
         val inner = Rect(layout.freeform).apply { inset(-pad, -pad) }
 
+        // 洞 = 角落触摸条（[avoid]）+ 屏上**其它**自由窗（[Layout.others]，同样按 pad 外扩）。
+        // 其它自由窗必须抠掉：它们跟本次这一扇无关，被盖上就点不动了。
+        val holes = ArrayList<Rect>(avoid.size + layout.others.size)
+        holes += avoid
+        for (other in layout.others) {
+            if (other.isEmpty) continue
+            holes += Rect(other).apply { inset(-pad, -pad) }
+        }
+
         val innerTop = inner.top.coerceIn(safe.top, safe.bottom)
         val innerBottom = inner.bottom.coerceIn(safe.top, safe.bottom)
         val innerLeft = inner.left.coerceIn(safe.left, safe.right)
@@ -182,11 +233,18 @@ class OutsideTapBlocker(private val context: Context) {
         val left = Rect(safe.left, innerTop, innerLeft, innerBottom)
         val right = Rect(innerRight, innerTop, safe.right, innerBottom)
 
+        // 「只遮左右」与「只遮上下」是互斥的两个选项。两个都开着时四块会被同时清空——
+        // 遮罩整块消失、功能静默失效。设置页已经保证互斥，这里再兜一道：都开 = 不限制。
+        val bothOnly = store.outsideTapSidesOnly && store.outsideTapVerticalOnly
+
         return mapOf(
-            KEY_TOP to if (store.outsideTapSidesOnly) emptyList() else subtractHoles(top, avoid),
-            KEY_BOTTOM to if (store.outsideTapSidesOnly) emptyList() else subtractHoles(bottom, avoid),
-            KEY_LEFT to if (store.outsideTapVerticalOnly) emptyList() else subtractHoles(left, avoid),
-            KEY_RIGHT to if (store.outsideTapVerticalOnly) emptyList() else subtractHoles(right, avoid),
+            KEY_TOP to if (!bothOnly && store.outsideTapSidesOnly) emptyList() else subtractHoles(top, holes),
+            KEY_BOTTOM to
+                if (!bothOnly && store.outsideTapSidesOnly) emptyList() else subtractHoles(bottom, holes),
+            KEY_LEFT to
+                if (!bothOnly && store.outsideTapVerticalOnly) emptyList() else subtractHoles(left, holes),
+            KEY_RIGHT to
+                if (!bothOnly && store.outsideTapVerticalOnly) emptyList() else subtractHoles(right, holes),
         )
     }
 
@@ -322,7 +380,20 @@ class OutsideTapBlocker(private val context: Context) {
 
     private fun detach(key: String) {
         val view = views.remove(key) ?: return
-        runCatching { windowManager?.removeViewImmediate(view) }
+        // 用 `removeView`，**不要用 `removeViewImmediate`**。
+        //
+        // 后者会**同步等待**这个窗口从 WMS 里真正摘掉（`ViewRootImpl.die()` 全程阻塞调用线程）。
+        // 遮罩是按「块」拆开的（四边各自还可能被抠洞切成好几片），一次形状变化常常要连撤
+        // 4~5 块 —— 真机实测那一下把**无障碍主线程**堵了 **571ms**（日志里是
+        // `MASK_REMOVE ×5` 与随后的 `MASK_ADD ×5` 之间整整半秒空白）。
+        //
+        // 后果不只是「慢」：关闭流程的复检回调（[FreeformAccessibilityService] 里的
+        // `closeHandler`，post 在主线程上）被一起推迟，用户连点的第二下也常常正好落进
+        // 这段没遮罩的窗口期里穿到下层应用 —— 正是他报的
+        // 「第一次关闭后遮罩会有一会儿不在，这时候可以点到下面的应用」。
+        //
+        // `removeView` 是异步的，立刻返回；遮罩是全透明的，晚一帧消失看不出任何差别。
+        runCatching { windowManager?.removeView(view) }
         DebugLog.info("OUTSIDE_TAP_MASK_REMOVE", key)
     }
 

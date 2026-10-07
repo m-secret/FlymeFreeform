@@ -104,6 +104,74 @@ class FreeformAccessibilityService : AccessibilityService() {
     /** 校准用的「关闭落点」准星窗。 */
     private var closeAnchorMarkerView: View? = null
 
+    /**
+     * [lastFreeformWindows] 的元素：屏上的一扇自由窗。
+     *
+     * [focused] 用**严格的** `isFocused`——判断「这扇是不是当前焦点窗」要靠它（见
+     * [needsFocusBeforeSwipe]），拿 `isActive` 顶替会把非焦点窗误判成焦点窗。
+     * [active] 只参与「哪一扇是当前那一扇」的挑选，对应原来的 `isFocused || isActive`。
+     */
+    data class FreeformWindow(
+        val bounds: Rect,
+        val pkg: String?,
+        val focused: Boolean,
+        val active: Boolean = false,
+    )
+
+    /**
+     * 屏上**此刻所有**自由窗。
+     *
+     * 早先只记「一扇」（[lastFreeformBounds] / [lastFreeformPackage]）。屏上开两扇时，
+     * 遮罩只绕那一扇铺，另一扇被整块盖住（点它就等于点窗外）；关闭目标也永远是那一扇，
+     * 跟用户点的是哪扇无关。用户报的「两扇小窗，点一扇的窗外却关掉另一扇」就是这么来的。
+     */
+    private var lastFreeformWindows: List<FreeformWindow> = emptyList()
+
+    /**
+     * 上一次**成功认出**自由窗的时刻。
+     *
+     * 给「这一拍认不出小窗」加一道宽限：关掉一扇窗、把它拖到别处这类操作期间，窗口列表会有一两拍
+     * 处在系统重排的中间态，`observeLayout()` 返回 null。若照旧立刻 [OutsideTapBlocker.detachAll]，
+     * 遮罩就整块消失——此时屏上明明还开着另一扇窗，用户点「窗外」会直接穿到下层应用。
+     */
+    private var lastFreeformSeenAt = 0L
+
+    /**
+     * 本次关闭流程锁定要关的是**哪一扇**（发起那一刻的矩形与包名）。
+     *
+     * 复检时必须按**身份**判断「那一扇还在不在」：屏上还开着另一扇小窗，
+     * 只看「还有没有自由窗」会把另一扇当成「没关掉」再补一刀，一关关俩。
+     */
+    private var closeTargetBounds: Rect? = null
+    private var closeTargetPackage: String? = null
+
+    /**
+     * 关闭动作是否已经**发出**（见 [startCloseFlow]）。
+     *
+     * 关闭流程分两段：`closing=true` 但还没注入时要挡住 [refresh]（否则遮罩一铺回来就盖住
+     * 注入落点，手势打空）；一旦注入完成，落点已经在系统输入队列里，遮罩重排不再挡它——
+     * 这时就该**立刻**把另一扇小窗的遮罩铺回来，而不是干等 [RECHECK_DELAY_MS] 的复检。
+     */
+    private var injectDone = false
+
+    /**
+     * 关闭流程**专用**的 handler。
+     *
+     * 与主 [handler] 分开，是为了能精确撤销本流程排下的回调（[cancelCloseFlow]）。
+     * 早先用的是 `handler.removeCallbacksAndMessages(null)`：它会把排队的 [refreshRunnable]
+     * 一起清掉——轻则这一拍重排丢掉，重则（配旧的布尔标志）让 [refresh] 永久停摆。
+     */
+    private val closeHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 关闭流程进行中又来的那一次窗外点击（落点）。
+     *
+     * 用户连点两下关两扇窗时，第二下往往落在第一扇的复检窗口里。早先直接丢弃
+     * （`if (closing) return`），用户的感觉就是「关了一扇之后得等一阵才能关第二扇」。
+     * 这里记下来，[finishCloseFlow] 收尾时用**那一刻的最新布局**重放一次。
+     */
+    private var pendingOutsideTap: Pair<Float, Float>? = null
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
@@ -136,28 +204,42 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 所有调用点都必须走这里。
      */
     private fun safeRefresh() {
+        val startedAt = SystemClock.elapsedRealtime()
         runCatching { refresh() }.onFailure { DebugLog.error("A11Y_REFRESH_FAILED", null, it) }
+        // 慢路径留痕：重排跑在无障碍主线程上，一慢就会把排在同一条消息队列上的**所有**回调
+        // （关闭流程的复检、排队的重放……）一起推迟 —— 用户看到的就是「点了没反应」。
+        // 正常一次只花几毫秒，只有真出问题（实测最坏 571ms，元凶是 `removeViewImmediate`
+        // 同步阻塞）才会越过这条线。常态不打，不留噪音。
+        val cost = SystemClock.elapsedRealtime() - startedAt
+        if (cost >= 100) DebugLog.warn("A11Y_REFRESH_SLOW", "refresh 耗时 ${cost}ms")
     }
 
     /**
-     * 有没有已经排队的重排。
+     * 合并式重排的载体（见 [scheduleRefresh]）：一个固定 Runnable，靠
+     * `removeCallbacks + post` 去重。
+     *
+     * **不要再用「布尔标志 + 匿名 Runnable」那套写法。** 早先就是那么写的：关闭流程开头有
+     * 一次清队列（现在是 [cancelCloseFlow]，那会儿是 `removeCallbacksAndMessages(null)`），
+     * 它会把**已经排队、还没执行**的那个匿名 Runnable 从队列里摘掉，可布尔标志留在 `true`
+     * ——此后**每一次** `scheduleRefresh()` 都在第一行直接返回，`refresh()` 永久停摆，
+     * 直到服务下次重连才自己好。用户看到的就是「关掉一扇小窗后遮罩就没了、再点窗外关不掉」。
+     *
+     * 固定 Runnable 没有这个失效态：谁清队列都只是让这一拍没跑，下一次窗口事件或
+     * [finishCloseFlow] 的主动催排会补上。
+     */
+    private val refreshRunnable = Runnable { safeRefresh() }
+
+    /**
+     * 合并式重排：同一个消息循环里连着的多次请求只跑一次。
      *
      * 窗口变化事件是**成串**来的（开机那一段尤其密），每个都同步跑一遍 `refresh()` 意味着
      * 每次都做「查窗口(IPC) + 最多四次 updateViewLayout(IPC) + 拼一长串日志」，
      * 全压在无障碍服务的**主线程**上。主线程被占住，系统会把它当成无响应的无障碍服务并
      * 直接停用——这正是「重启后无障碍权限丢了」最可能的成因之一。
-     *
-     * 所以多次事件合并成一次重排：已经排了就把这次丢掉。
      */
-    private var refreshScheduled = false
-
     private fun scheduleRefresh() {
-        if (refreshScheduled) return
-        refreshScheduled = true
-        handler.post {
-            refreshScheduled = false
-            safeRefresh()
-        }
+        handler.removeCallbacks(refreshRunnable)
+        handler.post(refreshRunnable)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -208,6 +290,20 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private var sawFreeformSinceLaunch = false
 
+    /**
+     * 本服务**这一轮生命周期里**有没有认出过自由窗。一旦置真就**不再复位**（[startSettleWatch]
+     * 也不会清它，那是 [sawFreeformSinceLaunch] 的活）。
+     *
+     * 只用来给 [observeLayout] 的第二遍（伴生装饰窗）当门：没有任何自由窗时，
+     * `TYPE_SYSTEM + pkg=android` 也可能是音量条、系统对话框，不能凭它单独认定是小窗；
+     * 但**只要这轮见过自由窗**，同尺寸的 android 系统窗就是小窗的伴生物，可以放心收。
+     *
+     * 实测（手机竖屏 1272×2772）：屏上零小窗时，无障碍窗口列表里**一个** `pkg=android`
+     * 的非应用窗都没有；开一扇小窗 → 出现一条（与内容窗 bounds 完全一致）；
+     * 开两扇 → 两条（非当前那扇只有装饰窗）。
+     */
+    private var everSawFreeform = false
+
     /** 本轮第一次「全屏兜住」的时刻（0 = 还没兜过）。给兜底加一个**硬上限**。 */
     private var captureStartedAt = 0L
 
@@ -254,19 +350,37 @@ class FreeformAccessibilityService : AccessibilityService() {
         val target = blocker ?: return
         target.clickMode = store.outsideTapClickMode
         if (closing) {
-            // 兜底：万一某次关闭流程没能走到收尾（注入抛异常、手势被系统掐断……），
-            // `closing` 会永远停在 true，`refresh()` 就永远从这里返回——遮罩再也挂不回来。
-            // 症状正是「小窗开着但点得动下面的应用」和「把窗外关闭关掉再打开也没用」。
-            // 超过时限就当这次关闭已经结束了，强制复位。
-            if (SystemClock.elapsedRealtime() - closingStartedAt <= CLOSING_TIMEOUT_MS) {
-                updateCloseAnchorMarker(store, null)
+            // 关闭流程分**两段**，两段都要从这里返回，但理由不同：
+            //
+            // - 注入**之前**（`!injectDone`）必须挡住——否则遮罩一铺回来就把注入落点盖住，
+            //   手势打空；
+            // - 注入**之后**（`injectDone`）**不做中间态重排**。这时目标窗正在播收起动画，
+            //   它的 bounds 每帧都在变，重排出来的形状下一秒就作废；更要命的是形状一变，
+            //   遮罩块就要被拆掉重建（切分方式变了，`key#序号` 对不上），而**新建的遮罩窗
+            //   要等 `HAS_DRAWN` 才接得住触摸（实测 70ms 上下）**。用户连点的第二下正好落进
+            //   这段拆建期，会直接穿到下层应用——他报的就是
+            //   「第一次关闭后遮罩会有一会儿不在，这时候可以点到下面的应用」。
+            //
+            //   冻结是有代价的（形状短暂与实况不符），但**收尾时一定会重排**：
+            //   [finishCloseFlow] 主动催一次 [scheduleRefresh]，那一次 `closing` 已经复位，
+            //   走的是正常路径，算出来的是最终形状。
+            if (!injectDone) {
+                // 兜底：万一某次关闭流程没能走到注入（重探失败、注入抛异常……），`closing` 会
+                // 永远停在 true，`refresh()` 就永远从这里返回——遮罩再也挂不回来。症状正是
+                // 「小窗开着但点得动下面的应用」和「把窗外关闭关掉再打开也没用」。
+                // 超过时限就当这次关闭已经结束了，强制复位。
+                if (SystemClock.elapsedRealtime() - closingStartedAt <= CLOSING_TIMEOUT_MS) {
+                    updateCloseAnchorMarker(store, null)
+                    return
+                }
+                DebugLog.warn(
+                    "CLOSE_FLOW_TIMEOUT",
+                    "关闭流程超过 ${CLOSING_TIMEOUT_MS}ms 没收尾，强制复位（否则遮罩永远挂不回来）",
+                )
+                closing = false
+            } else {
                 return
             }
-            DebugLog.warn(
-                "CLOSE_FLOW_TIMEOUT",
-                "关闭流程超过 ${CLOSING_TIMEOUT_MS}ms 没收尾，强制复位（否则遮罩永远挂不回来）",
-            )
-            closing = false
         }
         // 每次都探一遍窗口：标记需要它，校准后的关闭也需要最新的小窗边界。
         val layout = observeLayout()
@@ -330,12 +444,33 @@ class FreeformAccessibilityService : AccessibilityService() {
                     }
                     target.captureAll(screen, store.outsideTapDebugOutline, avoid)
                 } else if (target.activeCount > 0) {
-                    target.detachAll()
-                    DebugLog.info("OUTSIDE_TAP_NO_WINDOW", "未识别到小窗，撤下遮罩")
+                    val sinceSeen = SystemClock.elapsedRealtime() - lastFreeformSeenAt
+                    if (closing || (lastFreeformSeenAt != 0L && sinceSeen < MASK_HOLD_GRACE_MS)) {
+                        // 认不出小窗 ≠ 小窗没了。两种情形都**保持现有遮罩**：
+                        //
+                        // - 关闭流程中：目标窗正在播收起动画，这一刻 bounds 掉到面积下限以下；
+                        // - 刚刚还认得出（[MASK_HOLD_GRACE_MS] 之内）：窗口列表处在系统重排的
+                        //   中间态。实测「关掉一扇之后」就会出现这么一跳——紧跟其后的重放
+                        //   本来要按这份列表挑目标，列表被清空就直接
+                        //   `OUTSIDE_TAP_TARGET_MISS`；同时遮罩整块消失约 180ms，
+                        //   这段时间点窗外会穿到下层应用。
+                        //
+                        // 撤错的代价（遮罩多留 400ms，纯透明、点上去也是「关窗外」的语义）
+                        // 远小于撤早的代价（点穿到下层应用、以及第二下点不中目标）。
+                        DebugLog.info(
+                            "OUTSIDE_TAP_MASK_HOLD",
+                            "这一拍认不出小窗（${sinceSeen}ms 前还认得出），保持现有遮罩",
+                        )
+                    } else {
+                        target.detachAll()
+                        DebugLog.info("OUTSIDE_TAP_NO_WINDOW", "未识别到小窗，撤下遮罩")
+                    }
                 }
             }
 
-            else -> target.apply(layout, store, avoid)
+            // 关闭流程中额外要求「形状为空就别动」：小窗收起动画的中间态会把遮罩算空，
+            // 撤下就等于把另一扇窗的遮罩也一起收了，那段时间点窗外会穿到下层应用。
+            else -> target.apply(layout, store, avoid, holdIfEmpty = closing)
         }
         updateCloseAnchorMarker(store, layout?.freeform)
     }
@@ -385,21 +520,99 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (safe.isEmpty) return null
 
         val screenArea = screen.width().toLong() * screen.height()
+        if (screenArea <= 0) return null
+        val minFreeformArea = screenArea * MIN_RATIO_PERCENT / 100
+        val maxFreeformArea = screenArea * FULLSCREEN_RATIO_PERCENT / 100
 
-        // 先收集所有 TYPE_APPLICATION 候选，并打出它们的特征，便于在真机上定位识别偏差。
-        data class Candidate(
-            val window: AccessibilityWindowInfo,
-            val bounds: Rect,
-            val area: Long,
-        )
-
-        val candidates = ArrayList<Candidate>()
+        // 屏上**每一扇**自由窗。这套判定只有一份，[best] 也从它里面挑——**判据必须同源**，
+        // 否则会出现「遮罩给 A 抠了洞、关闭目标却选了 B」这种自相矛盾。
+        //
+        // 分三遍扫：
+        //
+        // **第 0 遍**：先把「伴生装饰窗」的矩形收起来 —— `TYPE_SYSTEM + pkg=android`、面积落在
+        // 小窗区间内的非应用窗。它是自由窗的**身份凭证**，第一遍要用。
+        //
+        // **第一遍**：内容窗（`TYPE_APPLICATION`，包名是应用自己），**必须能配上一个装饰窗**。
+        // 不配对说明它只是「一个没占满屏的应用窗」，不是小窗。放它进来的后果真机复现过：
+        // 竖屏应用跑在横屏下会被系统放进 **size-compat 窗** —— 实测手机横屏里它是
+        // `[1094,0][1678,1272]`（居中、满高、占屏 21%），面积正落在小窗区间里。于是日志出现
+        // `屏上 3 扇`，它还**被选成了关闭目标**（`CLOSE_TRIGGERED 目标=com.android.launcher`），
+        // 随后两刀全滑在下层应用上 —— 正是用户最怕的「关小窗却滑动了下面的软件」。
+        // 系统对话框同理（也是 `TYPE_APPLICATION` + 二三十个百分点面积），一并被这条挡掉。
+        //
+        // 装饰窗一定在，且与真实小窗 bounds 一致（实测只差 1px）——`•••` 与底部小横条就画在
+        // 它上面。真机逐帧验过 6 种状态：**打开动画的每一帧**内容窗与装饰窗都成对出现、
+        // bounds 同步跟着动画走；开一扇 → 成对；开两扇 → **当前那扇**成对、另一扇只剩装饰窗；
+        // 关掉一扇后的中间态 → 剩下的那扇只剩装饰窗。
+        //
+        // 所以这里**不留**「一个装饰窗都没有就退回老口径」的兜底。那个兜底防的是「系统哪天不报
+        // 装饰窗了」这种**没观测到**的假设，却会放进一个**已实测**的误判：横屏下关掉一扇、
+        // 系统回到桌面时，桌面自己也是竖屏应用、也跑在 size-compat 窗里（`com.android.launcher
+        // [1094,0][1678,1272]`），那一刻屏上恰好没有任何装饰窗 —— 兜底一开，它就被当成小窗，
+        // 还被选成关闭目标，两刀全滑在桌面上。宁可哪天真的不报装饰窗了、日志里出现
+        // `屏上 0 扇` 再回来处理，也不要常态地滑到用户下层应用。
+        //
+        // 验证用的 slack **必须**和后面去重用的 [DECOR_MERGE_SLACK_PX] 一致：验证更松的话，
+        // 会出现「凭证算配得上、去重却合不到一起」，同一扇窗被数成两扇。
+        //
+        // **第二遍**：收伴生装饰窗，用 [everSawFreeform] 把关：本服务这一轮里**从来没认出过**
+        // 自由窗时，不收 `TYPE_SYSTEM + pkg=android` —— 那个画像也可能是音量条、系统弹窗。
+        // 为什么非收不可：ColorOS 只给**当前那一扇**小窗上报内容窗；屏上其余小窗在无障碍
+        // 的窗口列表里**只剩**这个装饰窗。只认内容窗的后果实测过：手机竖屏开两扇小窗，
+        // 日志里 `屏上 1 扇：com.coloros.calculator`，另一扇整个不见了。
+        //
+        // 这两遍的「门」都**不能**用 [sawFreeformSinceLaunch]：它在我方发起小窗启动时会被
+        // [startSettleWatch] 清零；屏上已有两扇、用户再开第三扇时，另外两扇的装饰窗会在这段
+        // 探测期里集体消失，遮罩跟着抖动。
+        //
+        // 也不能用「第一遍非空」当第二遍的门：关掉一扇的瞬间，剩下的那扇有一段中间态
+        // **只有装饰窗、内容窗还没补报**（实测约 180ms × 手机竖屏）。那一刻第一遍恰好是空的，
+        // 那样就把自己要救的场景挡在门外 —— 候选列表清空 → 遮罩被撤下，用户正好在这 182ms 里
+        // 点到下层应用（「关掉一扇后遮罩有一会儿不在」）；紧跟的重放还会因列表为空而
+        // `OUTSIDE_TAP_TARGET_MISS`。
+        val decorRects = ArrayList<Rect>(4)
         for (window in windowList) {
-            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            if (packageOf(window) != DECOR_PACKAGE) continue
             val bounds = Rect().also { window.getBoundsInScreen(it) }
             if (bounds.isEmpty) continue
             val area = bounds.width().toLong() * bounds.height()
-            candidates += Candidate(window, bounds, area)
+            if (area < minFreeformArea || area >= maxFreeformArea) continue
+            decorRects += bounds
+        }
+
+        val all = ArrayList<FreeformWindow>(4)
+        for (pass in DECOR_PASS_CONTENT..DECOR_PASS_DECOR) {
+            if (pass == DECOR_PASS_DECOR && !everSawFreeform) break
+            for (window in windowList) {
+                val app = window.type == AccessibilityWindowInfo.TYPE_APPLICATION
+                // 第一遍只要内容窗；第二遍只要伴生装饰窗。
+                if (if (pass == DECOR_PASS_CONTENT) !app else app) continue
+                val owner = packageOf(window)
+                if (owner == packageName) continue
+                if (!app && owner != DECOR_PACKAGE) continue
+                val bounds = Rect().also { window.getBoundsInScreen(it) }
+                if (bounds.isEmpty) continue
+                val area = bounds.width().toLong() * bounds.height()
+                if (area < minFreeformArea || area >= maxFreeformArea) continue
+                // 内容窗必须配得上一个装饰窗才算自由窗（见上）。
+                if (app && decorRects.none { withinSlack(it, bounds, DECOR_MERGE_SLACK_PX) }) continue
+                val focused = window.isFocused
+                val active = window.isActive
+                // 近似去重：同一扇窗会**同时**以内容窗与装饰窗两个身份出现（边界差 1~2px），
+                // 精确相等去不掉，会把「屏上有几扇」翻倍。带包名的（内容窗）优先保留；
+                // 装饰窗那个 `pkg=android` 是假包名，记成 null 更诚实——收尾动作
+                // （如 [forceStopViaShizuku]）不会拿它去 force-stop 系统进程。
+                val absorbed = all.indexOfFirst { withinSlack(it.bounds, bounds, DECOR_MERGE_SLACK_PX) }
+                if (absorbed >= 0) {
+                    val kept = all[absorbed]
+                    val mergedPkg = if (kept.pkg == null && app) owner else kept.pkg
+                    all[absorbed] =
+                        FreeformWindow(kept.bounds, mergedPkg, kept.focused || focused, kept.active || active)
+                    continue
+                }
+                all += FreeformWindow(Rect(bounds), if (app) owner else null, focused, active)
+            }
         }
 
         if (windowList.isNotEmpty()) {
@@ -416,54 +629,47 @@ class FreeformAccessibilityService : AccessibilityService() {
             }
         }
 
-        // 自由窗优先：它通常是**焦点窗口**（isFocused/isActive），面积又比全屏前台应用小。
-        // ColorOS 的 getBoundsInScreen 有时把自由窗报成接近全屏，光靠面积区分不可靠，
-        // 所以把「焦点」作为最强信号：有焦点的次全屏窗口就是自由窗。
-        var best: Rect? = null
-        var bestPackage: String? = null
-        var bestArea = Long.MAX_VALUE
-
-        // 第一优先：有焦点、且面积 < 92% 的窗口。
-        for (c in candidates) {
-            val owner = packageOf(c.window)
-            if (owner == packageName) continue
-            if (c.area >= screenArea * FULLSCREEN_RATIO_PERCENT / 100) continue
-            if (c.area < screenArea * MIN_RATIO_PERCENT / 100) continue
-            if (!c.window.isFocused && !c.window.isActive) continue
-            if (c.area < bestArea) {
-                bestArea = c.area
-                best = Rect(c.bounds)
-                bestPackage = owner
+        // 从 [all] 里挑「当前那一扇」。先看有焦点（或活动）的，取其中面积最小的一扇；
+        // 一扇都没有（都被判成非焦点）时退回面积最小者。两者缺一不可：遮罩要给**每一扇**
+        // 抠洞，点窗外也要按点击坐标在其中认出「用户点的是哪一扇」，而这一扇只用于
+        // 「没有指定目标时该关哪扇」的兜底与准星落点。
+        var picked: FreeformWindow? = null
+        var pickedArea = Int.MAX_VALUE
+        for (w in all) {
+            if (!w.focused && !w.active) continue
+            val area = w.bounds.width() * w.bounds.height()
+            if (area < pickedArea) {
+                pickedArea = area
+                picked = w
             }
         }
-        // 第二优先：没有焦点窗口命中时，退回「面积最小」的次全屏窗口。
-        if (best == null) {
-            bestArea = Long.MAX_VALUE
-            for (c in candidates) {
-                val owner = packageOf(c.window)
-                if (owner == packageName) continue
-                if (c.area >= screenArea * FULLSCREEN_RATIO_PERCENT / 100) continue
-                if (c.area < screenArea * MIN_RATIO_PERCENT / 100) continue
-                if (c.area < bestArea) {
-                    bestArea = c.area
-                    best = Rect(c.bounds)
-                    bestPackage = owner
+        if (picked == null) {
+            pickedArea = Int.MAX_VALUE
+            for (w in all) {
+                val area = w.bounds.width() * w.bounds.height()
+                if (area < pickedArea) {
+                    pickedArea = area
+                    picked = w
                 }
             }
         }
 
-        val freeform = best ?: run {
+        val chosen = picked ?: run {
             // 小窗没了（被关掉了）。
             // 边界也要清掉。否则它一直是**上一扇窗**留下的旧值，而「点窗外」的关闭流程
             // 会拿它算注入落点 —— 落点跑到旧窗口的位置上，就会在那个坐标上凭空滑一下，
             // 点到当时恰好在那儿的应用。宁可直接放弃这一次关闭。
             lastFreeformBounds = null
             lastFreeformPackage = null
+            lastFreeformWindows = emptyList()
             return null
         }
-        lastFreeformPackage = bestPackage
-        lastFreeformBounds = Rect(freeform)
+        lastFreeformWindows = all
+        lastFreeformPackage = chosen.pkg
+        lastFreeformBounds = Rect(chosen.bounds)
+        lastFreeformSeenAt = SystemClock.elapsedRealtime()
         sawFreeformSinceLaunch = true
+        everSawFreeform = true
         stopSettleWatch()
         // 顺手把小横条的真实坐标学下来（见 [FreeformCaption]）：它只能从系统日志里读，
         // 窗口一出现先学一次，等用户点窗外时坐标已经就绪，关闭动作就不用再多等一截。
@@ -475,7 +681,12 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (ime != null) {
             DebugLog.info("OUTSIDE_TAP_IME", "软键盘 ${ime.toShortString()}，底部遮罩已让开")
         }
-        return OutsideTapBlocker.Layout(freeform, safe, ime)
+        // 屏上其它几扇也要交给遮罩当洞抠掉（见 [OutsideTapBlocker.Layout.others]）：
+        // 不抠的话它们会被遮罩整块盖住，变成「点哪儿都在点窗外」。
+        // 按**对象身份**排除，不按坐标——[picked] 本来就是 [all] 的元素，坐标比较会误伤
+        // 边界恰好相同的那一扇（比如装饰窗还没来得及合并的情形）。
+        val others = all.filter { it !== chosen }.map { it.bounds }
+        return OutsideTapBlocker.Layout(chosen.bounds, safe, ime, others)
     }
 
     /**
@@ -896,7 +1107,21 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 返回键只作为用户**显式选择**的策略存在，不会被自动回退到。
      */
     private fun onOutsideTap(x: Float, y: Float) {
-        if (closing) return
+        // 关闭流程进行中又来的这一下：**别丢**。用户连点两下关两扇窗时，第二下常常落在
+        // 第一扇的复检窗口里；丢了就是「关了一扇之后得等一阵才能关第二扇」。
+        // 记下来，等本次收尾后用最新的布局重放（见 [finishCloseFlow]）。
+        if (closing) {
+            if (injectDone) {
+                pendingOutsideTap = x to y
+                DebugLog.info(
+                    "OUTSIDE_TAP_QUEUED",
+                    "上一刀已发出，这次点击(${x.toInt()},${y.toInt()})排队等收尾后重放",
+                )
+            } else {
+                DebugLog.info("OUTSIDE_TAP_DROPPED", "上一刀还没发出，忽略这次点击（避免叠加注入）")
+            }
+            return
+        }
         // 兜底：遮罩重排依赖无障碍的窗口变化事件，键盘刚弹出那一刻可能还没来得及收缩到键盘上沿。
         // 落点在键盘里就直接忽略——宁可这一次不关窗，也不能把用户打字打断。
         val ime = runCatching { windows }.getOrNull()?.let { imeBounds(it) }
@@ -907,45 +1132,297 @@ class FreeformAccessibilityService : AccessibilityService() {
             )
             return
         }
-        startCloseFlow("窗外点击")
+        // **按点击坐标锁定目标**：屏上可能开着两扇以上的小窗，用户点的是哪一扇的「窗外」
+        // 就该关哪一扇。早先一律取全局 best（有焦点/面积最小那扇），与点击位置无关——
+        // 真机实测（平板横屏两扇并排）：点右边那扇的窗外，日志却是
+        // `CLOSE_TRIGGERED 目标=com.coloros.filemanager`（左边那扇），还得补一刀才关对。
+        // 见 [resolveCloseTarget]。
+        val target = resolveCloseTarget(x, y)
+        if (target == null) {
+            DebugLog.warn(
+                "OUTSIDE_TAP_TARGET_MISS",
+                "落点(${x.toInt()},${y.toInt()})没认出附近有自由窗，这次不关",
+            )
+            return
+        }
+        startCloseFlow("窗外点击", target)
+    }
+
+    /**
+     * 按**点击坐标**在一屏自由窗里认出「用户点的是哪一扇的窗外」。
+     *
+     * 判据是**到窗口边框的距离**（点在某扇窗里就算 0）：把落点归给最近的那一扇。
+     * 平手时优先拿焦点的——那通常就是用户刚刚在用的那扇。
+     *
+     * 这是「点哪扇关哪扇」的核心。屏上只有一扇时它的结果与旧的全局 best 完全一致，
+     * 所以单窗场景不会因为这个判据而变化。
+     */
+    private fun resolveCloseTarget(x: Float, y: Float): FreeformWindow? {
+        val list = lastFreeformWindows
+        if (list.isEmpty()) return lastFreeformBounds?.let { FreeformWindow(Rect(it), lastFreeformPackage, false) }
+        val px = x.toInt()
+        val py = y.toInt()
+        val scan = list.joinToString(" ") { w ->
+            "${w.pkg ?: "?"}${if (w.focused) "*" else ""}距离=${rectGapToPoint(w.bounds, px, py)}${w.bounds.toShortString()}"
+        }
+        val picked =
+            list.minWithOrNull(
+                compareBy({ rectGapToPoint(it.bounds, px, py) }, { if (it.focused) 0 else 1 }),
+            )
+        if (picked != null) {
+            DebugLog.info(
+                "OUTSIDE_TAP_TARGET",
+                "落点($px,$py) → 目标=${picked.pkg ?: "未知"} ${picked.bounds.toShortString()} " +
+                    "有焦点=${picked.focused}（屏上 ${list.size} 扇：$scan）",
+            )
+        }
+        return picked
+    }
+
+    /** 点到矩形边框的距离（点在矩形内为 0）。 */
+    private fun rectGapToPoint(r: Rect, x: Int, y: Int): Int {
+        val dx = when {
+            x < r.left -> r.left - x
+            x > r.right -> x - r.right
+            else -> 0
+        }
+        val dy = when {
+            y < r.top -> r.top - y
+            y > r.bottom -> y - r.bottom
+            else -> 0
+        }
+        return dx + dy
+    }
+
+    /** 两个矩形的「边差之和」，用来判断是不是同一扇窗（越小越像）。 */
+    private fun rectGap(a: Rect, b: Rect): Int =
+        kotlin.math.abs(a.left - b.left) +
+            kotlin.math.abs(a.top - b.top) +
+            kotlin.math.abs(a.right - b.right) +
+            kotlin.math.abs(a.bottom - b.bottom)
+
+    /** 每边差都不超过 [slack] 才算这两个矩形是同一扇窗（见 [CLOSE_SAME_SLACK_PX]）。 */
+    private fun withinSlack(a: Rect, b: Rect, slack: Int): Boolean =
+        kotlin.math.abs(a.left - b.left) <= slack &&
+            kotlin.math.abs(a.top - b.top) <= slack &&
+            kotlin.math.abs(a.right - b.right) <= slack &&
+            kotlin.math.abs(a.bottom - b.bottom) <= slack
+
+    /**
+     * 把「发起那一刻算出的目标」对齐到**最新一次布局**里的同一扇窗。
+     *
+     * 从点窗外到注入之间隔着几十毫秒和一拍重探，窗口可能刚被拖动/缩放过；直接沿用旧矩形
+     * 会把落点点偏。先按包名认人（认得出包名就必须一致），再按边界最接近兜一道。
+     */
+    private fun realignTarget(target: FreeformWindow): FreeformWindow? {
+        val list = lastFreeformWindows
+        if (list.isEmpty()) return null
+        val pkg = target.pkg
+        if (pkg != null) {
+            list.firstOrNull { it.pkg == pkg && withinSlack(it.bounds, target.bounds, CLOSE_SAME_SLACK_PX) }
+                ?.let { return it }
+            list.firstOrNull { it.pkg == pkg }?.let { return it }
+        }
+        return list.minByOrNull { rectGap(it.bounds, target.bounds) }
+    }
+
+    /**
+     * 本次关闭的目标窗在**最新一次布局**里的矩形；已经不在屏上返回 null。
+     *
+     * 「还有自由窗」不等于「没关掉」——屏上可能还开着另一扇。按**身份**判断：
+     * 包名认得出就必须一致，边界每边差不超过 [CLOSE_SAME_SLACK_PX] 才算同一扇。
+     */
+    private fun currentTargetBounds(): Rect? {
+        val want = closeTargetBounds ?: return null
+        val targetPkg = closeTargetPackage
+        for (w in lastFreeformWindows) {
+            if (targetPkg != null && w.pkg != null && w.pkg != targetPkg) continue
+            if (withinSlack(w.bounds, want, CLOSE_SAME_SLACK_PX)) return w.bounds
+        }
+        return null
     }
 
     /**
      * 统一的关闭流程入口：重探窗口 → 按当前策略执行一次 → 定时复检。
+     *
+     * @param target 要关的那一扇。给 null 时退回「屏上第一扇」——只有内置工具会这样调。
      */
-    private fun startCloseFlow(reason: String) {
-        // 已在关闭流程中（复检、重试、或上一个注入还没结束）就不再重复触发。
+    private fun startCloseFlow(reason: String, target: FreeformWindow? = null) {
+        // 已在关闭流程中（复检、或上一个注入还没结束）就不再重复触发。
         if (closing) return
+        val store = SettingsStore(this)
+        // 先重探一次窗口：用户可能刚拖过/缩放过小窗，用旧边界会把落点点偏。
+        observeLayout()
+        val chosen =
+            target?.let { realignTarget(it) }
+                ?: lastFreeformWindows.firstOrNull { it.focused }
+                ?: lastFreeformWindows.firstOrNull()
+        // 没有小窗（还在展开动画里、或者已经被关掉了）→ **什么都别做**。
+        // 拿旧边界硬注入会在那个坐标上凭空滑一下，点到当时恰好在那儿的应用。
+        if (chosen == null) {
+            DebugLog.warn("CLOSE_NO_WINDOW", "重探后仍没识别到小窗（还在展开动画里？），这次不注入")
+            return
+        }
         closing = true
+        injectDone = false
         closingStartedAt = SystemClock.elapsedRealtime()
         retryCount = 0
         closingWaitCount = 0
-        // 先重探一次窗口：用户可能刚拖过/缩放过小窗，用旧边界会把落点点偏。
-        observeLayout()
-        // 重探之后仍然没有小窗（比如它还在展开动画里、或者已经被关掉了）→ **什么都别做**。
-        // 拿旧边界硬注入会在那个坐标上凭空滑一下，点到当时恰好在那儿的应用。
-        if (lastFreeformBounds == null) {
-            DebugLog.warn("CLOSE_NO_WINDOW", "重探后仍没识别到小窗（还在展开动画里？），这次不注入")
-            closing = false
-            return
-        }
-        // 窗外遮罩若还在，会挡住注入的落点，先撤掉。
-        blocker?.detachAll()
-        closeStartBounds = lastFreeformBounds?.let { Rect(it) }
-        val store = SettingsStore(this)
+        closeTargetBounds = Rect(chosen.bounds)
+        closeTargetPackage = chosen.pkg
+        closeStartBounds = Rect(chosen.bounds)
+        // 关闭动作（[performCloseMode] 一系）读的是 lastFreeformBounds/包名这两个字段，
+        // 把它们指向本次目标，注入落点才落在对的那一扇上。
+        lastFreeformBounds = Rect(chosen.bounds)
+        lastFreeformPackage = chosen.pkg
         DebugLog.info(
             "CLOSE_TRIGGERED",
-            "原因=$reason 方式=${store.outsideTapCloseMode} 目标=${lastFreeformPackage ?: "未知"} 窗口=$lastFreeformBounds",
+            "原因=$reason 方式=${store.outsideTapCloseMode} 目标=${chosen.pkg ?: "未知"} " +
+                "窗口=${chosen.bounds.toShortString()} 有焦点=${chosen.focused} " +
+                "屏上共${lastFreeformWindows.size}扇",
         )
-        // 撤掉窗口后等一帧（约 40ms）让 WindowManager 真正把窗口移除，再注入，
-        // 否则注入的触摸可能仍被尚未移除的窗口吃掉。
-        handler.removeCallbacksAndMessages(null)
+        // 这里**不再撤遮罩**。落点可达性由 [OutsideTapBlocker.Layout.others] 抠洞保证：
+        // 遮罩围绕「当前那一扇」铺，而本次要关的目标窗要么就是那一扇（遮罩绕它铺、
+        // 根本不覆盖它），要么在 [others] 里（遮罩给它抠了洞，且洞按 pad **外扩**、
+        // 比窗口本身还大）。两种情况里 [captionPoint] 算出的落点都在窗口内，也就都在
+        // 洞里 —— 遮罩吃不到它。
+        //
+        // 早先这里无条件 `detachAll()`，那是「遮罩会压在落点上」年代的做法。修好其它扇
+        // 的抠洞之后，它成了**纯粹的空窗来源**：真机实测空窗 389ms，其中 300ms 花在
+        // [performCloseMode] 开头「先点横条让目标窗拿到焦点」那一步的等待上。这段里第二下
+        // 点击会直接穿到下层应用，正是用户报的「第一次关闭后遮罩会有一会儿不在，
+        // 这时候可以点到下面的应用」。
+        cancelCloseFlow()
+        DebugLog.info("CLOSE_FLOW_SCHEDULED", "已排定：${INJECT_HANDOFF_MS}ms 后注入、再 ${RECHECK_DELAY_MS}ms 后复检")
+        postCloseFlow(INJECT_HANDOFF_MS) {
+            performCloseMode(store.outsideTapCloseMode, isRetry = false)
+            // 手势已经发出（Shizuku 是异步起后台线程 `input swipe`，无障碍是 dispatchGesture，
+            // 都已在系统输入队列里，遮罩重排不再挡它）。**立刻放行重排**，让另一扇小窗的遮罩
+            // 马上铺回，而不是干等 [RECHECK_DELAY_MS] 的复检——那是「没关掉再补刀」的兜底，
+            // 不该卡住遮罩恢复。用户报的「关掉一扇后遮罩要等一阵才回来、这段点窗外没反应」
+            // 就是这 600ms 空窗造成的。
+            injectDone = true
+            scheduleRefresh()
+            postCloseFlow(RECHECK_DELAY_MS) { recheck() }
+        }
+    }
+
+    /**
+     * 排一个**关闭流程的**延时回调（可用 [cancelCloseFlow] 精确撤销）。
+     *
+     * 刻意不走主 [handler]：那条队列上还挂着 [refreshRunnable] 与落定探测，撤销关闭流程
+     * 回调时不能连它们一起清掉。
+     */
+    private fun postCloseFlow(delayMs: Long, action: () -> Unit) {
+        val postedAt = SystemClock.elapsedRealtime()
+        closeHandler.postDelayed(
+            Runnable {
+                // 「排定 vs 实际」是这条队列唯一可观测的指标：两者拉开就说明无障碍主线程
+                // 被别的重排占住了（见 [safeRefresh] 的慢路径留痕）。
+                DebugLog.info(
+                    "CLOSE_FLOW_TICK",
+                    "延时回调触发 排定=${delayMs}ms 实际=${SystemClock.elapsedRealtime() - postedAt}ms",
+                )
+                action()
+            },
+            delayMs,
+        )
+    }
+
+    /**
+     * 撤销本关闭流程排下的所有延时回调。
+     *
+     * 关闭流程**必须**走专属的 [closeHandler]，不能借主 [handler]：那条队列上还挂着
+     * [refreshRunnable] 与落定探测，收尾时一个 `removeCallbacksAndMessages(null)` 会把它们
+     * 一起清掉——重排与探测从此永久停摆。基线上正是这么写的，于是真机上反复出现
+     * 「排了复检却再也没有下文」。
+     */
+    private fun cancelCloseFlow() {
+        closeHandler.removeCallbacksAndMessages(null)
+    }
+
+    /**
+     * 关闭流程收尾：复位状态，并**立刻按当前窗口主动重排遮罩**。
+     *
+     * 这一步不能省。遮罩平时靠 `TYPE_WINDOWS_CHANGED` 事件触发 [refresh] 恢复，但「关掉一扇
+     * 小窗」**不一定产生新的窗口变化事件**（尤其屏上还开着另一扇时——关掉 B 之后 A 的窗口
+     * 列表没变，系统不会为「少了一扇窗」再发一次事件）。于是 [refresh] 迟迟不跑，另一扇小窗的
+     * 遮罩就「等一会儿」才铺回来，这空窗期点屏幕下方会穿到下层应用。
+     *
+     * 顺序上先置 [closing]，再 [scheduleRefresh]——后者是 post 到消息队列，跑起来时
+     * `closing` 已经是 false，不会撞上 [refresh] 里「关闭中提前返回」那条门。
+     */
+    private fun finishCloseFlow() {
+        DebugLog.info(
+            "CLOSE_FLOW_FINISH",
+            "收尾：复位并催重排（排队点击=${if (pendingOutsideTap != null) "有" else "无"}）",
+        )
+        closing = false
+        injectDone = false
+        closeStartBounds = null
+        closeTargetBounds = null
+        closeTargetPackage = null
+        cancelCloseFlow()
+        // **先重放，再催重排**——顺序不能反。
+        //
+        // 重放要用「刚关上那一扇、还没重排」的窗口列表去挑目标（[onOutsideTap] 读的是
+        // [lastFreeformWindows]）。若先 [scheduleRefresh]，[refresh] 会先跑一次重探；
+        // 而这一刻窗口列表往往正处在系统重排的**中间态**、一扇都认不出来，于是走
+        // `OUTSIDE_TAP_NO_WINDOW` 把 [lastFreeformWindows] 清空，紧接着的重放就
+        // `OUTSIDE_TAP_TARGET_MISS`——用户看到的是「连点两下，第二下没反应」。
+        // 真机实测日志正是这个顺序：`REPLAY` → `NO_WINDOW` → `TARGET_MISS`。
+        replayPendingOutsideTap()
+        scheduleRefresh()
+        // 再补一拍兜底：万一这一拍正好被别的重排覆盖、或窗口列表还没稳定下来。
+        // 只在确实不在关闭流程里时才跑，免得撞上紧接着发起的那一次关闭。
+        handler.postDelayed(
+            { if (!closing) safeRefresh() },
+            MASK_RESTORE_EXTRA_MS,
+        )
+    }
+
+    /**
+     * 重放关闭流程进行中被排队的窗外点击。
+     *
+     * 落点坐标是用户当时点的原样，用**那一刻的最新布局**重新挑目标——第一扇关掉之后
+     * 屏上少了一扇，重挑的结果自然就落在剩下那扇上。
+     */
+    private fun replayPendingOutsideTap() {
+        val pending = pendingOutsideTap ?: return
+        pendingOutsideTap = null
+        DebugLog.info("OUTSIDE_TAP_REPLAY", "收尾后重放排队的点击(${pending.first.toInt()},${pending.second.toInt()})")
+        postReplay(pending, 0)
+    }
+
+    /**
+     * 真正发起重放——**等窗口列表稳定下来再发**，最多试 [REPLAY_MAX_TRIES] 次。
+     *
+     * 收尾那一刻窗口列表常常正处在系统重排的**中间态**，`observeLayout()` 一扇都认不出来
+     * （日志 `OUTSIDE_TAP_NO_WINDOW`），列表被清空 → [resolveCloseTarget] 挑不到目标 →
+     * `OUTSIDE_TAP_TARGET_MISS`。用户看到的就是「连点两下，第二下没反应」。
+     * 真机实测（手机竖屏）：`REPLAY` → `NO_WINDOW` → `TARGET_MISS` 就是这个链条。
+     */
+    private fun postReplay(pending: Pair<Float, Float>, attempt: Int) {
         handler.postDelayed(
             {
-                performCloseMode(store.outsideTapCloseMode, isRetry = false)
-                handler.postDelayed({ recheck() }, RECHECK_DELAY_MS)
+                if (closing) {
+                    // 这期间又发起了一次关闭：交回排队逻辑，别叠加注入。
+                    pendingOutsideTap = pending
+                    DebugLog.info("OUTSIDE_TAP_REPLAY_DEFER", "重放时又进了关闭流程，重新排队")
+                    return@postDelayed
+                }
+                observeLayout()
+                if (lastFreeformWindows.isEmpty() && attempt < REPLAY_MAX_TRIES) {
+                    DebugLog.info(
+                        "OUTSIDE_TAP_REPLAY_WAIT",
+                        "窗口列表还没稳定（第 ${attempt + 1} 次），稍后再重放",
+                    )
+                    postReplay(pending, attempt + 1)
+                    return@postDelayed
+                }
+                onOutsideTap(pending.first, pending.second)
             },
-            INJECT_HANDOFF_MS,
+            if (attempt == 0) 0L else REPLAY_RETRY_MS,
         )
     }
 
@@ -956,8 +1433,30 @@ class FreeformAccessibilityService : AccessibilityService() {
      * （拖窗口右下角缩到最小），那条手势在真机上不成立、还会把关闭本身带坏，已整体下线。
      * 迷你窗交给 ColorOS 原生手势（用户自己滑小横条），本软件不插手。
      */
-    private fun performCloseMode(mode: String, isRetry: Boolean): Boolean =
-        when (mode) {
+    private fun performCloseMode(mode: String, isRetry: Boolean): Boolean {
+        // 动手之前先确保**目标窗是焦点窗**——这是所有关闭方式共同的前提，不是某一种的细节。
+        //
+        // ColorOS 把「关闭手势」交给当前聚焦的那扇窗：非焦点窗底部那条小横条是**死的**，
+        // 上滑没人接管，会直接漏到系统那层变成「底部上滑回桌面」；它的 `•••` 选单同理不响应。
+        // 而「关第二扇」天生就是非焦点窗——关掉第一扇之后焦点回到下层应用，剩下那扇不会被
+        // 重新聚焦。手机上实测就是这么失败的：`OUTSIDE_TAP_STILL_OPEN 点击没关掉小窗`，
+        // 两刀都打在设置窗（`有焦点=false`）上，两扇窗一个都没关掉。
+        //
+        // 这一步必须放在**这里**。早先它只在 [swipeUpOnCaption] 里、且带着
+        // 「窗口底边落进屏幕底部手势带」这个额外条件，于是 [closeViaCaption] 那条路
+        // （真实横条坐标，也就是用户实际在用的 `caption_auto`）**整个绕过了它**，
+        // 竖屏时条件也不成立，等于从来没生效过。
+        val target = closeTargetBounds ?: lastFreeformBounds
+        if (target != null && needsFocusBeforeSwipe(target) && !activateTarget(target)) {
+            DebugLog.warn(
+                "CLOSE_SWIPE_ACTIVATE_FAILED",
+                "连「点横条」这一下都没注入出去，照常动作（多半会漏成底部上滑/点了没反应）",
+            )
+        }
+        // [activateTarget] 内部要重探布局，那会把 [lastFreeformBounds] 刷成「全局那一扇」——
+        // 本次要关的是**锁定目标**，这里必须指回去，否则落点会打到另一扇窗上。
+        if (target != null) lastFreeformBounds = Rect(target)
+        return when (mode) {
             SettingsStore.CLOSE_MODE_SYSTEM -> clickSystemCloseEntry(isRetry)
 
             // ColorOS 手势模式自带：在小窗底部横条上「快速上滑」= 关闭浮窗。用无障碍重放一次即可。
@@ -969,6 +1468,7 @@ class FreeformAccessibilityService : AccessibilityService() {
             // 默认（含未知取值、含已下线的「返回键」两种取值）：模拟一次「快速上滑」。
             else -> swipeUpOnCaption(isRetry)
         }
+    }
 
     /**
      * 用小横条的**真实坐标**关闭。
@@ -1038,7 +1538,10 @@ class FreeformAccessibilityService : AccessibilityService() {
             return false
         }
         val store = SettingsStore(this)
-        val point = closeAnchorPoint(bounds, store)
+        // 起滑点必须落在**横条上**（窗口底边、窗口内部）。这里刻意用 [captionPoint] 而不是
+        // [closeAnchorPoint]：后者带「抬升到屏幕底部手势区上沿」的兜底，会把落点从横条上
+        // 抬走几十像素，横屏下就必然滑不到横条（真机日志：注入 (693,1188)，窗口底边却是 1246）。
+        val point = captionPoint(bounds, store)
         val shortEdge =
             minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
         // 距离与时长都可由用户在设置页调：判定「快速上滑」的阈值各家 ROM 不一样，写死就会
@@ -1046,6 +1549,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         val distance = (shortEdge * store.closeSwipeDistancePercent / 100f) *
             (if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f)
         val durationMs = store.closeSwipeDurationMs
+
+        // 「先确保目标窗是焦点窗」那一步已经提到 [performCloseMode] 开头了——它对**所有**
+        // 关闭方式都是前提（ColorOS 的关闭手势只认焦点窗）。放在这里只会让
+        // [closeViaCaption] 那条路漏掉，而用户用的正是那条。
 
         // 优先用 Shizuku 注入受信任触摸（`input swipe`），能可靠命中横条。
         // Shizuku 不可用时回退到无障碍 dispatchGesture。
@@ -1079,6 +1586,142 @@ class FreeformAccessibilityService : AccessibilityService() {
                 "提交=$dispatched",
         )
         return dispatched
+    }
+
+    /**
+     * 动手之前需不需要先把目标窗点成焦点窗：**只要它不是焦点窗就需要**。
+     *
+     * 这里**不能**再挂「窗口底边落进屏幕底部手势带」那个条件了。那条是早先按「横屏窗口贴底」
+     * 一个场景推出来的，实测把它当普适规则是错的：手机竖屏两扇小窗，设置窗底边距屏幕底还有
+     * 640px，上滑照样关不掉（`OUTSIDE_TAP_STILL_OPEN`，两刀全失败）。原因是关闭手势归**焦点窗**
+     * 认领，跟落点离屏幕底多远无关。
+     *
+     * 也**不能**按「屏上是不是只剩一扇」来省这一步：关掉第一扇之后焦点就回到下层应用了，
+     * 剩下那扇虽然成了唯一小窗却**不是**焦点窗——用户报的「关掉一扇后得等一阵才能关第二扇」
+     * 后半段正是这个状态。
+     *
+     * 找不到对应窗口时返回 false：身份都对不上就别乱点。
+     */
+    private fun needsFocusBeforeSwipe(bounds: Rect): Boolean {
+        val me = lastFreeformWindows.firstOrNull { withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+            ?: return false
+        return !me.focused
+    }
+
+    /**
+     * 把目标窗「点亮」的落点。
+     *
+     * **不能直接用 [captionPoint]**（窗口底部那条小横条）。手机上多扇小窗是大面积
+     * **层叠**摆放的，横条正好落在窗口水平居中处 —— 那也恰好是与其它小窗重叠最厉害的位置，
+     * 这一下会打到**上层那扇**窗上，目标窗压根没被点到。
+     *
+     * 真机实测（手机竖屏两扇小窗）：两扇的横条落点都在 x=636，点完 `mCurrentFocus` 仍是
+     * 另一扇；紧接着的上滑又打在那扇窗的**非横条**区域上，于是一刀都关不掉，
+     * 日志里是 `OUTSIDE_TAP_STILL_OPEN 点击没关掉小窗`。
+     *
+     * 所以改点**只有目标窗自己覆盖**的位置：窗口内、避开其它小窗矩形、贴着上边缘
+     * （标题栏那一带，不是内容区，点下去不会误触应用按钮）。
+     * 实测这样一点，焦点立刻落到目标窗上，随后的上滑一次命中。
+     */
+    private fun activationPoint(bounds: Rect): Pair<Float, Float> {
+        val inset = CornerGeometry.dp(this, ACTIVATION_INSET_DP)
+        val others =
+            lastFreeformWindows
+                .filter { !withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+                .map { it.bounds }
+        // 自上而下、左右交替各试几个点，取第一个「在窗口内、且不被别的窗盖住」的。
+        val offsets = intArrayOf(inset, inset * 2, inset * 3)
+        for (dy in offsets) {
+            for (x in intArrayOf(bounds.left + inset, bounds.right - inset)) {
+                val y = bounds.top + dy
+                if (x < bounds.left || x >= bounds.right) continue
+                if (y < bounds.top || y >= bounds.bottom) continue
+                if (others.any { it.contains(x, y) }) continue
+                return x.toFloat() to y.toFloat()
+            }
+        }
+        // 极端层叠（每个可试点都被别的窗盖住）→ 退回横条落点，至少保证落在窗口内。
+        return captionPoint(bounds, SettingsStore(this))
+    }
+
+    /**
+     * 轻量版焦点判断：只查窗口表，不写 [lastFreeformWindows]、不拼扫描串、不写 logcat，
+     * 也不会顺手触发「学小横条坐标」那个子进程。
+     *
+     * 只给 [activateTarget] 的等待循环用。那里跑在**无障碍主线程**上，换成 [observeLayout]
+     * 会把主消息队列一起堵住——真机实测那一段要 300ms，期间排着的遮罩重排全都往后拖。
+     */
+    private fun isFocusedWindowNow(bounds: Rect): Boolean {
+        val list = runCatching { windows }.getOrNull() ?: return false
+        for (w in list) {
+            if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            if (!w.isFocused) continue
+            val b = Rect().also { w.getBoundsInScreen(it) }
+            if (withinSlack(b, bounds, CLOSE_SAME_SLACK_PX)) return true
+        }
+        return false
+    }
+
+    /**
+     * 点一下目标窗底部横条，把它变成**焦点窗**。
+     *
+     * **不拿「焦点是否已转移」当退出条件**，只等一小会儿。这一点是被真机日志纠正过来的：
+     * 非焦点小窗在无障碍的窗口列表里常常只以伴生装饰窗（`pkg=android`）的身份上报，
+     * 它成为焦点窗之后那个身份也**不会**翻成 `isFocused=true`。于是按焦点轮询确认的写法
+     * 永远确认不到，白等满整个超时——实测日志正是
+     * `CLOSE_SWIPE_ACTIVATE_FAILED 点了横条但目标窗仍不是焦点窗`，而**同一次的上滑却把窗
+     * 关掉了**：焦点早就过去了，只是读不到。
+     *
+     * 所以这里只做「等待 + 尽量读一次」，读得到就早退，读不到就等满
+     * [CLOSE_FOCUS_WAIT_MS] 再走，返回值恒为 true。
+     */
+    private fun activateTarget(bounds: Rect): Boolean {
+        val point = activationPoint(bounds)
+        val x = point.first.toInt()
+        val y = point.second.toInt()
+        DebugLog.info("CLOSE_SWIPE_ACTIVATE", "目标窗不是焦点窗，先点它的专属区域($x,$y)让它拿到焦点")
+        val tapped =
+            if (ShizukuShell.hasPermission) {
+                ShizukuShell.injectTap(x, y)
+            } else {
+                val path = Path().apply { moveTo(point.first, point.second) }
+                val gesture =
+                    GestureDescription.Builder()
+                        .addStroke(GestureDescription.StrokeDescription(path, 0L, CLOSE_FOCUS_TAP_MS))
+                        .build()
+                runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
+            }
+        if (!tapped) return false
+        val startedAt = SystemClock.elapsedRealtime()
+        val deadline = startedAt + CLOSE_FOCUS_WAIT_MS
+        var readable = false
+        while (SystemClock.elapsedRealtime() < deadline) {
+            SystemClock.sleep(CLOSE_FOCUS_POLL_MS)
+            if (isFocusedWindowNow(bounds)) {
+                readable = true
+                break
+            }
+        }
+        DebugLog.info(
+            "CLOSE_SWIPE_FOCUS_DONE",
+            "点横条后等 ${SystemClock.elapsedRealtime() - startedAt}ms（读到焦点=$readable），接着上滑",
+        )
+        return true
+    }
+
+    /**
+     * 「上滑小横条」关闭用的**横条落点**。
+     *
+     * 和 [closeAnchorPoint] 的唯一区别是**不做「抬升到手势区上沿」那一步**——横条贴在窗口
+     * 底边，抬走就滑不到它了。横屏下「关小窗」与「回桌面」的区分靠的是**起滑点落在小窗内**
+     * 这一点（见 [swipeUpOnCaption] 里先聚焦那一段），不是靠把落点挪出手势带。
+     */
+    private fun captionPoint(bounds: Rect, store: SettingsStore): Pair<Float, Float> {
+        val ratio = (store.closeAnchorXPercent.coerceIn(0, 100)) / 100f
+        val x = (bounds.left + bounds.width() * ratio).coerceIn(bounds.left.toFloat(), bounds.right.toFloat())
+        val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDp)).toFloat()
+            .coerceIn(bounds.top.toFloat(), bounds.bottom.toFloat())
+        return x to y
     }
 
     /**
@@ -1181,7 +1824,9 @@ class FreeformAccessibilityService : AccessibilityService() {
     private fun removeCloseAnchorMarker() {
         val view = closeAnchorMarkerView ?: return
         closeAnchorMarkerView = null
-        runCatching { getSystemService(WindowManager::class.java)?.removeViewImmediate(view) }
+        // 同 [OutsideTapBlocker.detach]：不要用 `removeViewImmediate`，它会同步等待窗口摘除、
+        // 把无障碍主线程堵上几十到上百毫秒；而这一步在**每一次** [refresh] 里都可能走到。
+        runCatching { getSystemService(WindowManager::class.java)?.removeView(view) }
         DebugLog.info("CLOSE_ANCHOR_MARKER_REMOVE", "已撤下关闭落点准星")
     }
 
@@ -1288,32 +1933,42 @@ class FreeformAccessibilityService : AccessibilityService() {
         val store = SettingsStore(this)
         // 同 [refresh]：重试只看窗外关闭自己的开关，与「主动呼出」主开关无关。
         if (!store.outsideTapCloseEnabled) {
-            closing = false
+            DebugLog.info("OUTSIDE_TAP_RECHECK", "复检：窗外关闭开关已关，直接收尾")
+            finishCloseFlow()
             return
         }
-        val current = observeLayout() ?: run {
-            closing = false
-            DebugLog.info("OUTSIDE_TAP_CLOSED", "小窗已关闭")
+        val anyWindow = observeLayout()
+        // 「还有自由窗」不等于「没关掉」：屏上可能还开着**另一扇**小窗，那一扇跟本次关闭
+        // 无关。照旧逻辑就会再补一刀把它也关掉（用户报的「两扇并排，点一下窗外关掉俩」）。
+        // 所以这里按**身份**问一句：本次锁定的那一扇还在不在？
+        val now = currentTargetBounds()
+        if (anyWindow == null || now == null) {
+            DebugLog.info(
+                "OUTSIDE_TAP_CLOSED",
+                if (anyWindow == null) {
+                    "小窗已关闭"
+                } else {
+                    "目标小窗已关闭（屏上剩下的是另一扇，不动它）"
+                },
+            )
+            finishCloseFlow()
             return
         }
         // 窗口明显变小 = 系统已经在播收起动画。这时**绝不再补一次手势**：补的那一刀会打在
         // 一个正在变形的窗口上，用户看到的就是「卡了一下，先变小再关」。
         // 等待轮数用尽还在缩，说明它已经在往「气泡/最小化」那条路上走了，再补手势只会更乱。
-        if (isShrinking(current)) {
+        if (isShrinking(now)) {
             if (closingWaitCount >= MAX_CLOSING_WAIT) {
-                closing = false
-                closeStartBounds = null
                 DebugLog.warn("OUTSIDE_TAP_STILL_CLOSING", "窗口一直在收起，停止补刀", null)
+                finishCloseFlow()
                 return
             }
             closingWaitCount++
             DebugLog.info("OUTSIDE_TAP_CLOSING", "窗口正在收起（第 $closingWaitCount 次等待），不再补手势")
-            handler.postDelayed({ recheck() }, RECHECK_DELAY_MS)
+            postCloseFlow(RECHECK_DELAY_MS) { recheck() }
             return
         }
         if (retryCount >= MAX_RETRY) {
-            closing = false
-            closeStartBounds = null
             if (store.outsideTapForceClose && ShizukuShell.hasPermission) {
                 forceStopViaShizuku()
             } else {
@@ -1324,24 +1979,31 @@ class FreeformAccessibilityService : AccessibilityService() {
                         "小窗底部那条小横条，或改用「Shizuku 返回键」、开启「强力关闭」兜底",
                 )
             }
+            finishCloseFlow()
             return
         }
         retryCount++
         DebugLog.info("OUTSIDE_TAP_RETRY", "小窗仍在，重试一次（第 $retryCount 次）")
+        // 补刀也要打在**本次目标**那一扇上：重探之后 lastFreeformBounds 可能已经指向
+        // 全局 best（也就是另一扇），不重新指向就会把刀打偏。
+        lastFreeformBounds = Rect(now)
+        // 同 [startCloseFlow]：不撤遮罩——落点由 `others` 抠洞保证可达，撤了只会白白多一段
+        // 空窗（这段时间点窗外会穿到下层应用）。
         performCloseMode(store.outsideTapCloseMode, isRetry = true)
-        handler.postDelayed({ recheck() }, RECHECK_DELAY_MS)
+        injectDone = true
+        scheduleRefresh()
+        postCloseFlow(RECHECK_DELAY_MS) { recheck() }
     }
 
     /**
-     * 小窗是不是**已经在收起**：面积比发起关闭时小了一成以上。
+     * 小窗是不是**已经在收起**：面积比上次看到的还小了[CLOSING_AREA_RATIO]以上。
      *
      * 用面积比而不是坐标差，是因为退场动画既会缩也会往边上飘；而「没关掉」时窗口大小是不变的
      * （拖动只是平移）。判定成立就不再补手势，避免打在正在变形的窗口上。
      */
-    private fun isShrinking(current: OutsideTapBlocker.Layout): Boolean {
+    private fun isShrinking(now: Rect): Boolean {
         val start = closeStartBounds ?: return false
         if (start.isEmpty) return false
-        val now = current.freeform
         if (now.isEmpty) return true
         val startArea = start.width().toLong() * start.height()
         val nowArea = now.width().toLong() * now.height()
@@ -1349,7 +2011,9 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     private fun forceStopViaShizuku() {
-        val target = lastFreeformPackage
+        // 用**本次目标**的包名，不是 lastFreeformPackage：后者可能已经被重探刷成另一扇窗，
+        // 照着它 force-stop 会杀错应用。
+        val target = closeTargetPackage ?: lastFreeformPackage
         if (target == null) {
             DebugLog.warn("OUTSIDE_TAP_FORCE_SKIPPED", "不知道小窗属于哪个应用")
             return
@@ -1392,6 +2056,30 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val SETTLE_WATCH_TICKS = 20
         private const val MIN_RATIO_PERCENT = 8L
 
+        /**
+         * ColorOS 给自由窗画的**伴生装饰窗**的包名。
+         *
+         * 小窗右上角的 `•••` 与底部那条小横条不属于应用，而是 system_server 画在这个
+         * `TYPE_WINDOW pkg=android` 的窗上——它跟真实小窗的 bounds 一致。
+         *
+         * 系统只给**当前那一扇**小窗上报内容窗（`TYPE_APPLICATION`），屏上其余小窗在无障碍
+         * 的窗口列表里**只剩**这个装饰窗。所以它必须算作小窗候选（见 [observeLayout]）。
+         */
+        private const val DECOR_PACKAGE = "android"
+
+        /**
+         * 内容窗与它的伴生装饰窗的边界容差（px）。
+         *
+         * 真机实测两者底边只差 1px（内容窗 `[227,426][1212,2176]`、装饰窗 `[227,426][1212,2177]`），
+         * 用精确相等去重去不掉，会把「屏上有几扇」翻倍。取 12px：足够吃掉这点抖动，
+         * 又远小于两扇小窗之间的正常间距（手机竖屏层叠摆放实测差 84px）。
+         */
+        private const val DECOR_MERGE_SLACK_PX = 12
+
+        /** 收候选的两遍扫描：先内容窗（0），再伴生装饰窗（1）。 */
+        private const val DECOR_PASS_CONTENT = 0
+        private const val DECOR_PASS_DECOR = 1
+
         /** 「全屏应用已经落定」要连续命中几次（见 [fullscreenSettled]）。 */
         private const val FULLSCREEN_STABLE_TICKS = 2
 
@@ -1425,6 +2113,45 @@ class FreeformAccessibilityService : AccessibilityService() {
 
         /** 校验「学到的小横条坐标」是否属于当前小窗时给的容错余量（px）。 */
         private const val CLOSE_CAPTION_SLACK_PX = 48
+
+        /**
+         * 判定「这是不是同一扇窗」时容许的每边偏差（px）。
+         *
+         * 用「每边差」而不是「重叠比例」：两扇小窗尺寸相同、只差一个位置时重叠仍有 87%，
+         * 按重叠算就会把**另一扇**当成「本次目标还在」，于是复检判「没关掉」再补一刀——
+         * 用户看到的是「一关关俩」。每边都贴近才算同一扇，才能把「另一扇」排除掉。
+         */
+        private const val CLOSE_SAME_SLACK_PX = 48
+
+        /** 关闭流程收尾后补的那一拍重排的延时（见 [finishCloseFlow]）。 */
+        private const val MASK_RESTORE_EXTRA_MS = 250L
+
+        /**
+         * 「这一拍认不出小窗」的宽限时长。
+         *
+         * 关掉一扇、拖动小窗这类操作会让窗口列表有一两拍处在系统重排的中间态。
+         * 这个时长内认不出就当中间态处理、保持现有遮罩；超过才真正撤下。
+         */
+        private const val MASK_HOLD_GRACE_MS = 400L
+
+        /** 重放排队的点击时，等窗口列表稳定的重试间隔与次数。 */
+        private const val REPLAY_RETRY_MS = 120L
+        private const val REPLAY_MAX_TRIES = 4
+
+        /** 把目标窗点成焦点窗后，等焦点真的过去的轮询参数。 */
+        private const val CLOSE_FOCUS_WAIT_MS = 150L
+        private const val CLOSE_FOCUS_POLL_MS = 30L
+
+        /**
+         * 「点亮」目标窗时，落点到窗口边缘的距离。
+         *
+         * 20dp 是踩出来的：小一点会压到窗口的圆角上（系统可能不认这一个点），
+         * 大一点就跨进内容区、可能误触应用里的按钮。
+         */
+        private const val ACTIVATION_INSET_DP = 20
+
+        /** 无障碍回退路径下，「点一下」的按压时长。 */
+        private const val CLOSE_FOCUS_TAP_MS = 60L
 
         /** 撤掉捕获层/遮罩后到注入之间的等待（约一帧），让 WindowManager 真正移除窗口。 */
         private const val INJECT_HANDOFF_MS = 40L
