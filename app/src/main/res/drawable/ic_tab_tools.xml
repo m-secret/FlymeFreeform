@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  底栏「功能」。四宫格（Material Symbols 的 grid_view），24dp 网格。
+
+  选四宫格而不是齿轮 / 扳手：这一格装的是「更多面板 / 主动呼出 / 窗外点击关闭 / 应用管理」
+  四个入口，是**一组入口的集合**，四宫格在这个语境下比任何具象图形都直白；
+  齿轮留给「设置」那一格，两者也不会撞形。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M3,3h8v8H3V3zM13,3h8v8h-8V3zM3,13h8v8H3v-8zM13,13h8v8h-8v-8z" />
+</vector>

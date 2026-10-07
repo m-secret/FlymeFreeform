@@ -455,7 +455,10 @@ class CornerSettingsActivity : Activity() {
                 this,
                 Ui.smallAction(this, "去系统设置里打开通知", emphasized = false) {
                     runCatching {
-                        startActivity(
+                        // 走 AppContext：ColorOS 会在跳页时回调本页的 onUserLeaveHint，
+                        // 不标记的话「后台隐藏」开着就把这一页连 task 一起清掉（一闪就没了）。
+                        AppContext.startActivity(
+                            this,
                             Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
                                 .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
                         )
@@ -592,7 +595,7 @@ class CornerSettingsActivity : Activity() {
 
     private fun updateIconPackLabel() {
         val current = store.iconPackPackage
-        (iconPackButton.tag as? TextView)?.text =
+        (iconPackButton.tag as? Ui.RowTexts)?.title?.text =
             if (current.isBlank()) {
                 "图标包：不使用（默认图标）"
             } else {

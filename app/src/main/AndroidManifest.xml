@@ -16,6 +16,9 @@
         tools:ignore="QueryAllPackagesPermission" />
     <!-- 开机自启：系统重启后自动恢复 Shizuku 监听与主动呼出服务。 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 「关于」页的「检查更新」要访问 GitHub 的 releases 接口。这是全应用唯一一处联网，
+         且只在用户主动点「检查更新」时发生，不涉及任何数据上传。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <queries>
         <intent>

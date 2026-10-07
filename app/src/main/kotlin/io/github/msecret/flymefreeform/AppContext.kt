@@ -2,6 +2,8 @@ package io.github.msecret.flymefreeform
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.os.SystemClock
 
 /**
  * 极简的 Application Context 持有者。
@@ -61,10 +63,49 @@ object AppContext {
      * 代价说清楚：按 Home 后整个 Activity 栈会被结束，下次打开是冷启动（回到首页）。但这只影响
      * 界面——[OverlayGestureService] 是独立的前台服务、无障碍服务更是系统级的，**功能一律不受
      * 影响**。开关关掉时不走这个分支，行为与从前完全一致。
+     *
+     * ## 坑：`onUserLeaveHint()` 在跳自家子页面时**也会**回调（真机实测）
+     *
+     * AOSP 文档说它只在「用户主动离开」时回调，程序自己 `startActivity` 不算。**ColorOS 17 不
+     * 这样**：从主设置页点「运行日志 / 更多面板 / 主动呼出 / 窗外点击关闭 / 管理扇形应用」，
+     * 被压在下面的 MainActivity 照样收到 `onUserLeaveHint()`，于是 `finishAndRemoveTask()`
+     * 把**刚打开的那一页连同整个 task** 一起清掉——用户看到的就是「点一下就闪退」。
+     * （真机日志：`MainActivity t2508 f` → `onTaskVanished taskInfo:2508`，焦点直接回桌面。）
+     *
+     * 所以跳自家页面必须走 [startActivity]，它会先记一个时间戳；[hideFromRecentsOnLeave]
+     * 在窗口期内直接放行。用时间窗而不是一次性布尔量是为了自愈：万一某个机型**不**回调
+     * （AOSP 行为），标志也不会一直挂着、把之后真正的「按 Home」漏掉。
      */
     fun hideFromRecentsOnLeave(activity: Activity) {
         // 已经在结束路上的（比如自己 finish）就不要再插一脚。
         if (activity.isFinishing || activity.isDestroyed) return
+        // 这一下是我们自己刚跳的页，不是用户要离开。
+        if (SystemClock.uptimeMillis() - internalNavAt < INTERNAL_NAV_WINDOW_MS) return
         if (SettingsStore(activity).hideFromRecents) activity.finishAndRemoveTask()
     }
+
+    /**
+     * 打开一个页面（自家的、或系统设置那种要回来的），并把它标记为「不是用户主动离开」。
+     *
+     * **界面上任何 `startActivity` 都该走这里**——每漏一处，那个入口在「后台隐藏」打开时就
+     * 会闪退一次（见 [hideFromRecentsOnLeave]）。
+     */
+    fun startActivity(activity: Activity, intent: Intent) {
+        noteInternalNavigation()
+        activity.startActivity(intent)
+    }
+
+    /**
+     * 只记时间戳、不负责启动。给那些自己 `startActivity` 的地方用（比如
+     * [UpdateChecker.openUrl] 里拉浏览器）。
+     */
+    internal fun noteInternalNavigation() {
+        internalNavAt = SystemClock.uptimeMillis()
+    }
+
+    /** 上一次「我们自己跳页」的时刻（[SystemClock.uptimeMillis]）。 */
+    private var internalNavAt = 0L
+
+    /** [internalNavAt] 的有效窗口。够覆盖「点击 → 系统把新页拉起来」这一段就够，别给大。 */
+    private const val INTERNAL_NAV_WINDOW_MS = 1_500L
 }

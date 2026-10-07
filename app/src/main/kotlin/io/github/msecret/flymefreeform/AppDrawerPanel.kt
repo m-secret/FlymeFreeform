@@ -792,24 +792,60 @@ class AppDrawerPanel(
         // 首帧之后再吸附到当前页：这时容器才量出宽度，滚动位置才算得对。
         pager.post { pager.snapTo(activeTab, animate = false) }
 
-        // 打开动画：整块（含遮罩）淡入 + 卡片从 92% 回弹到原大小，避免「直接蹦出来」。
-        // pivot 用 View 默认的自身中心，卡片是 FrameLayout 居中摆放，回弹正好从小窗中心扩开。
+        // 打开动画：整块（含遮罩）淡入 + 卡片轻微放大到位。
+        //
+        // **必须等首帧布局落定再起**：构造函数这一趟是在主线程把整棵卡片建出来（冷启动第一次
+        // 还要算上类加载），紧接着就 `animate()` 会和首帧的 measure/layout 抢帧——用户看到的
+        // 就是「第一次呼出会卡、动画还很突兀」。挂一次性 onGlobalLayout 之后，动画是从一份
+        // 已经量好的布局开始的，第一帧就是顺的。
+        //
+        // pivot 用 View 默认的自身中心：卡片在 FrameLayout 里居中摆放，放大正好从中心扩开。
         alpha = 0f
         card.scaleX = PANEL_ENTER_SCALE_FROM
         card.scaleY = PANEL_ENTER_SCALE_FROM
-        post {
-            animate()
-                .alpha(1f)
-                .setDuration(PANEL_ENTER_DURATION_MS)
-                .setInterpolator(DecelerateInterpolator(1.5f))
-                .start()
-            card.animate()
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(PANEL_ENTER_DURATION_MS)
-                .setInterpolator(OvershootInterpolator(1.2f))
-                .start()
-        }
+        viewTreeObserver.addOnGlobalLayoutListener(
+            object : ViewTreeObserver.OnGlobalLayoutListener {
+                override fun onGlobalLayout() {
+                    // **每次现取 observer，不能捕获构造期那一个**：这一趟 View 还没 attach，
+                    // `viewTreeObserver` 给的是游离的 `mFloatingTreeObserver`；attach 时
+                    // `View.dispatchAttachedToWindow()` 会把它 `merge()` 进窗口那个 observer
+                    // ——而 `ViewTreeObserver.merge()` 的最后一步就是 `observer.kill()`。
+                    // 监听被搬过去了、回调是在**窗口那个** observer 上触发的，此时拿手里那个
+                    // 已经死掉的引用去 `removeOnGlobalLayoutListener` 就抛
+                    //   `IllegalStateException: This ViewTreeObserver is not alive`
+                    // 整个进程跟着崩（真机日志自证：`AppDrawerPanel$N.onGlobalLayout` →
+                    // `ViewTreeObserver.checkIsAlive`；用户报的「更多打不开了，软件直接闪退」）。
+                    //
+                    // 现取的那个是活的窗口 observer，摘得掉；万一这时候已经 detach，
+                    // 现取会退化成另一个游离 observer（同样是活的），`isAlive` 一判就不会抛。
+                    val current = viewTreeObserver
+                    if (current.isAlive) current.removeOnGlobalLayoutListener(this)
+                    startEnterAnimation()
+                }
+            },
+        )
+    }
+
+    /**
+     * 入场动画本体（由上面那次首帧布局回调触发）。
+     *
+     * 卡片**不回弹**：早先用 `OvershootInterpolator` 让 0.92 冲过头再收回来，在这个尺寸的
+     * 卡片上看就是「弹了一下」——用户反馈的「动画感觉也很突兀」正是它。
+     * 现在只做「轻微放大 + 整块淡入」，幅度收到 [PANEL_ENTER_SCALE_FROM]，够交代「从哪儿
+     * 出来」就行。
+     */
+    private fun startEnterAnimation() {
+        animate()
+            .alpha(1f)
+            .setDuration(PANEL_ENTER_DURATION_MS)
+            .setInterpolator(DecelerateInterpolator(1.5f))
+            .start()
+        card.animate()
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(PANEL_ENTER_DURATION_MS)
+            .setInterpolator(DecelerateInterpolator(1.5f))
+            .start()
     }
 
     /**
@@ -2040,6 +2076,10 @@ class AppDrawerPanel(
                 // 0.023 / 0.080 ≈ 0.2875，两者观感才对得上。
                 labelTextScale = 0.2875f,
                 onLongPress = { entry -> if (!manageMode) showPinAction(entry) },
+                // 工具页**不长按拖动排序**：这里长按的意图是「管理这一项」（弹动作卡），而拖动
+                // 那套视觉（放大 1.12 + 灰底 + 浮起）一出现就像点坏了——用户报的「更多里工具
+                // 长按时会向上缩」就是它。工具顺序在「更多面板 → 工具顺序」里调。
+                longPressDrag = false,
                 columns = columns,
                 nestedScroll = true,
                 // 纵向节奏和应用页的网格对齐：那边每一行自带 8dp 上下内边距，两行之间是 16dp；

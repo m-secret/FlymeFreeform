@@ -2,19 +2,25 @@ package io.github.msecret.flymefreeform
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import kotlin.math.abs
 import kotlin.math.min
 
 /**
@@ -134,7 +140,7 @@ object Ui {
     const val COLOR_ON_ERROR_CONTAINER = 0xFF410002.toInt()
 
     /** state layer 覆盖色：onSurface 的 12%。 */
-    private const val STATE_LAYER = 0x1F1A1A1A
+    internal const val STATE_LAYER = 0x1F1A1A1A
 
     // 兼容旧调用点：语义等价于新角色，保留别名免得一次改散。
     const val COLOR_PAGE_BG = COLOR_SURFACE
@@ -167,16 +173,17 @@ object Ui {
     /**
      * 行与行的纵向内边距。
      *
-     * 组内不画分隔线之后，行高就是**唯一的**行间区分手段，所以比早先给得宽一点：
-     * 单行大约撑到 52dp 上下，手指点起来也不容易串行。
+     * 组内不画分隔线之后，行高就是**唯一的**行间区分手段。13 → 16 → **18**：主界面切成三格
+     * 之后每格内容都不满一屏，行与行再挤在一起整页就「空且密」——把行本身撑高一点，
+     * 卡片才有分量（用户反馈「现在空间比较足，可以适当拉大间距」「每页感觉很空」）。
      */
-    const val ROW_PADDING_V = 16
+    const val ROW_PADDING_V = 18
 
     /** 组与组之间、卡片与卡片之间的间距。**必须是实缝**（见类注释）。 */
-    const val SPACE_CARD = 12
+    const val SPACE_CARD = 16
 
     /** 区块标题的上方留白。 */
-    const val SPACE_SECTION_TOP = 24
+    const val SPACE_SECTION_TOP = 30
 
     /**
      * 不可用项的透明度（M3 的 disabled 标准值）。
@@ -212,7 +219,7 @@ object Ui {
         designSp / BASE_SHORT_EDGE_DP * shortEdge(context)
 
     /** M3 的标题一律用 Medium 字重（不是 Bold）。 */
-    private val mediumTypeface: Typeface by lazy {
+    internal val mediumTypeface: Typeface by lazy {
         Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
 
@@ -349,13 +356,18 @@ object Ui {
         return builder
     }
 
-    /** 组与组之间的纵向实缝。 */
-    fun spacer(context: Context): View =
+    /**
+     * 组与组之间的纵向实缝。默认 [SPACE_CARD]。
+     *
+     * [sizeDp] 是给「这一屏内容少、想让它透气一点」的地方用的：同一个缝在同一次改动里
+     * 不该有两个语义（那会变成随手写魔数），所以留出这个入口，而不是各处直接 `View(context)`。
+     */
+    fun spacer(context: Context, sizeDp: Int = SPACE_CARD): View =
         View(context).apply {
             layoutParams =
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(context, SPACE_CARD),
+                    dp(context, sizeDp),
                 )
         }
 
@@ -555,10 +567,11 @@ object Ui {
     }
 
     /**
-     * 入口行：文字 + 右侧箭头。
+     * 入口行：标题（+ 可选副标题）+ 右侧箭头。
      *
-     * 标题 TextView 挂在返回 View 的 `tag` 上——需要动态改文案的入口
-     * （例如「管理扇形应用（已固定 3 / 6）」）取出来直接用。
+     * 标题与副标题两个 TextView 一起挂在返回 View 的 `tag` 上（[RowTexts]）——需要动态改文案的
+     * 入口取出来直接用。**会变的数字放副标题，别塞进标题**：标题长短随计数跳（「管理扇形应用
+     * （已固定 3 / 6）」），整卡的文字左边缘就参差不齐了。
      */
     fun entryRow(
         context: Context,
@@ -568,11 +581,12 @@ object Ui {
     ): LinearLayout {
         val container = row(context)
         val titleView = rowTitle(context, text)
+        val detailView = if (!detail.isNullOrBlank()) rowDetail(context, detail) else null
         val texts =
             LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(titleView)
-                if (!detail.isNullOrBlank()) addView(rowDetail(context, detail))
+                if (detailView != null) addView(detailView)
             }
         container.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(
@@ -583,11 +597,22 @@ object Ui {
                 setPadding(dp(context, 8), 0, 0, 0)
             },
         )
-        container.tag = titleView
+        container.tag = RowTexts(titleView, detailView)
         container.isClickable = true
         container.setOnClickListener { onClick() }
         return container
     }
+
+    /**
+     * [entryRow] 挂在自己 `tag` 上的两个文本。
+     *
+     * 为什么要一起交出去：有些入口的文案是**动态的**——「管理扇形应用 / 已固定 3 / 6」、
+     * 「图标包 / 从 xx 读取」。调用方得在刷新时改它，而这些 View 没有 id 可 `findViewById`，
+     * 只能顺着 tag 拿。
+     *
+     * [detail] 在创建时没给 `detail` 的那一行上是 `null`（那一行压根没有副标题）。
+     */
+    class RowTexts(val title: TextView, val detail: TextView?)
 
     // ---- Buttons（M3 的几种按钮变体） ----
 
@@ -868,5 +893,486 @@ class CardGroup(context: Context) : LinearLayout(context) {
             )
             addView(row, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         }
+    }
+}
+/**
+ * 底栏的一格：一个图标 + 一行文字。
+ *
+ * 之所以要有类型而不是两个平行列表（`titles` / `icons`），是因为它们**一一对应**——分成两个
+ * 列表就会多出「谁跟谁配」这个只能靠下标维持的约定，早晚会错位一格。
+ *
+ * [iconRes] 给的是矢量图（`res/drawable/ic_tab_*.xml`），画成纯黑单色；选中 / 未选的颜色
+ * 由 [TabStrip] 用 `setColorFilter` 上，和文字色同步。
+ */
+class TabItem(val title: String, val iconRes: Int)
+
+/**
+ * 底部导航栏 —— M3 **navigation bar** 的手写版。
+ *
+ * ## 为什么自己写
+ *
+ * 本模块刻意不引 AndroidX / ViewPager（见 [Ui] 的类注释），分页只能自己来。好在需求很窄：
+ * tab 数固定且个位数、内容区由调用方自己换，所以这里只做「一排可点的格子 + 选中态」，
+ * 不含滚动与预加载逻辑——**左右滑动切页在 [TabbedPage] 里用手势做**。
+ *
+ * ## 观感照 M3 navigation bar
+ *
+ * | 部位 | 规则 |
+ * | --- | --- |
+ * | 位置 | **贴屏幕底部**；上方一条 **1dp** outline 分隔线把它和内容分开 |
+ * | 布局 | 横向**等宽平分**（不用自适应宽，否则切换时标签会左右跳）；每格整格可点 |
+ * | 格内 | **图标在上、文字在下**（[ICON_DP] / 文字 12sp），整格垂直居中 |
+ * | 选中 | `primaryContainer` 药丸底**只裹住图标** + `onPrimaryContainer` 图文 + medium 字重 |
+ * | 未选 | 无底，`onSurfaceVariant` 图文 |
+ * | 按压 | 水波纹同样是那颗药丸的范围，不铺满整格 |
+ *
+ * 药丸用 [Ui.COLOR_PRIMARY_CONTAINER] 是为了和全应用其它「选中 / 强调」的地方同一个口径
+ * （见 [Ui.pill]、[Ui.smallAction]），不另开一套配色。
+ *
+ * ## 药丸为什么只包图标，不包整格
+ *
+ * 这是 M3 navigation bar 的原始画法（indicator 包住 icon，label 在它下面），也是「按下去
+ * 亮出的那块」和「选中时亮着的那块」能对齐的前提。早先的实现反过来——背景铺满整格、文字
+ * 在里面居中——于是按一下会亮出**屏宽 1/N 的灰方块**，和选中态那颗小药丸形状对不上，看着
+ * 就像点出了个 bug（用户反馈「点击功能 tab 有一个灰色背景」）。
+ *
+ * 现在内容层与遮罩层就是同一个圆角矩形（见 [tabBackground]），且宿主 [FrameLayout] 的尺寸
+ * 就是药丸尺寸，两者天然重合。触摸区不受影响——`isClickable` 仍在整格 [LinearLayout] 上。
+ *
+ * ## 用法
+ *
+ * ```kotlin
+ * val strip = TabStrip(context, listOf(TabItem("首页", R.drawable.ic_tab_home), …)) { i -> show(i) }
+ * strip.select(index)   // 内容切完之后把高亮挪过去
+ * ```
+ *
+ * **本控件不持有内容**：它只发通知、只画自己。内容区由调用方负责（见 [TabbedPage]），
+ * 这样「几格内容一次建好、切换只切可见性」的写法才成立（见 MainActivity）。
+ */
+class TabStrip(
+    context: Context,
+    tabs: List<TabItem>,
+    private val onSelect: (Int) -> Unit,
+) : LinearLayout(context) {
+
+    /** 每个 tab 的标签。下标即 tab 序号。 */
+    private val labels = mutableListOf<TextView>()
+
+    /** 每个 tab 的图标。颜色跟着 [labels] 一起换。 */
+    private val icons = mutableListOf<ImageView>()
+
+    /**
+     * 每格裹住图标的那块底（M3 的 indicator）。
+     *
+     * **背景（选中底 + 水波纹）挂在这一层**：它的大小就是药丸的大小，画出来的形状自然和选中态
+     * 一模一样（见类注释）。
+     */
+    private val pills = mutableListOf<FrameLayout>()
+
+    /**
+     * 横向装着各格的那一行。
+     *
+     * 提成字段是给 [setGap] 用的：上下留白加在**它的外边距**上，而不是 TabStrip 自己的
+     * 上内边距——padding 会落在第一个子 View（分隔线）**上面**，那样图标+文字就贴着分隔线、
+     * 底下空一大条（用户报的「图标+文字整体没上下居中」）。
+     */
+    private val row =
+        LinearLayout(context).apply {
+            orientation = HORIZONTAL
+        }
+
+    /** 当前高亮项；`-1` = 还没选过。 */
+    private var selected = -1
+
+    init {
+        orientation = VERTICAL
+
+        // 分隔线在上：底栏贴着屏底，靠这条线把「导航」和「内容」分开。
+        addView(
+            View(context).apply { setBackgroundColor(Ui.COLOR_OUTLINE) },
+            LayoutParams(LayoutParams.MATCH_PARENT, Ui.dp(context, 1)),
+        )
+
+        tabs.forEachIndexed { index, item ->
+            val icon =
+                ImageView(context).apply {
+                    setImageResource(item.iconRes)
+                    // 矢量图等比铺满这一小块正方形；不留白则齿轮这种「几乎占满 24dp」的图形会糊边。
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                }
+            val label =
+                TextView(context).apply {
+                    text = item.title
+                    gravity = Gravity.CENTER
+                    setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(context, 12f))
+                    maxLines = 1
+                }
+            // 药丸只裹图标：它就是 M3 navigation bar 的 indicator，尺寸固定在
+            // [PILL_WIDTH_DP] × [PILL_HEIGHT_DP]，所以背景直接铺满这一层即可、不用再算居中的图层。
+            val pill =
+                FrameLayout(context).apply {
+                    addView(
+                        icon,
+                        FrameLayout.LayoutParams(
+                            Ui.dp(context, ICON_DP),
+                            Ui.dp(context, ICON_DP),
+                            Gravity.CENTER,
+                        ),
+                    )
+                }
+            val cell =
+                LinearLayout(context).apply {
+                    orientation = VERTICAL
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    // 上下内边距把格子撑到 ~60dp：图标多了之后底栏本来就该高一点，
+                    // 手指点起来也不费劲。
+                    setPadding(Ui.dp(context, 4), Ui.dp(context, 7), Ui.dp(context, 4), Ui.dp(context, 7))
+                    addView(
+                        pill,
+                        LayoutParams(Ui.dp(context, PILL_WIDTH_DP), Ui.dp(context, PILL_HEIGHT_DP)),
+                    )
+                    addView(
+                        label,
+                        LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
+                            topMargin = Ui.dp(context, LABEL_GAP_DP)
+                        },
+                    )
+                    // 触摸区是**整格**；水波纹的可视范围就是那颗药丸（见类注释）。
+                    isClickable = true
+                    setOnClickListener {
+                        select(index)
+                        onSelect(index)
+                    }
+                }
+            // 等宽：weight = 1、宽 = 0。
+            row.addView(cell, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+            labels += label
+            icons += icon
+            pills += pill
+        }
+        addView(row)
+        applyBottomGap()
+        select(0)
+    }
+
+    /**
+     * 底栏跟屏幕底边之间留出距离。
+     *
+     * 两部分相加：
+     *
+     * - **固定呼吸量**（[BOTTOM_GAP_DP]，经 [Ui.dp] 按屏幕短边等比缩放）——大屏小屏观感一致，
+     *   这也是「别贴着屏底」的主要来源；
+     * - **系统底栏的实际高度**——必须问系统。手势条 / 两键 / 三键三种导航方式的数值完全不同，
+     *   各家 ROM 还会加自己的余量，写死任何一个数都会在别的机型上被压住
+     *   （本工程 `targetSdk 37`，Android 15+ 强制 edge-to-edge，窗口本来就画到系统栏底下）。
+     *
+     * 如果外层已经把这段 inset 消费掉了（拿到 0），那就只剩固定呼吸量，不会重复留白。
+     */
+    private fun applyBottomGap() {
+        // **必须问窗口、而不是问自己收到的 inset**：`decorFitsSystemWindows` 打开时
+        // DecorView 会把 systemBars 的 inset 变成 padding 消费掉（本机实测：状态栏那一段
+        // 被换成了 content 的上内边距，于是这一层收到的是 `CONSUMED`，监听器压根不会被调用）。
+        // [rootWindowInsets] 取的是窗口**分发前**的那一份，才拿得到真值。
+        val fromWindow = windowBottomInset()
+        setGap(fromWindow)
+
+        setOnApplyWindowInsetsListener { view, insets ->
+            val fromInsets =
+                maxOf(
+                    insets.getInsets(WindowInsets.Type.systemBars()).bottom,
+                    insets.getInsets(WindowInsets.Type.tappableElement()).bottom,
+                    insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
+                )
+            setGap(maxOf(fromWindow, fromInsets))
+            insets
+        }
+        requestApplyInsets()
+    }
+
+    /**
+     * 窗口底部的系统栏高度（px）。
+     *
+     * 三个来源取最大：报得出底栏的那一个跟 ROM / 导航方式走——手势模式下 `systemBars` 可能给 0，
+     * 而 `tappableElement` / `mandatorySystemGestures` 有值，只信一个会漏。
+     */
+    private fun windowBottomInset(): Int {
+        val insets = rootWindowInsets ?: return 0
+        return maxOf(
+            insets.getInsets(WindowInsets.Type.systemBars()).bottom,
+            insets.getInsets(WindowInsets.Type.tappableElement()).bottom,
+            insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
+        )
+    }
+
+    /**
+     * 按系统底栏高度决定留白，并把图标+文字这一整块在底栏里**上下居中**。
+     *
+     * 要居中的是「上方那条分隔线 → 屏幕底（或系统底栏上沿）」这一段，所以留白必须加在
+     * **分隔线与行之间**、以及**行与屏底之间**：做成 TabStrip 自身的上内边距是不行的——
+     * padding 落在第一个子 View（分隔线）上面，分隔线被推下来、行却紧贴着它，底下空出
+     * 长长一条（用户反馈「图标+文字整体没上下居中」）。这里改给 [row] 加**上下外边距**。
+     *
+     * [systemBottom] 是系统底栏占掉的高度，它**整个**落在下方——那一段本来就画不到，
+     * 不能拿来当「留白的一半」，所以是「下外边距 slack/2 + 底部 padding systemBottom」，
+     * 屏幕上看得见的下方空隙正好也是 slack/2。
+     */
+    private fun setGap(systemBottom: Int) {
+        val slack = Ui.dp(context, if (systemBottom > 0) SLACK_DP else SLACK_FALLBACK_DP)
+        // 刻意绕开 DebugLog 的开关直接写 logcat：**窗口 inset 是排版前提**，以后凡是
+        // 「底栏位置不对 / 被手势条压住」，第一件事都是看这一行。它只在 attach 与 inset
+        // 变化时打，不会刷屏（旋转、切导航方式、弹键盘才各来一次）。
+        android.util.Log.i(TAG, "TAB_INSET system=$systemBottom slackPx=$slack")
+        (row.layoutParams as? LayoutParams)?.let {
+            it.topMargin = slack / 2
+            it.bottomMargin = slack / 2
+            row.requestLayout()
+        }
+        setPadding(0, 0, 0, systemBottom)
+    }
+
+    /**
+     * 首次挂上窗口后再量一次。
+     *
+     * `attach` 当下 [rootWindowInsets] 可能还没分发到位（返回 null），`post` 一发就稳了——
+     * 那时 `init` 里那次用兜底值画的 padding 会被这里替换成按真实 inset 算的结果。
+     */
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        post { applyBottomGap() }
+    }
+
+    /** 把高亮挪到第 [index] 个 tab。重复调用同一个下标是空操作。 */
+    fun select(index: Int) {
+        if (index == selected || index !in labels.indices) return
+        selected = index
+        labels.forEachIndexed { i, label ->
+            val active = i == index
+            val color = if (active) Ui.COLOR_ON_PRIMARY_CONTAINER else Ui.COLOR_ON_SURFACE_VARIANT
+            label.setTextColor(color)
+            label.typeface = if (active) Ui.mediumTypeface else Typeface.DEFAULT
+            // 图标用 ColorFilter 上色，和文字同步——矢量图本身是纯黑的单色画法。
+            icons[i].setColorFilter(color)
+            // 每次重建而不是改现成的 drawable：drawable 可能被系统共享 / 缓存，直接 mutate
+            // 改色在个别 ROM 上会串到别的 View 上。
+            pills[i].background = tabBackground(active)
+        }
+    }
+
+    /** 一格的背景：内容层 = 选中药丸（未选全透明），遮罩层 = 同一形状的不透明药丸。 */
+    private fun tabBackground(active: Boolean): Drawable =
+        RippleDrawable(
+            ColorStateList.valueOf(Ui.STATE_LAYER),
+            pillShape(if (active) Ui.COLOR_PRIMARY_CONTAINER else Color.TRANSPARENT),
+            pillShape(Color.BLACK),
+        )
+
+    /**
+     * 药丸形状。
+     *
+     * 内容层与遮罩层共用它，两处**必须完全同一形状**——差一点就会出现「灰块比绿药丸大一圈」
+     * 的观感。圆角取高度的一半，两端正好是半圆。
+     */
+    private fun pillShape(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            cornerRadius = Ui.dp(context, PILL_HEIGHT_DP / 2).toFloat()
+            setColor(color)
+        }
+
+    private companion object {
+        /**
+         * 内容上下**合计**的呼吸量（一半在上、一半在下）。**系统报得出底栏高度时**用这一档。
+         */
+        const val SLACK_DP = 28
+
+        /**
+         * 系统**报不出**底栏高度时的兜底呼吸量。
+         *
+         * `targetSdk 37` 下窗口本来就画到系统栏底下，正常该由 inset 把这一段让出来；但 inset
+         * 也可能在传递途中被别处消费掉、到这一层已经是 0（本机实测三个来源全是 0）。那时如果
+         * 只留 [SLACK_DP] 这么一点，底栏就贴住了屏幕底、被手势条压着。
+         */
+        const val SLACK_FALLBACK_DP = 36
+
+        /** 图标边长；药丸比它大一圈，正好是 M3 indicator 的观感。 */
+        const val ICON_DP = 24
+
+        /** 选中药丸（也就是 M3 的 indicator）的尺寸。宽度沿用 M3 navigation bar 的 64dp。 */
+        const val PILL_WIDTH_DP = 64
+        const val PILL_HEIGHT_DP = 32
+
+        /** 图标与文字之间那一线空隙。 */
+        const val LABEL_GAP_DP = 3
+
+        /** logcat 标签，与 [DebugLog] 用同一个，便于一条 `-s` 全捞出来。 */
+        const val TAG = "FlymeFreeformNoRoot"
+    }
+}
+
+/**
+ * 「标题 + 可滚动内容 + 底部导航栏」的页面骨架。
+ *
+ * ## 版面
+ *
+ * ```
+ * 标题                        ← 固定，不滚
+ * ┌─────────────────────┐
+ * │ 内容（滚这里）        │
+ * └─────────────────────┘
+ * [ 首页 │ 功能 │ 设置 ]       ← 固定贴底
+ * ```
+ *
+ * 标题与底栏都在 [ScrollView] **之外**：底栏跟着内容滚走的话，滑到半屏就不知道自己在哪一格、
+ * 也切不回去——那正是分 tab 想避免的事。
+ *
+ * ## 内容区怎么用
+ *
+ * [content] 是已经带好左右边距的竖向容器，往里 `addView` 就行。切换 tab 有两条路：
+ *
+ * - **推荐**：几格内容**一次性都建好**塞进 [content]，切换只改各块的 `visibility`
+ *   （MainActivity 就是这么做的）。好处是各块里的 View 引用一直有效，「刷新状态」不用管当前
+ *   停在哪一格；代价是内容常驻内存（这几屏的量可以忽略）。
+ * - 切一次建一次（`removeAllViews()` + `addView`）：省内存，但每次都丢滚动位置、还得把所有
+ *   状态重新灌一遍，并且会重放子 View 的入场动效。
+ *
+ * ## 左右滑动切页
+ *
+ * 内容区上挂了一个**只认横向**的手势（见 [SwipeAwareScrollView]）：横向位移超过 [SWIPE_MIN_DP]
+ * 且至少是纵向的 1.5 倍才切页，否则一律放给滚动。
+ *
+ * 判定用「拖动位移」而不是 fling 速度——**慢慢拖过去也该切页**，只认「甩」会让人觉得时灵时不灵。
+ */
+class TabbedPage(
+    context: Context,
+    title: String,
+    tabs: List<TabItem>,
+    private val onSelect: (Int) -> Unit,
+) : LinearLayout(context) {
+
+    /** 可滚动的内容区。 */
+    val content: LinearLayout
+
+    private val tabStrip: TabStrip
+    private val tabCount = tabs.size
+    private var currentIndex = 0
+
+    init {
+        orientation = VERTICAL
+        setBackgroundColor(Ui.COLOR_SURFACE)
+
+        val head =
+            LinearLayout(context).apply {
+                this.orientation = VERTICAL
+                // 与 [Ui.pageRoot] 同一套上 / 左 / 右边距；底部留白挪给了内容区。
+                setPadding(Ui.dp(context, 16), Ui.dp(context, 6), Ui.dp(context, 16), 0)
+            }
+        if (title.isNotEmpty()) head.addView(Ui.title(context, title))
+        addView(head)
+
+        content =
+            LinearLayout(context).apply {
+                this.orientation = VERTICAL
+                // 底部比左右多留一点：底栏自己上方已有一条分隔线，内容再贴着它就显得挤。
+                setPadding(Ui.dp(context, 16), 0, Ui.dp(context, 16), Ui.dp(context, 20))
+            }
+        val scroll =
+            SwipeAwareScrollView(
+                context = context,
+                thresholdPx = Ui.dp(context, SWIPE_MIN_DP),
+            ) { direction -> request(currentIndex + direction) }
+                .apply {
+                    setBackgroundColor(Ui.COLOR_SURFACE)
+                    // 内容比屏幕矮时也把根容器拉到整屏高，底色才能铺满（同 [Ui.scrollPage]）。
+                    isFillViewport = true
+                    addView(content)
+                }
+        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
+
+        tabStrip = TabStrip(context, tabs) { index -> request(index) }
+        addView(tabStrip)
+    }
+
+    /**
+     * 请求切到第 [index] 格：越界夹紧、同一格直接返回（滑动时手指一抖就会重复请求同一格）。
+     *
+     * 这里先把高亮挪好再通知调用方，调用方只需要管各格内容的可见性。
+     */
+    private fun request(index: Int) {
+        val target = index.coerceIn(0, tabCount - 1)
+        if (target == currentIndex) return
+        currentIndex = target
+        tabStrip.select(target)
+        onSelect(target)
+    }
+
+    private companion object {
+        /** 触发切页所需的最小横向位移（dp）。太小会和「点一下」抢。 */
+        const val SWIPE_MIN_DP = 56
+    }
+}
+
+/**
+ * 认得「左右滑动」的 [ScrollView]。
+ *
+ * ## 为什么不能只挂 `setOnTouchListener`
+ *
+ * 内容里的卡片行都是**可点**的（[Ui.entryRow] / [Ui.switchRow] 会给行挂点击和涟漪）。
+ * `ViewGroup` 的分发顺序是「先给子 View，子 View 不吃才轮到自己的 `OnTouchListener`」——
+ * 于是从一张卡片上起手横滑时，DOWN 被那一行吃掉，挂在 ScrollView 上的监听**根本收不到**；
+ * 更糟的是那行会把手势当成「点了一下」，滑完顺手就打开了那个页面。
+ * （实测踩到过：在「功能」格从「管理扇形应用」那行起手左滑，直接跳进了应用管理页。）
+ *
+ * 所以改在 [dispatchTouchEvent] 里拿**全部**事件（它比子 View 更早），并旦认定是横滑就：
+ *
+ * 1. 给下面那行补一个 **ACTION_CANCEL**，让它撤销按下态、不要触发点击；
+ * 2. 把这条手势剩下的部分**自己吃掉**（返回 `true`），不再往下传。
+ *
+ * 竖直方向的滚动完全不受影响：判定要求横向位移至少是纵向的 [SWIPE_RATIO] 倍，
+ * 达不到就原样交给 [ScrollView] 处理。
+ */
+private class SwipeAwareScrollView(
+    context: Context,
+    private val thresholdPx: Int,
+    private val onSwipe: (direction: Int) -> Unit,
+) : ScrollView(context) {
+
+    private var downX = 0f
+    private var downY = 0f
+
+    /** 这条手势已经被「抢」过来了：剩下的 MOVE / UP 都由本控件吃掉。 */
+    private var hijacked = false
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+                hijacked = false
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (!hijacked) {
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (abs(dx) >= thresholdPx && abs(dx) >= abs(dy) * SWIPE_RATIO) {
+                        hijacked = true
+                        // 先让下面那张卡片放弃这次点击，否则滑完会顺手把它点开。
+                        val cancel = MotionEvent.obtain(event)
+                        cancel.action = MotionEvent.ACTION_CANCEL
+                        super.dispatchTouchEvent(cancel)
+                        cancel.recycle()
+                        onSwipe(if (dx < 0) 1 else -1)
+                    }
+                }
+                if (hijacked) return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> hijacked = false
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private companion object {
+        /** 横向位移至少要达到纵向的这么多倍才认作「左右滑动」，否则就是在上下滚。 */
+        const val SWIPE_RATIO = 1.5f
     }
 }

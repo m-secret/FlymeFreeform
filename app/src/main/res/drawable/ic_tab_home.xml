@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  底栏「首页」。Material Symbols 的 home（filled），24dp 网格。
+
+  底栏的图标一律画成**纯黑单色**：选中 / 未选两种颜色由代码里的 setColorFilter 上，
+  和文字色同步（见 TabStrip.select）。所以这里不要写品牌色，否则选中态会串色。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
+</vector>

@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -12,17 +13,31 @@ import android.util.TypedValue
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.util.concurrent.Executors
 
 /**
  * 运行日志页（Material 3 版面）：机内调试日志实时显示，便于真机定位问题（不依赖 adb）。
  *
- * 之前精简设置页时误删了日志入口，导致排查「更多面板空列表」等问题时看不到日志，
- * 这里恢复成一个独立二级页。
+ * ## 日志怎么拿出去
+ *
+ * 三条路，都在「操作」那张卡里：
+ *
+ * - **复制**：进剪贴板。**有截断风险**（超长文本系统剪贴板会截），只适合贴一小段；
+ * - **导出**：写成 `.txt` 落进系统「下载」目录，不需要任何存储权限，用户自己去找；
+ * - **分享**：同一个文件，直接拉起系统分享面板发出去（微信 / 邮件 / 网盘都行）。
+ *
+ * 后两条是留给「要完整日志」的场景的——之前只有复制，用户反馈过长日志贴过去是半截。
  */
 class LogActivity : Activity() {
 
     private lateinit var logView: TextView
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 导出 / 分享走子线程：写文件 + MediaStore 的几次 IPC，别压在主线程上。 */
+    private val worker = Executors.newSingleThreadExecutor()
+
+    /** 导出进行中：防连点（连点会往「下载」里塞好几个同名文件）。 */
+    private var exporting = false
 
     private val observer: (List<String>) -> Unit = { lines ->
         mainHandler.post { logView.text = lines.takeLast(LOG_VISIBLE_LINES).joinToString("\n") }
@@ -52,6 +67,11 @@ class LogActivity : Activity() {
     override fun onStop() {
         DebugLog.removeObserver(observer)
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        worker.shutdownNow()
+        super.onDestroy()
     }
 
     private fun buildContent(): View {
@@ -86,17 +106,21 @@ class LogActivity : Activity() {
         root.addView(
             CardGroup(this)
                 .row(
-                    actionRow("复制全部日志") {
+                    actionRow("复制全部日志", "复制") {
                         getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
                             ClipData.newPlainText("log", DebugLog.asText()),
                         )
-                        android.widget.Toast
-                            .makeText(this, "已复制到剪贴板", android.widget.Toast.LENGTH_SHORT)
-                            .show()
+                        toast("已复制到剪贴板")
                     },
                 )
                 .row(
-                    actionRow("清空日志", danger = true) {
+                    actionRow("导出到「下载」", "导出") { exportLog(afterExport = null) },
+                )
+                .row(
+                    actionRow("分享日志", "分享") { exportLog { uri -> LogExport.share(this, uri) } },
+                )
+                .row(
+                    actionRow("清空日志", "清空", danger = true) {
                         DebugLog.clear()
                         logView.text = ""
                     },
@@ -128,14 +152,46 @@ class LogActivity : Activity() {
         return Ui.scrollPage(this, root)
     }
 
+    /**
+     * 导出日志到系统「下载」目录。[afterExport] 非空时，导出成功后再拿那个文件做下一件事
+     * （目前只有「分享」用）。
+     *
+     * 导出和分享走的是**同一个文件**：分享需要一个别的应用读得到的 `content://`，而这个
+     * Uri 正是导出的产物（理由见 [LogExport] 的类注释）。所以点「分享」也会在「下载」里
+     * 留一份——那句提示文案会说明，不让用户莫名其妙。
+     */
+    private fun exportLog(afterExport: ((Uri) -> Unit)?) {
+        if (exporting) return
+        exporting = true
+        toast("正在导出…")
+        worker.execute {
+            val exported = LogExport.exportToDownloads(this)
+            mainHandler.post {
+                exporting = false
+                if (isFinishing || isDestroyed) return@post
+                if (exported == null) {
+                    toast("导出失败，请重试")
+                } else if (afterExport == null) {
+                    toast("已保存到「下载」：${exported.name}")
+                } else {
+                    afterExport(exported.uri)
+                }
+            }
+        }
+    }
+
+    private fun toast(text: String) {
+        android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
     /** 一行动作（M3 的 list item + 行尾动词）。 */
-    private fun actionRow(text: String, danger: Boolean = false, onClick: () -> Unit): View =
+    private fun actionRow(text: String, verb: String, danger: Boolean = false, onClick: () -> Unit): View =
         Ui.row(this).apply {
             addView(Ui.rowTitle(this@LogActivity, text))
             addView(View(this@LogActivity), LinearLayout.LayoutParams(0, 0, 1f))
             addView(
                 TextView(this@LogActivity).apply {
-                    this.text = if (danger) "清空" else "复制"
+                    this.text = verb
                     setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(this@LogActivity, 12f))
                     setTextColor(if (danger) Ui.COLOR_ERROR else Ui.COLOR_PRIMARY)
                     typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)

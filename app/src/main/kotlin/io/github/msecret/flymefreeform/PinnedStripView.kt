@@ -95,10 +95,22 @@ class PinnedStripView(
     /**
      * 长按起了拖拽、但**抬手时手指还在原地没挪**：交给调用方处理（工具页用它弹管理菜单）。
      *
-     * 一条手势因此能承载两个意图——**长按拖 = 排序，长按不动再松手 = 打开菜单**。不需要为
-     * 排序另开一个入口，也不会把原来那套「长按弹菜单」的用法弄丢。
+     * 开着 [longPressDrag] 时，一条手势能承载两个意图——**长按拖 = 排序，长按不动再松手 =
+     * 打开菜单**。关掉 [longPressDrag] 后它改成**长按判定一到就回调**（见那个参数的说明）。
      */
     private val onLongPress: ((AppEntry) -> Unit)? = null,
+    /**
+     * 长按是否进入拖动排序。
+     *
+     * 「已选」条与底栏开着——拖动排序就是它们的主要交互。**工具页的网格关掉**：那里长按的
+     * 意图是「管理这一项」（弹动作卡），而图标一放大、垫上灰底、浮起来（[DRAG_SCALE] /
+     * [DRAG_BACKGROUND] / elevation）看着就像点坏了——用户报的「更多里工具长按时会向上缩」
+     * 正是这个。工具顺序另有入口（「更多面板 → 工具顺序」），排序能力不会因此丢掉。
+     *
+     * 关掉之后 [onLongPress] 改成**长按判定一到就回调**（不必再等抬手），且这一抬手不再算
+     * 一次点击，免得菜单刚弹出来就把那一格当成点击启动掉。
+     */
+    private val longPressDrag: Boolean = true,
     /**
      * 嵌在可滚动容器里（工具页的 ScrollView、底栏的横向滚动条）时置 true。
      *
@@ -221,13 +233,23 @@ class PinnedStripView(
     /** 内容代次。每次 [submit] 自增，用来作废那些「已经过期」的延迟回调。 */
     private var contentGeneration = 0
 
+    /** 这次按压已经触发过长按。抬手时据此判断「不该再算一次点击」。 */
+    private var longPressFired = false
+
     private val longPress =
         Runnable {
             val index = pressedIndex
             if (index !in slots.indices) return@Runnable
-            // 只有一个固定项时拖动没有意义，别给用户「好像能拖」的错觉。
-            if (slots.size < 2) return@Runnable
-            beginDrag(index)
+            if (longPressDrag) {
+                // 只有一个固定项时拖动没有意义，别给用户「好像能拖」的错觉。
+                if (slots.size < 2) return@Runnable
+                longPressFired = true
+                beginDrag(index)
+            } else {
+                // 不拖的场合：判定一到就直接回调，不必等抬手——菜单该在按住的那一刻出现。
+                longPressFired = true
+                slots.getOrNull(index)?.let { slot -> onLongPress?.invoke(slot.entry) }
+            }
         }
 
     init {
@@ -521,6 +543,7 @@ class PinnedStripView(
                 val badgeHit = badgeHitIndex(event.x, event.y)
                 pressedOnBadge = badgeHit >= 0
                 pressedIndex = if (pressedOnBadge) badgeHit else indexAt(event.x, event.y)
+                longPressFired = false
                 if (pressedIndex >= 0) {
                     // 落在角标上**不进长按计时**——角标是个按钮，按它就是要「点一下」。
                     //
@@ -572,10 +595,12 @@ class PinnedStripView(
                     if (!moved && onLongPress != null) {
                         slots.getOrNull(index)?.let { onLongPress(it.entry) }
                     }
-                } else {
+                } else if (!longPressFired) {
                     val index = pressedIndex
                     if (!moved && index in slots.indices) onTap(slots[index].entry)
                 }
+                // 长按已经处理过这一次按压（拖过、或已经弹出菜单），抬手不再算点击。
+                longPressFired = false
                 releaseBadgeIntercept()
                 pressedIndex = -1
                 return true
@@ -587,6 +612,7 @@ class PinnedStripView(
                 if (draggedIndex >= 0) finishDrag()
                 releaseBadgeIntercept()
                 pressedIndex = -1
+                longPressFired = false
                 return true
             }
         }
