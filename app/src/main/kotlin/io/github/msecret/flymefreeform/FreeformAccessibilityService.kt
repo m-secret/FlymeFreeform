@@ -98,6 +98,17 @@ class FreeformAccessibilityService : AccessibilityService() {
     /** 发起关闭那一刻的小窗矩形，用来分辨「没关掉」和「正在播收起动画」。 */
     private var closeStartBounds: Rect? = null
 
+    /**
+     * **上一次复检**看到的目标窗矩形。
+     *
+     * 判断「正在收起」必须拿**相邻两次**比，不能拿初始值比：ColorOS 对小窗横条的
+     * **短上滑 / 慢上滑**会判成「缩小回弹」（系统日志 `mGeatureMode=-1` + `reboundAnim`），
+     * 窗口缩到一个较小尺寸后**就停在那儿**，并不会继续消失。拿初始值比的话，它永远满足
+     * 「面积比初始小」，会被一路当成「正在收起」，等满 [MAX_CLOSING_WAIT] 后放弃——
+     * 用户看到的就是「点一下上滑了变小，然后就没动静了」。
+     */
+    private var closeLastCheckBounds: Rect? = null
+
     /** 因判断为「正在收起」而空等的轮数，超过 [MAX_CLOSING_WAIT] 就不再等。 */
     private var closingWaitCount = 0
 
@@ -1263,6 +1274,15 @@ class FreeformAccessibilityService : AccessibilityService() {
             if (targetPkg != null && w.pkg != null && w.pkg != targetPkg) continue
             if (withinSlack(w.bounds, want, CLOSE_SAME_SLACK_PX)) return w.bounds
         }
+        // 边界对不上，但**同包的窗还在屏上** —— 它只是被系统缩放/回弹了，并没有关掉。
+        // 必须把它的**当前**矩形交出去，让 [recheck] 走到「补刀」那条路。若在这里返回 null，
+        // 复检会把「缩小回弹」当成「已关闭」直接收尾：真机复现日志是系统
+        // `mGeatureMode=-1` + `quickSwipeBottomIfNeed ... reboundAnim`（窗口缩到 88% 就停住、
+        // 仍在窗口表里），而 App 打的是 `OUTSIDE_TAP_CLOSED`。用户看到的就是
+        // 「点一下上滑了变小，然后就没动静了」。
+        if (targetPkg != null) {
+            lastFreeformWindows.firstOrNull { it.pkg == targetPkg }?.let { return it.bounds }
+        }
         return null
     }
 
@@ -1295,6 +1315,8 @@ class FreeformAccessibilityService : AccessibilityService() {
         closeTargetBounds = Rect(chosen.bounds)
         closeTargetPackage = chosen.pkg
         closeStartBounds = Rect(chosen.bounds)
+        // 首次复检还没有「上一次」可比，留空让它退回用 closeStartBounds。
+        closeLastCheckBounds = null
         // 关闭动作（[performCloseMode] 一系）读的是 lastFreeformBounds/包名这两个字段，
         // 把它们指向本次目标，注入落点才落在对的那一扇上。
         lastFreeformBounds = Rect(chosen.bounds)
@@ -1384,6 +1406,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         closing = false
         injectDone = false
         closeStartBounds = null
+        closeLastCheckBounds = null
         closeTargetBounds = null
         closeTargetPackage = null
         cancelCloseFlow()
@@ -1470,7 +1493,12 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 「窗口底边落进屏幕底部手势带」这个额外条件，于是 [closeViaCaption] 那条路
         // （真实横条坐标，也就是用户实际在用的 `caption_auto`）**整个绕过了它**，
         // 竖屏时条件也不成立，等于从来没生效过。
-        val target = closeTargetBounds ?: lastFreeformBounds
+        // 优先用 [lastFreeformBounds]——它是**最新一次重探**看到的矩形；[closeTargetBounds] 只是
+        // 发起关闭那一刻的快照。[recheck] 补刀前会把 lastFreeformBounds 刷成目标窗**当前**的
+        // 矩形；若这里仍优先用快照，落点会按缩小前的底边算，起点直接落到窗口外面，
+        // 那一刀打在空处。真机复现：目标被缩到 [397,559][1261,2095] 后，补刀起点还是
+        // (829,2257)，补完依旧 `OUTSIDE_TAP_STILL_OPEN`。
+        val target = lastFreeformBounds ?: closeTargetBounds
         if (target != null && needsFocusBeforeSwipe(target) && !activateTarget(target)) {
             DebugLog.warn(
                 "CLOSE_SWIPE_ACTIVATE_FAILED",
@@ -1666,9 +1694,30 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 窗口内、避开其它小窗矩形、贴着上边缘（标题栏那一带，不是内容区，点下去不会误触
      * 应用按钮）。真机实测（手机竖屏两扇小窗）两扇的横条落点都在 x=636、点完
      * `mCurrentFocus` 仍是另一扇，所以那种摆法必须退。
+     *
+     * ★ 2026-10-07 补：上面那批 A/B 全是在**手机横屏、窗口贴屏底**这一个摆法下做的，
+     * 那条「横条点亮」的经验**不能当普适规则**——同一批实测里，「横条」和「标题区」的差别
+     * 其实是「上滑起点在不在系统底部手势带里」。平板竖屏上窗口底边离屏底 1120px、
+     * 压根不沾手势带，这时按横条反而会被 `FlexiblePointerHandler` 认领成 scale 手势，
+     * 因焦点切换留下一个收不掉的悬挂手势，把随后的上滑劈成两半、后半截漏给下层应用
+     * （5 轮 3 轮穿透）。所以现在**只在窗口贴屏底时才点横条**，其余一律走标题区——
+     * 判据与两侧数据见 [captionNearScreenBottom]，实测对照见那里。
      */
-    private fun activationPoint(bounds: Rect): Pair<Float, Float> {
-        captionPrimePoint(bounds)?.let { return it }
+    private fun activationPlan(bounds: Rect): Pair<Pair<Float, Float>, String> {
+        // ★ 只有「窗口底边贴着屏幕底部」时，才把点亮落点放在横条上。机理与真机数据
+        // 见 [captionNearScreenBottom]；不贴屏底时点横条只有坏处，没有好处。
+        if (captionNearScreenBottom(bounds)) {
+            captionPrimePoint(bounds)?.let { return it to "落在横条上＝这一刀上滑的钥匙" }
+        }
+        return titleActivationPoint(bounds) to
+            "点标题区点亮（不碰横条，免得留下收不掉的悬挂手势）"
+    }
+
+    /**
+     * 「点亮」落点的退让方案：窗口内、避开别的自由窗矩形、贴着上边缘（标题栏那一带，
+     * 不是内容区，点下去不会误触应用按钮）。
+     */
+    private fun titleActivationPoint(bounds: Rect): Pair<Float, Float> {
         val inset = CornerGeometry.dp(this, ACTIVATION_INSET_DP)
         val others =
             lastFreeformWindows
@@ -1690,10 +1739,40 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 「点亮」目标窗时该点的**横条落点**；横条被别的小窗压住时返回 null（由 [activationPoint] 退让）。
+     * 目标窗底边是不是「贴着屏幕底部」——也就是上滑起点有没有可能落进**系统底部手势带**。
      *
-     * 点这里不只是为了转移焦点——**这一下是让后面那一刀上滑能稳赢的唯一办法**（机理与实测数据
-     * 见 [activationPoint]）。所以它必须严格落在横条上，也就是和随后的上滑**同一个点**
+     * 这是 [activationPlan] 里「还要不要先按住横条」的唯一判据，两边都有真机数据：
+     *
+     * **贴屏底时非按横条不可**（手机横屏 2772×1272，窗底边 y=1246、屏底 1272、
+     * SystemUI 手势带 `bottomGestureAreaHeight = 77` 即 y≥1195，横条整条躺在带里）：
+     * 什么都不点 2 关 / 5 回桌面；先点横条 19 关 / 20、零次回桌面。
+     * 不按住横条，那一刀会被 SystemUI 当成「底部上滑」抢走。
+     *
+     * **不贴屏底时按横条只有坏处**（平板竖屏 2400×3392，设置窗 `[1374,559][2337,2272]`，
+     * 底边离屏底还有 1120px，根本够不着手势带）：先点横条 5 轮**3 轮把下层应用滑走**，
+     * 且那一刀上滑被劈成两半——系统只认到
+     * `startGestureUpOrDown currY=-555 yVel=-2120`（完整一刀是 `-960 / -22000`）。
+     * 原因是那一按会被 `FlexiblePointerHandler` 当成一次 scale 手势
+     * （`mStartHandleBottomPoint=Point(1855,2257)` + `dragArea DRAG_AREA_BOTTOM_HANDLE_SCALE`），
+     * 而这一按**必然引起焦点切换**，焦点切换让 InputDispatcher 把 DOWN **再投递一遍**
+     * （日志里连着两次 `startScaleSpringAnimInAnimHandler`，第二次没有配对的 UP）。
+     * 悬挂手势把随后的上滑劈开，后半截漏给下层应用＝用户看到的「关小窗把下面的列表滑走了」。
+     * 同一场景改点标题区、或干脆什么都不点，上滑都是完整的 `-960`，0 轮穿透。
+     *
+     * 容差取 [CAPTION_NEAR_BOTTOM_DP]：贴合屏底那扇距屏底只有 26px（约 9dp），
+     * 而平板那扇差了 1120px，两边都留了很大余量。
+     */
+    private fun captionNearScreenBottom(bounds: Rect): Boolean {
+        val slack = CornerGeometry.dp(this, CAPTION_NEAR_BOTTOM_DP)
+        return bounds.bottom >= screenBounds().bottom - slack
+    }
+
+    /**
+     * 「点亮」目标窗时该点的**横条落点**；横条被别的小窗压住时返回 null（由 [activationPlan] 退让）。
+     *
+     * 只有当窗口底边贴着屏幕底部时才会走到这里（见 [captionNearScreenBottom]）——那种情况下
+     * 这一按是让后面那一刀上滑不被 SystemUI 抢走的唯一办法（机理与实测数据见 [activationPlan]）。
+     * 所以它必须严格落在横条上，也就是和随后的上滑**同一个点**
      * （[captionPoint]，横向按 [SettingsStore.closeAnchorXPercent]、纵向从窗口底边往上
      * [SettingsStore.closeAnchorYDp]）。
      *
@@ -1750,14 +1829,14 @@ class FreeformAccessibilityService : AccessibilityService() {
      * [CLOSE_FOCUS_WAIT_MS] 再走，返回值恒为 true。
      */
     private fun activateTarget(bounds: Rect): Boolean {
-        val point = activationPoint(bounds)
+        // 只算一次落点：早先 [activationPoint] 和这里的 `onCaption` 各调一次 [captionPrimePoint]，
+        // 于是「横条被压住」那条日志在真机上总是出现两遍。
+        val (point, why) = activationPlan(bounds)
         val x = point.first.toInt()
         val y = point.second.toInt()
-        val onCaption = captionPrimePoint(bounds) != null
         DebugLog.info(
             "CLOSE_SWIPE_ACTIVATE",
-            "目标窗不是焦点窗，先点($x,$y)让它拿到焦点" +
-                (if (onCaption) "（落在横条上＝这一刀上滑的钥匙）" else "（横条被压住，退成标题区）"),
+            "目标窗不是焦点窗，先点($x,$y)让它拿到焦点（$why）",
         )
         val tapped =
             if (ShizukuShell.hasPermission) {
@@ -2036,7 +2115,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 窗口明显变小 = 系统已经在播收起动画。这时**绝不再补一次手势**：补的那一刀会打在
         // 一个正在变形的窗口上，用户看到的就是「卡了一下，先变小再关」。
         // 等待轮数用尽还在缩，说明它已经在往「气泡/最小化」那条路上走了，再补手势只会更乱。
-        if (isShrinking(now)) {
+        val shrinking = isShrinking(now)
+        // 记下**本次**看到的尺寸，供下一轮复检比对（见 [closeLastCheckBounds]）。
+        closeLastCheckBounds = Rect(now)
+        if (shrinking) {
             if (closingWaitCount >= MAX_CLOSING_WAIT) {
                 DebugLog.warn("OUTSIDE_TAP_STILL_CLOSING", "窗口一直在收起，停止补刀", null)
                 finishCloseFlow()
@@ -2081,12 +2163,13 @@ class FreeformAccessibilityService : AccessibilityService() {
      * （拖动只是平移）。判定成立就不再补手势，避免打在正在变形的窗口上。
      */
     private fun isShrinking(now: Rect): Boolean {
-        val start = closeStartBounds ?: return false
-        if (start.isEmpty) return false
+        // 拿**上一次复检**比对，不拿初始值：见 [closeLastCheckBounds] 的说明。
+        val prev = closeLastCheckBounds ?: closeStartBounds ?: return false
+        if (prev.isEmpty) return false
         if (now.isEmpty) return true
-        val startArea = start.width().toLong() * start.height()
+        val prevArea = prev.width().toLong() * prev.height()
         val nowArea = now.width().toLong() * now.height()
-        return startArea > 0 && nowArea < startArea * CLOSING_AREA_RATIO
+        return prevArea > 0 && nowArea < prevArea * CLOSING_AREA_RATIO
     }
 
     private fun forceStopViaShizuku() {
@@ -2241,6 +2324,14 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 大一点就跨进内容区、可能误触应用里的按钮。
          */
         private const val ACTIVATION_INSET_DP = 20
+
+        /**
+         * 「窗口底边算贴屏底」的容差——超过这个距离就不认为上滑起点会落进系统底部手势带。
+         *
+         * 手机横屏贴底那扇底边距屏底只有 26px（约 9dp，密度 3），48dp 绰绰有余；
+         * 平板竖屏那扇距屏底 1120px，怎么都够不着。见 [captionNearScreenBottom]。
+         */
+        private const val CAPTION_NEAR_BOTTOM_DP = 48
 
         /** 无障碍回退路径下，「点一下」的按压时长。 */
         private const val CLOSE_FOCUS_TAP_MS = 60L
