@@ -611,6 +611,20 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean(KEY_SHOW_NOTIFICATION, true)
         set(value) = preferences.edit().putBoolean(KEY_SHOW_NOTIFICATION, value).apply()
 
+    /**
+     * 「后台隐藏」：开启后本应用不出现在系统「最近任务」（Recents）里。
+     *
+     * 默认关闭。**生效方式是运行时** `ActivityManager.AppTask.setExcludeFromRecents()`
+     * （见 [MainActivity.applyHideFromRecents]），**不是** manifest 里的
+     * `android:excludeFromRecents`——那个是编译期写死的，一旦加上就永远隐藏，用户没法随手关掉。
+     *
+     * 注意这个标记是打在**当时已存在的 task** 上的：应用被从最近任务划掉后重新打开会新建
+     * 一个 task，所以每次回到界面都要按这个开关重新应用一遍。
+     */
+    var hideFromRecents: Boolean
+        get() = preferences.getBoolean(KEY_HIDE_FROM_RECENTS, false)
+        set(value) = preferences.edit().putBoolean(KEY_HIDE_FROM_RECENTS, value).apply()
+
     /** 调试日志开关。默认关闭，只在排查问题时打开（否则 WINDOW_SCAN 等日志会刷爆）。 */
     var debugLogEnabled: Boolean
         get() = preferences.getBoolean(KEY_DEBUG_LOG, false)
@@ -876,6 +890,7 @@ class SettingsStore(context: Context) {
         private const val KEY_LANDSCAPE_SIDE_MIGRATED_AUTO = "landscape_side_migrated_to_auto"
         private const val KEY_HIDE_NOTIFICATION = "hide_foreground_notification"
         private const val KEY_SHOW_NOTIFICATION = "show_foreground_notification"
+        private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
         private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
         const val CLICK_MODE_SINGLE = "single"

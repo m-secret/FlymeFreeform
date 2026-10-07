@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Intent
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -25,7 +26,7 @@ import java.util.concurrent.Executors
  *
  * ## 版面（重排后）
  *
- * 标题 → 一句话说明 → 「基础权限」组 → 两个操作按钮 → 「设置」组 → 「调试」组。
+ * 标题 → 一句话说明 → 「基础权限」组 → 两个操作按钮 → 「设置」组 → 「其他」组 → 「调试」组。
  *
  * 每一组都是**一张卡**（[CardGroup]），组内行之间只有分隔线、没有缝；组与组之间留实缝。
  * 早先每行都是独立圆角小卡、行距只有几 dp，相邻两行的圆角在缝里相对，整页边缘全是
@@ -83,6 +84,8 @@ class MainActivity : Activity() {
         refreshStatus()
         // 用户可能刚从系统设置里开关了无障碍服务，这里同步一次遮罩状态。
         FreeformAccessibilityService.refreshIfRunning()
+        // 「后台隐藏」的标记落在 task 上，重开后是新 task——每次回到界面都要重新按开关应用。
+        applyHideFromRecents()
     }
 
     override fun onDestroy() {
@@ -180,6 +183,24 @@ class MainActivity : Activity() {
                 .row(appManageButton),
         )
 
+        // ---- 其他 ----
+        //
+        // 只放「与某个具体功能无关、但影响应用整体存在感」的开关。
+        root.addView(Ui.sectionTitle(this, "其他"))
+        root.addView(
+            CardGroup(this).row(
+                Ui.switchRow(
+                    this,
+                    "后台隐藏",
+                    store.hideFromRecents,
+                    detail = "在最近任务隐藏",
+                ) { checked ->
+                    store.hideFromRecents = checked
+                    applyHideFromRecents()
+                },
+            ),
+        )
+
         // ---- 调试 ----
         root.addView(Ui.sectionTitle(this, "调试"))
         root.addView(
@@ -191,6 +212,27 @@ class MainActivity : Activity() {
         )
 
         return Ui.scrollPage(this, root)
+    }
+
+    /**
+     * 把「后台隐藏」这个开关落到系统上：让本应用的 task 不出现在「最近任务」里。
+     *
+     * 用 [ActivityManager.AppTask.setExcludeFromRecents]（API 30+，本工程 minSdk 35，直接可用）。
+     * 选它而不是 manifest 里的静态 `android:excludeFromRecents`，是因为静态的那个是编译期写死的
+     * ——一旦加上就永远隐藏，用户没法随手关掉；这个属性现在是用户可切换的开关。
+     *
+     * 两个容易踩的点：
+     * - 标记打在**当时已存在的 task** 上。应用被从最近任务划掉后重新打开会新建一个 task，
+     *   新 task 默认是**可见**的——所以 [onResume] 每次回来都要按开关重新应用一遍，
+     *   否则用户会遇到「开关明明开着，可又在最近任务里冒出来了」。
+     * - 只按 [SettingsStore.hideFromRecents] 单向设置就够了：关掉开关时传 `false` 即是撤销，
+     *   不需要额外的「清理」分支。
+     */
+    private fun applyHideFromRecents() {
+        val manager = getSystemService(ActivityManager::class.java) ?: return
+        runCatching {
+            manager.appTasks.forEach { it.setExcludeFromRecents(store.hideFromRecents) }
+        }
     }
 
     // ---- 权限状态行 ----
