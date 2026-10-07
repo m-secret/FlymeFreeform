@@ -32,6 +32,59 @@ object CornerGeometry {
     fun dp(context: Context, value: Int): Int =
         (value * context.resources.displayMetrics.density).toInt()
 
+    /**
+     * 界面尺寸的设计基准短边（dp）。全应用所有「按屏幕短边等比缩放」的尺寸都从这里出发。
+     */
+    private const val BASE_SHORT_EDGE_DP = 400f
+
+    /** [uiScale] 的上下限。 */
+    private const val MIN_UI_SCALE = 0.85f
+
+    /**
+     * [uiScale] 的上限。**这是大屏适配的关键一刀**，见 [uiScale] 的说明。
+     */
+    private const val MAX_UI_SCALE = 1.15f
+
+    /**
+     * 全应用统一的界面缩放系数 = 屏幕**短边 dp** ÷ [BASE_SHORT_EDGE_DP]，并夹在
+     * [MIN_UI_SCALE] ~ [MAX_UI_SCALE] 之间。
+     *
+     * ## 为什么口径必须是 **dp** 短边，而不是像素短边
+     *
+     * 早先各处写的是 `value / 400 * 短边像素` —— 把 px 当 dp 用了。它在手机上**凑巧**成立：
+     * 短边 1272px ÷ density 3.5 = 363dp ≈ 基准 400dp。但**平板**上同一段代码算出的是
+     * 2400px ÷ 2.625 = **914dp**，于是整界面被放大 2.29 倍：项目里一个 18dp 的行高变成 41dp、
+     * 一条 12sp 的说明变成 27sp，一屏只装得下原本一半的东西。用户报的
+     * 「平板明明空间很大却还要上下滑动、每个条目巨大、底栏太高」就是这一条。
+     *
+     * ## 为什么要**封顶**
+     *
+     * 换成 dp 口径只是让数字「说实话」，全量按比例走的话平板仍旧是 2.29 倍。大屏的正确做法是
+     * **一屏装更多**，而不是把同一套 UI 撑大——所以这里把放大夹到 [MAX_UI_SCALE]。
+     * 1.15 是折中：再小在平板上点击目标偏小，再大就回到「条目巨大」。
+     *
+     * ## 手机完全不受影响
+     *
+     * 手机短边 363dp ÷ 400 = 0.908，落在上下限之间，换算出来的像素与改动前**逐像素相同**
+     * （400 × 0.908 × 3.5 = 1272px，正是原来的短边）。竖屏那一套逻辑因此原样不动。
+     */
+    fun uiScale(context: Context): Float {
+        val metrics = context.resources.displayMetrics
+        val shortEdgeDp = minOf(metrics.widthPixels, metrics.heightPixels) / metrics.density
+        return (shortEdgeDp / BASE_SHORT_EDGE_DP).coerceIn(MIN_UI_SCALE, MAX_UI_SCALE)
+    }
+
+    /**
+     * 「等效短边」（px）：把 [uiScale] 折算回像素后的基准长度。
+     *
+     * 凡是原来直接用「短边像素」当基数的地方（`Ui.dp` / `Ui.sp`、面板的 `ui(fraction)`、
+     * `sizeByScreen(fraction)`、各处的 `shortEdgePx`），都改成用它——**一处收敛，全部生效**。
+     */
+    fun designShortEdgePx(context: Context): Float {
+        val metrics = context.resources.displayMetrics
+        return BASE_SHORT_EDGE_DP * uiScale(context) * metrics.density
+    }
+
     fun navigationBarHeight(context: Context): Int {
         val resources = context.resources
         val id = resources.getIdentifier("navigation_bar_height", "dimen", "android")

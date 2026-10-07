@@ -36,8 +36,13 @@ class ScreenTextPanel(
     private val onDismiss: () -> Unit,
 ) : FrameLayout(context) {
 
-    private val shortEdgePx: Float =
-        min(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
+    /**
+     * 尺寸基准（px）：**等效短边**，见 [CornerGeometry.designShortEdgePx]。
+     *
+     * 用「dp 短边 + 大屏封顶」那一套，而不是裸的短边像素——否则识屏浮层在平板上会被
+     * 整体放大 2.29 倍，一屏塞不下几行文字。
+     */
+    private val shortEdgePx: Float = CornerGeometry.designShortEdgePx(context)
 
     private fun ui(fraction: Float): Int = (shortEdgePx * fraction).toInt()
 

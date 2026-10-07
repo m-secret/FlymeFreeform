@@ -579,37 +579,33 @@ class SettingsStore(context: Context) {
                 )
                 .apply()
 
-    /**
-     * 把前台服务那条「主动呼出已开启」的通知做成**静默、可划掉**的。
-     *
-     * 默认关闭（保持原样）。Android 要求前台服务必须挂一条通知，**彻底不显示是做不到的**：
-     * 强行 `cancel()` 掉它，部分 ROM 会判定这条服务失去了前台身份而把它收掉——那是
-     * 「主动呼出自己停了」这种最坏的结果，比多一行通知严重得多，所以不冒这个险。
-     *
-     * 打开后切到静默渠道：最低重要级（不出声、不弹横幅、不亮屏、无角标）+ 不进锁屏 + 可划掉。
-     */
-    var hideForegroundNotification: Boolean
-        get() = preferences.getBoolean(KEY_HIDE_NOTIFICATION, false)
-        set(value) = preferences.edit().putBoolean(KEY_HIDE_NOTIFICATION, value).apply()
+    // ---- 通知：**没有开关了，那条常驻通知一直发。** ----
+    //
+    // 曾经有两个开关（「显示常驻通知」`show_foreground_notification`、「隐藏状态栏通知」
+    // `hide_foreground_notification`），2026-10-08 用户拍板**全部删除**。三个理由，别再往回加：
+    //
+    // 1. **做不到。** 「既是前台服务、又一条通知都不显示」在 Android 上无解。三条路都真机
+    //    验过（平板 `b37664b8` / Android 16）：`cmd appops set --uid <pkg> POST_NOTIFICATION
+    //    ignore`（Shizuku）**拦不住**前台服务通知（appops 已是 `ignore`，`dumpsys notification`
+    //    里那条 `FOREGROUND_SERVICE` 通知照旧在）；`STOP_FOREGROUND_DETACH` + `cancel` 会把
+    //    **前台身份一起丢**；删通知渠道则让 `startForeground` 直接抛异常崩掉。
+    // 2. **代价太大。** 「关掉就不发」只能靠**不调 `startForeground()`** 兑现，而那会同时触发
+    //    两个事故：`ForegroundServiceDidNotStartInTimeException`（系统杀进程）与 ColorOS 的
+    //    后台冻结（无障碍服务被反复解绑重绑）。细节见 `OverlayGestureService.startAsForeground`。
+    // 3. **有正经口子。** 用户真不想要，就去系统里关掉本应用的通知权限——被拒时
+    //    `startForeground` 不抛异常、服务照跑，只是通知不显示。
 
     /**
-     * 要不要那条「主动呼出已开启」的**常驻通知**。默认**开**（保持原有行为）。
+     * 上一次**自动**写回无障碍名单的时刻（wall clock，`System.currentTimeMillis()`）。
      *
-     * 关掉它 = 通知栏里彻底没有这条通知。做法（见 `OverlayGestureService.startAsForeground`）：
-     * 先 `startForeground` 把**前台身份**立起来，再 `STOP_FOREGROUND_DETACH` 把通知与前台身份
-     * 解绑（前台身份保留），最后 `cancel` 掉那条通知本身。服务照旧是前台服务，不会被当成
-     * 后台服务收掉。**不需要 Shizuku。**
-     *
-     * 曾经用 `cmd appops set [--uid] <pkg> POST_NOTIFICATION ignore` 实现（需 Shizuku）——
-     * 真机实测（平板 `b37664b8` / Android 16，2026-10-07）**它拦不住前台服务通知**：
-     * appops 已是 `ignore`，服务重启后通知照样出现在状态栏。uid 级、包级都试过，已废弃。
-     *
-     * 与 [hideForegroundNotification]（静默）的区别：那个只是把通知压到最低重要级、
-     * 变成可划掉，它**仍然躺在通知栏里**；这个是真的一点都不显示。
+     * 不存 `elapsedRealtime`：那个跨重启会归零，而这条记录的意义正是「跨重启也别反复写」。
+     * 用途见 [AccessibilityGrant.restoreIfMissing] 的冷却——**每次写系统无障碍名单，系统都会
+     * 认为「本应用刚获得无障碍权限」，ColorOS 安全中心于是弹一次提示**（`com.oplus.securitypermission`），
+     * 用户报的「总是提示检测到 Flyme 小窗 获取无障碍权限」就是这么来的。
      */
-    var showForegroundNotification: Boolean
-        get() = preferences.getBoolean(KEY_SHOW_NOTIFICATION, true)
-        set(value) = preferences.edit().putBoolean(KEY_SHOW_NOTIFICATION, value).apply()
+    var lastAutoA11yGrantAt: Long
+        get() = preferences.getLong(KEY_LAST_AUTO_A11Y_GRANT, 0L)
+        set(value) = preferences.edit().putLong(KEY_LAST_AUTO_A11Y_GRANT, value).apply()
 
     /**
      * 「后台隐藏」：开启后本应用不出现在系统「最近任务」（Recents）里。
@@ -892,8 +888,10 @@ class SettingsStore(context: Context) {
         private const val KEY_DRAWER_DEFAULT_TAB = "drawer_default_tab"
         private const val KEY_LANDSCAPE_PANEL_SIDE = "landscape_panel_side"
         private const val KEY_LANDSCAPE_SIDE_MIGRATED_AUTO = "landscape_side_migrated_to_auto"
-        private const val KEY_HIDE_NOTIFICATION = "hide_foreground_notification"
-        private const val KEY_SHOW_NOTIFICATION = "show_foreground_notification"
+        // `show_foreground_notification` / `hide_foreground_notification` 两个 key 已废弃
+        // （原因见文件上方「通知：没有开关了，那条常驻通知一直发」那段），不要重新引入。
+        // 存量设备的 prefs 里可能还留着这两项，不影响任何逻辑。
+        private const val KEY_LAST_AUTO_A11Y_GRANT = "last_auto_a11y_grant_at"
         private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
         private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"

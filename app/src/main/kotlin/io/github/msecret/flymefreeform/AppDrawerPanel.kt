@@ -101,11 +101,46 @@ class AppDrawerPanel(
     private val onDismiss: () -> Unit,
 ) : FrameLayout(context) {
 
+    /**
+     * 构造函数**第一条**属性初始化处的时刻（`elapsedRealtime`）。只为呼出性能打点。
+     *
+     * 必须声明在所有属性之前：Kotlin 的属性初始化器按源码顺序执行，而 [sectionsAll]
+     * （分组，过去是主要开销）就排在下面不远处。放在这里量出的 `data=` 段才覆盖得住它——
+     * 早先的 `perfPanelStart` 写在 init 块里，那已经晚于全部分组工作，整段都量不到。
+     */
+    private val perfConstructStart = android.os.SystemClock.elapsedRealtime()
+
     /** 分组后的应用列表：一组 = 一个首字母 + 该字母下的应用。 */
     private data class Section(val letter: String, val apps: List<AppEntry>)
 
-    /** 网格每行的图标数。 */
-    private val columns: Int = GRID_COLUMNS
+    /**
+     * 网格每行的图标数。
+     *
+     * **不是固定 4**：按「卡片实际宽度 ÷ 每列目标宽度」算，夹在 [GRID_MIN_COLUMNS] ~
+     * [GRID_MAX_COLUMNS] 之间。手机竖屏算出来正好是 4（与改动前完全一致）；平板横屏的卡片有
+     * 1764px 宽，会排到 7 列——同样是「一屏装更多」，而不是把每个图标撑大（用户报的
+     * 「平板上每个条目都巨大、还得上下滑」）。
+     */
+    private val columns: Int = computeColumns()
+
+    /**
+     * 算 [columns]。
+     *
+     * 只用 `resources` 和纯函数 [CornerGeometry.designShortEdgePx]，**不碰任何后置字段**——
+     * 属性初始化阶段就会被调到（[sectionsAll] / [buildFlatItems] 都在构造里跑），那时
+     * `shortEdgePx` 之类还没赋上值。
+     */
+    private fun computeColumns(): Int {
+        val metrics = resources.displayMetrics
+        val cardWidth =
+            if (metrics.widthPixels > metrics.heightPixels) {
+                metrics.widthPixels * CARD_WIDTH_FRACTION_LANDSCAPE
+            } else {
+                metrics.widthPixels * CARD_WIDTH_FRACTION
+            }
+        val columnWidth = CornerGeometry.designShortEdgePx(context) * GRID_COLUMN_WIDTH_FRACTION
+        return (cardWidth / columnWidth).toInt().coerceIn(GRID_MIN_COLUMNS, GRID_MAX_COLUMNS)
+    }
 
     /** 一行应用（≤ columns 个），供网格布局使用。 */
     private class AppRow(val entries: List<AppEntry>)
@@ -173,6 +208,12 @@ class AppDrawerPanel(
      * 它是可变的：「最近使用」跟着用户实际用过什么在变，每次 [refreshContent] 都要重算一遍。
      */
     private var flatItems: List<Any> = buildFlatItems()
+
+    /**
+     * 数据准备（分组 + 拍平）结束的时刻。与 [perfConstructStart] 相减就是这段的耗时，
+     * 会出现在 `PERF_BUILD` 的 `data=` 上。
+     */
+    private val perfDataReady = android.os.SystemClock.elapsedRealtime()
 
     /** 当前在哪一页，取值 [TAB_APPS] / [TAB_TOOLS]。每次打开默认从应用页开始。 */
     private var activeTab: Int = defaultTab.coerceIn(TAB_APPS, TAB_TOOLS)
@@ -394,14 +435,18 @@ class AppDrawerPanel(
      */
     private lateinit var card: LinearLayout
 
+    /** 构造开始的时刻（`elapsedRealtime`）。只为呼出性能打点，见 [init] 开头。 */
+    private var perfPanelStart = 0L
+
     /**
-     * 屏幕短边（px），作为面板所有尺寸的基准。
+     * 面板所有尺寸的基准长度（px）——**等效短边**，见 [CornerGeometry.designShortEdgePx]。
      *
-     * 图标、文字、间距都按它的比例算，而不是写死 dp——这样大屏小屏上占屏幕的比例一致，
-     * 不会再「有的屏幕大了有的小了」。
+     * 图标、文字、间距都按它的比例算，而不是写死 dp：这样不同屏幕上占屏幕的比例一致。
+     * 但基数是「dp 短边 + 大屏封顶」那一套，**不是**早先的裸短边像素——后者在平板
+     * （2400px ÷ 2.625 = 914dp）上会把图标、字号、行高整体撑到 2.29 倍，一屏只显示原来
+     * 一半的条目（用户报的「平板上每个条目都巨大、还要上下滑」）。
      */
-    private val shortEdgePx: Float =
-        min(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
+    private val shortEdgePx: Float = CornerGeometry.designShortEdgePx(context)
 
     /** 按屏幕短边比例算尺寸（px）。 */
     private fun ui(fraction: Float): Int = (shortEdgePx * fraction).toInt()
@@ -501,7 +546,23 @@ class AppDrawerPanel(
     private val dockIconPx: Int =
         (ui(GRID_ICON_FRACTION) * if (landscape) DOCK_ICON_SCALE_LANDSCAPE else 1f).toInt()
 
+
     init {
+        // ---- 呼出性能打点 ----
+        //
+        // 用户报「第一次呼出能卡一秒多、不是行云流水」。这段构造是在**主线程**把整棵卡片建出来，
+        // 但一秒也可能花在别处（窗口 addView、首帧布局、图标解码），所以先把每一段量出来再谈优化。
+        // 刻意绕开 [DebugLog] 的开关直写 logcat：用户复现一次就能拿到证据。
+        // 全部时间戳都是 `elapsedRealtime`（单调时钟），可跨类与 `PERF_*` 系列直接相减。
+        perfPanelStart = android.os.SystemClock.elapsedRealtime()
+        var perfLast = perfPanelStart
+        val perfParts = StringBuilder()
+        fun perfMark(name: String) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            perfParts.append(name).append('=').append(now - perfLast).append("ms ")
+            perfLast = now
+        }
+
         // 面板窗口铺满整屏，垫半透明遮罩；卡片固定尺寸居中（接近小窗大小），点卡片外即关闭。
         //
         // **不要用 `setPadding` 来让开系统栏**：根上还挂着几张 `MATCH_PARENT` 的层
@@ -556,6 +617,7 @@ class AppDrawerPanel(
             }
 
         card.addView(buildHeader())
+        perfMark("header")
 
         // 「已选」+ 标签栏 + 内容页竖排成一层；**字母索引条叠在这一层之上**，
         // **浮层结构**：两页内容铺满整块 bodyLayer，「已选」和标签栏是盖在上面的两块浮层，
@@ -576,11 +638,14 @@ class AppDrawerPanel(
                     )
             }
         pager.addView(buildAppsBody())
+        perfMark("apps")
         pager.addView(buildToolsBody())
+        perfMark("tools")
 
         // 两块浮层的背景必须**不透明**：内容会从它们下面滑过去，透明的话会透出来。
         selectorSection = buildSelectorSection().apply { setBackgroundColor(CARD_COLOR) }
         tabBarLayer = buildTabBar().apply { setBackgroundColor(CARD_COLOR) }
+        perfMark("overlays")
 
         bodyLayer =
             FrameLayout(context).apply {
@@ -620,6 +685,7 @@ class AppDrawerPanel(
             bodyLayer,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
         )
+        perfMark("body")
 
         // 量出两块浮层的高度：定下「已选」的高度、标签栏的顶边距、以及列表的上内边距。
         // 之后滚动就只动偏移、不动布局了。必须 post——要等第一次布局跑完才量得到高度。
@@ -820,9 +886,22 @@ class AppDrawerPanel(
                     // 现取会退化成另一个游离 observer（同样是活的），`isAlive` 一判就不会抛。
                     val current = viewTreeObserver
                     if (current.isAlive) current.removeOnGlobalLayoutListener(this)
+                    // 首帧布局落定的时刻——也就是「用户能看见面板」的时刻（动画从 alpha 0 起，
+                    // 此前整块不可见）。与 PERF_BUILD 相减就是布局那一趟的耗时。
+                    android.util.Log.i(
+                        "FlymeFreeformNoRoot",
+                        "PERF_FIRST_FRAME since_build=" +
+                            (android.os.SystemClock.elapsedRealtime() - perfPanelStart) + "ms",
+                    )
                     startEnterAnimation()
                 }
             },
+        )
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "PERF_BUILD total=${android.os.SystemClock.elapsedRealtime() - perfPanelStart}ms " +
+                // 分组 + 拍平那一段（属性初始化期，init 里的 perfParts 覆盖不到）。
+                "data=${perfDataReady - perfConstructStart}ms $perfParts",
         )
     }
 
@@ -839,6 +918,13 @@ class AppDrawerPanel(
             .alpha(1f)
             .setDuration(PANEL_ENTER_DURATION_MS)
             .setInterpolator(DecelerateInterpolator(1.5f))
+            .withEndAction {
+                android.util.Log.i(
+                    "FlymeFreeformNoRoot",
+                    "PERF_ANIM_END since_build=" +
+                        (android.os.SystemClock.elapsedRealtime() - perfPanelStart) + "ms",
+                )
+            }
             .start()
         card.animate()
             .scaleX(1f)
@@ -1141,6 +1227,8 @@ class AppDrawerPanel(
      */
     private fun buildSections(source: List<AppEntry>): List<Section> {
         if (source.isEmpty()) return emptyList()
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val missed0 = sectionLetterMisses
         val sections =
             try {
                 buildSectionsWithIcu(source)
@@ -1148,6 +1236,17 @@ class AppDrawerPanel(
                 DebugLog.warn("ALPHABETIC_INDEX_FAILED", null, error)
                 buildSectionsFallback(source)
             }
+        // 这一段在**每次呼出面板**和**每次后台刷新目录**都要跑，所以单独量一条。
+        // [hanTransliterator] 那次一次性 ICU 规则构建（几百毫秒）过去就砸在这里，
+        // 冷启动只见它。`miss` = 这一趟真正走了 ICU 的标签数，正常应当是 0。
+        val cost = android.os.SystemClock.elapsedRealtime() - t0
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "PERF_SECTIONS cost=${cost}ms n=${source.size} " +
+                "miss=${sectionLetterMisses - missed0} cache=${SECTION_LETTER_CACHE.size}",
+        )
+        // 新算出来的立刻落盘：下一次冷启动就不用再碰 ICU 了。
+        flushSectionLetters()
         return sections
     }
 
@@ -1172,13 +1271,30 @@ class AppDrawerPanel(
      */
     private fun stableSectionLetter(rawLabel: String): String {
         val label = rawLabel.trim()
+        // 同一个标签永远算出同一个字母，而面板每次呼出都要把全部应用重算一遍——
+        // 所以结果直接缓存（见 [SECTION_LETTER_CACHE]）。
+        SECTION_LETTER_CACHE[label]?.let { return it }
+        sectionLetterMisses++
+        val letter = computeSectionLetter(label)
+        if (SECTION_LETTER_CACHE.size < SECTION_LETTER_CACHE_LIMIT) {
+            SECTION_LETTER_CACHE[label] = letter
+            PENDING_LETTERS[label] = letter
+        }
+        return letter
+    }
+
+    /** [stableSectionLetter] 的实际计算。有了缓存，每个标签这条路径只会走一次。 */
+    private fun computeSectionLetter(label: String): String {
         val first = label.firstOrNull() ?: return "#"
         if (first in 'A'..'Z' || first in 'a'..'z') return first.uppercaseChar().toString()
         if (!first.isLetter()) return "#"
-        val transliterator =
-            runCatching { Transliterator.getInstance("Han-Latin/Names") }.getOrNull()
-                ?: return "#"
-        val latin = transliterator.transliterate(label)
+        // 音译器**复用同一个实例**，且加锁使用——`transliterate()` 会改实例内部状态。
+        // 见 [hanTransliterator] 的说明：它跟后台预热共用同一个实例。
+        val latin =
+            synchronized(HAN_LATIN_LOCK) {
+                val transliterator = hanTransliterator() ?: return "#"
+                transliterator.transliterate(label)
+            }
         val initial = latin.firstOrNull { it in 'A'..'Z' || it in 'a'..'z' }
             ?: return "#"
         return initial.uppercaseChar().toString()
@@ -3328,6 +3444,115 @@ class AppDrawerPanel(
             return !ch.isLetter()
         }
 
+        /**
+         * 汉字 → 拼音首字母用的 ICU 音译器。
+         *
+         * ## 为什么只建一次
+         * `Transliterator.getInstance("Han-Latin/Names")` 每次调用都要重新解析规则 ID 并实例化。
+         * 真机实测（手机 `3B169G01RP000000`，89 个中文应用名，跑 [stableSectionLetter] 的等价路径）：
+         *
+         * | 做法 | 冷态 | 热态 |
+         * |---|---|---|
+         * | 每个名字各调一次 `getInstance`（原实现） | **326 ms** | 43 ms |
+         * | 复用同一个实例 | — | **12 ms** |
+         *
+         * ## 为什么光「只建一次」还不够
+         * 因为**首次构建规则本身**就要几百毫秒。真机自证（同一个固定版本）：
+         *
+         * ```
+         * PERF_SECTIONS cost=451ms n=89     ← 你手动冷启动呼出那次
+         * PERF_SECTIONS cost=1ms   n=89     ← 页缓存热的时候
+         * ```
+         *
+         * 这段随机落在**主线程的呼出路径**上，用户看到的就是「第一次打开要等一秒」。
+         * 所以两条腿一起走：
+         * 1. [warmSectionLetters] 在服务启动时用**后台线程**把这次构建提前做掉；
+         * 2. [preloadSectionLetters] 把算好的「标签 → 字母」从磁盘读回来，
+         *    常见情况下主线程**根本不碰 ICU**。
+         *
+         * ## 线程安全
+         * `Transliterator.transliterate()` 会改实例内部状态，**不是线程安全的**，所以构建与使用
+         * 统一走 [HAN_LATIN_LOCK]。早先用 `ThreadLocal` 规避，但那样后台预热出来的实例主线程
+         * 用不上、预热等于白做。
+         */
+        private val HAN_LATIN_LOCK = Any()
+        private var hanLatinReady = false
+        private var hanLatin: Transliterator? = null
+
+        private fun hanTransliterator(): Transliterator? = synchronized(HAN_LATIN_LOCK) {
+            if (!hanLatinReady) {
+                hanLatin = runCatching { Transliterator.getInstance("Han-Latin/Names") }.getOrNull()
+                hanLatinReady = true
+            }
+            hanLatin
+        }
+
+        /**
+         * 后台预热：把一次性的 ICU 规则构建挪出主线程。
+         *
+         * 由 `OverlayGestureService` 启动时在 `worker` 上调（见那边的 `onCreate`）。
+         * 没预热上也不会错——[computeSectionLetter] 会在主线程自己建，只是会慢那一次。
+         */
+        fun warmSectionLetters() {
+            runCatching { hanTransliterator() }
+        }
+
+        /** 「标签 → 首字母」落盘用的文件名。 */
+        private const val LETTER_PREFS_NAME = "flymefreeform_letters"
+
+        private var letterPrefs: android.content.SharedPreferences? = null
+
+        /**
+         * 把上次算好的「标签 → 首字母」读回内存缓存。由服务启动时在后台线程调。
+         *
+         * 应用标签几乎不会变，这张表**一次算完可以一直用**。落盘之后，后续任何一次进程冷启动
+         * 打开面板都不需要再碰 ICU——冷启动那 451ms 就是这么省掉的。
+         *
+         * 读盘成本是「解析一个小 XML」，几百条也就几毫秒，所以放后台线程。
+         */
+        fun preloadSectionLetters(context: Context) {
+            val prefs = context.applicationContext
+                .getSharedPreferences(LETTER_PREFS_NAME, Context.MODE_PRIVATE)
+            letterPrefs = prefs
+            runCatching {
+                for ((key, value) in prefs.all) {
+                    if (value is String && key.isNotEmpty()) SECTION_LETTER_CACHE[key] = value
+                }
+            }
+        }
+
+        /**
+         * 「应用标签 → 首字母分组字母」的结果缓存。
+         *
+         * 同一个标签永远算出同一个字母，而面板每次呼出都要把全部应用重算一遍——缓存之后
+         * 第二次起这段几乎归零。只增不减正好（键是标签，一台设备上数量天然有限），
+         * 到 [SECTION_LETTER_CACHE_LIMIT] 就停止写入，避免极端情况下无上限增长。
+         */
+        private val SECTION_LETTER_CACHE =
+            java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        /** 本次新算出、还没落盘的条目。由 [flushSectionLetters] 一次写掉。 */
+        private val PENDING_LETTERS = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        /** 累计走了 ICU 的标签数（= 缓存没命中的次数）。只为 `PERF_SECTIONS` 打点。 */
+        private var sectionLetterMisses = 0
+
+        /**
+         * 把这次新算出的条目写回磁盘。由 [buildSections] 算完后调一次。
+         *
+         * `apply()` 是异步落盘，不阻塞调用它的线程。
+         */
+        private fun flushSectionLetters() {
+            val prefs = letterPrefs ?: return
+            if (PENDING_LETTERS.isEmpty()) return
+            val editor = prefs.edit()
+            for ((label, letter) in PENDING_LETTERS) editor.putString(label, letter)
+            PENDING_LETTERS.clear()
+            editor.apply()
+        }
+
+        private const val SECTION_LETTER_CACHE_LIMIT = 4096
+
         const val TYPE_HEADER = 0
         const val TYPE_ROW = 1
         const val TYPE_RECENT = 2
@@ -3338,8 +3563,19 @@ class AppDrawerPanel(
         /** 尺寸设计基准：以 400dp 短边的屏幕为准，其它屏幕按短边比例缩放。 */
         const val BASE_SHORT_EDGE_DP = 400f
 
-        /** 网格每行的图标数。 */
-        const val GRID_COLUMNS = 4
+        /** 网格每行图标数的下限。手机竖屏算出来正好是它。 */
+        const val GRID_MIN_COLUMNS = 4
+
+        /** 网格每行图标数的上限：平板横屏会排到 7~8，再多每格就窄得比图标还小。 */
+        const val GRID_MAX_COLUMNS = 8
+
+        /**
+         * 网格每列的宽度（占**等效短边**的比例，见 [computeColumns]）。
+         *
+         * 0.19 是「让手机竖屏仍旧正好 4 列」的值：卡片 941px ÷ (1272px × 0.19) = 3.9 → 4 列。
+         * 它同时钉住了**图标与列宽的比例**，所以换到列数更多的屏幕上时，图标在格子里的占比不变。
+         */
+        const val GRID_COLUMN_WIDTH_FRACTION = 0.19f
 
         /** 网格单个图标的直径（占屏幕短边的比例，与「已选」条、底栏共用，保证大小一致）。 */
         const val GRID_ICON_FRACTION = 0.080f
@@ -3395,6 +3631,14 @@ class AppDrawerPanel(
          */
         const val LANDSCAPE_MAX_ASPECT = 1.2f
 
+        /**
+         * 卡片四角的圆角半径（dp）。
+         *
+         * **刻意不跟随屏幕圆角**：试过直接照抄设备那条半径（见 `CornerGeometry.roundedCornerRadius`），
+         * 手机上是 176px（≈50dp），卡片被啃得过于圆、用户判定「太丑了」，于是回退到这个固定值。
+         * 屏幕圆角是为了「屏幕边界和机身圆角对齐」，跟一张**浮在屏幕中间**的卡片要多大圆角
+         * 本来就不是一回事。
+         */
         const val CARD_CORNER_DP = 22
 
         /** 卡片与下面「底栏」之间留的空隙。 */

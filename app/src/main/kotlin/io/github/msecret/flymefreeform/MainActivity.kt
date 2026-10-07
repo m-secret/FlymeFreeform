@@ -655,11 +655,14 @@ class MainActivity : Activity() {
         mainHandler.postDelayed({ refreshStatus() }, 400L)
     }
 
-    private val shortEdgePx: Float
-        get() = minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
-
-    /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
-    private fun scaledSp(designSp: Float): Float = designSp / 400f * shortEdgePx
+    /**
+     * 权限行里的文字尺寸（px）。
+     *
+     * 直接走 [Ui.sp]，和界面其它地方**同一把尺子**（dp 短边口径 + 大屏封顶，见
+     * [CornerGeometry.designShortEdgePx]）——早先这里是独立的一份 `短边像素 / 400`，
+     * 平板上会跟着放大 2.29 倍，行文字比标题还大。
+     */
+    private fun scaledSp(designSp: Float): Float = Ui.sp(this, designSp)
 
     private companion object {
         const val REQUEST_SHIZUKU = 200

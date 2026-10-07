@@ -1,15 +1,12 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
-import android.app.NotificationManager
 import android.content.Context
-import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.os.Bundle
-import android.provider.Settings
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.Switch
@@ -55,16 +52,6 @@ class CornerSettingsActivity : Activity() {
     /** 「触摸区」这一组卡片。示意图加不加要整组重画，所以得留个引用（见 [applyTouchDiagramRow]）。 */
     private lateinit var touchGroup: CardGroup
 
-    /**
-     * 「通知权限没给」这句提示的容器。
-     *
-     * 它**不常显**：通知权限是可选项（不给也不影响任何功能，只是常驻通知不出现），
-     * 所以它不该占着主设置页的「基础权限」栏向用户要——那里只列**真会影响功能**的权限。
-     * 只有当用户在本页把「显示常驻通知」打开、而系统里本应用的通知确实是关的，才在这里露一句
-     * + 一个跳系统设置的小动作。见 [renderNotificationPermHint]。
-     */
-    private lateinit var notificationPermBox: LinearLayout
-
     /** 「触摸区」这一组里**除示意图之外**的行。建一次、反复复用（见 [applyTouchDiagramRow]）。 */
     private lateinit var touchCoreRows: List<View>
 
@@ -84,15 +71,6 @@ class CornerSettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         setContentView(buildContent())
-        renderNotificationPermHint()
-    }
-
-    /**
-     * 从系统设置回来时重算那条通知提示：用户可能刚在系统里把本应用的通知打开了。
-     */
-    override fun onResume() {
-        super.onResume()
-        renderNotificationPermHint()
     }
 
     /**
@@ -371,43 +349,13 @@ class CornerSettingsActivity : Activity() {
         }
 
         // ---- 通知 ----
-        root.addView(Ui.sectionTitle(this, "通知"))
-        root.addView(
-            CardGroup(this)
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "显示常驻通知",
-                        store.showForegroundNotification,
-                        detail = "关掉 = 完全不发通知",
-                    ) { checked ->
-                        store.showForegroundNotification = checked
-                        // 通知是前台服务启动时挂上去的，改完得让它按新设置重挂/撤掉一次。
-                        OverlayGestureService.reload(this)
-                        renderNotificationPermHint()
-                    },
-                )
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "隐藏状态栏通知",
-                        store.hideForegroundNotification,
-                        detail = "通知还在，但静默、不进锁屏、可划掉",
-                    ) { checked ->
-                        store.hideForegroundNotification = checked
-                        OverlayGestureService.reload(this)
-                    },
-                ),
-        )
-        root.addView(
-            Ui.hint(
-                this,
-                "「显示常驻通知」关掉后就**完全不发通知**；" +
-                    "「隐藏状态栏通知」是让它静默、不进锁屏、可划掉。",
-            ),
-        )
-        notificationPermBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(notificationPermBox)
+        //
+        // 这一块**空了**，不是漏了。原来这里有两个开关（「显示常驻通知」「隐藏状态栏通知」），
+        // 2026-10-08 按用户要求删除：Android 上前台服务那条通知没法真的不发——两个开关要么
+        // 做不到，要么得牺牲前台身份，代价是 `ForegroundServiceDidNotStartInTimeException`
+        // 崩溃 + ColorOS 后台冻结导致无障碍反复断开（细节见
+        // `OverlayGestureService.startAsForeground`）。所以那条通知现在**一直发**；
+        // 用户真不想要，去系统设置里关掉本应用的通知权限即可（服务照常运行）。
 
         // ---- 图标包 ----
         root.addView(Ui.sectionTitle(this, "图标包"))
@@ -422,50 +370,6 @@ class CornerSettingsActivity : Activity() {
 
         renderTouchDiagram()
         return Ui.scrollPage(this, root)
-    }
-
-    /**
-     * 「系统里本应用的通知是关着的」这句提示——**只在真的缺、且真的会用到**时才露出来。
-     *
-     * 通知权限是这一个应用里唯一的**纯可选项**：不给它，主动呼出、窗外点击关闭、识屏、截屏、
-     * 一键锁屏全都照常，只是「主动呼出已开启」那条常驻通知不出现（Android 13+ 前台服务通知要
-     * `POST_NOTIFICATIONS`；被拒时 `startForeground` 不抛异常、服务照跑，真机实测过）。
-     *
-     * 所以它**不该**占着主设置页「基础权限」栏的一行去要——那一栏现在只列真会影响功能的权限。
-     * 这里也不弹系统权限框，而是直接把人送到系统设置页：一次到位，而且能覆盖「之前点过拒绝、
-     * 系统已经不再弹框」的情况（那种情况下再调 `requestPermissions` 会立刻静默返回失败）。
-     */
-    private fun renderNotificationPermHint() {
-        notificationPermBox.removeAllViews()
-        // 用户自己就没打算显示常驻通知 → 这句话没有意义。
-        if (!store.showForegroundNotification) return
-        val notificationsEnabled =
-            getSystemService(NotificationManager::class.java)?.areNotificationsEnabled() != false
-        if (notificationsEnabled) return
-        notificationPermBox.addView(
-            Ui.hint(
-                this,
-                "**系统里本应用的通知是关着的**：那条「主动呼出已开启」的常驻通知不会出现。" +
-                    "其余功能不受影响——不想要它就放着不管也行。",
-            ),
-        )
-        notificationPermBox.addView(
-            // 套一层横向容器：纵向 LinearLayout 里直接 addView 会**整宽拉满**，那就不是「小药丸」了。
-            Ui.actionRow(
-                this,
-                Ui.smallAction(this, "去系统设置里打开通知", emphasized = false) {
-                    runCatching {
-                        // 走 AppContext：ColorOS 会在跳页时回调本页的 onUserLeaveHint，
-                        // 不标记的话「后台隐藏」开着就把这一页连 task 一起清掉（一闪就没了）。
-                        AppContext.startActivity(
-                            this,
-                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
-                        )
-                    }
-                },
-            ),
-        )
     }
 
     /**

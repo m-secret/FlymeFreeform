@@ -873,9 +873,14 @@ class PinnedStripView(
         }
     }
 
-    /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
+    /**
+     * 尺寸基准（px）：**等效短边**，见 [CornerGeometry.designShortEdgePx]。
+     *
+     * 不再是裸的短边像素——那个口径在平板上会把图标、角标、间距整体放大 2.29 倍。
+     * 注意这里**只影响观感尺寸**：拖动排序用的位移判定是按事件坐标算的，不经过本值。
+     */
     private val shortEdgePx: Float
-        get() = minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
+        get() = CornerGeometry.designShortEdgePx(context)
 
     private fun dp(value: Int): Int = (value / 400f * shortEdgePx).toInt()
 

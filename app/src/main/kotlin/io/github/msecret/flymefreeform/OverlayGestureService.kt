@@ -244,6 +244,17 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         handler.postDelayed(triggerWatchdog, TRIGGER_WATCHDOG_MS)
         // 服务随开机/更新后重新拉起时会走这里：顺手把 Shizuku 重连监听挂上，授权能自动恢复。
         ShizukuShell.startAutoReconnect()
+        // 「应用首字母分组」那套东西提前备好，**全在后台线程**：
+        // 1. [AppDrawerPanel.preloadSectionLetters] 把上次算好的「标签 → 字母」读回内存；
+        // 2. [AppDrawerPanel.warmSectionLetters] 把 ICU 音译器的一次性规则构建（真机实测
+        //    冷态 280~450ms）做掉。
+        // 这两样都在**主线程构造面板**时才第一次被用到，压在那里就是用户报的
+        // 「冷启动第一次打开「更多」要等一秒」——服务一般比用户呼出早得多，
+        // 放在这里等于白捡。
+        worker.execute {
+            AppDrawerPanel.preloadSectionLetters(this)
+            AppDrawerPanel.warmSectionLetters()
+        }
         DebugLog.info("SERVICE_CREATED")
     }
 
@@ -502,12 +513,16 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     // ---- 前台通知 ----
 
     /**
-     * 两条通知渠道：正常的一条（[CHANNEL_ID]）与**静默**的一条（[CHANNEL_ID_QUIET]）。
+     * 唯一一条通知渠道（[CHANNEL_ID]）。
      *
-     * 后者给设置里那个「隐藏状态栏通知」用：最低重要级（不出声、不弹横幅、不亮屏、无角标）、
-     * 不进锁屏，并且通知本身可划掉。**这是能做到的极限**——Android 要求前台服务必须挂一条通知，
-     * 强行 `cancel()` 掉它，部分 ROM 会判定这条服务失去了前台身份而把它收掉，那就变成
-     * 「主动呼出自己停了」，比多一行通知严重得多。所以这里只压低存在感，不冒那个险。
+     * **曾经还有第二条「静默」渠道**，配合设置里那个「隐藏状态栏通知」开关用。那套东西连同
+     * 「显示常驻通知」开关一起删掉了，原因见 [startAsForeground]：Android 上前台服务的通知
+     * **没法真的不发**，于是「关掉通知」这个开关只能靠**不调 `startForeground()`** 来兑现——
+     * 那会同时丢掉前台身份，代价是崩溃 + 后台被冻结，得不偿失。
+     *
+     * 用户不想要这条通知，正确的口子是**系统设置里关掉本应用的通知权限**：实测被拒时
+     * `startForeground` 不抛异常、服务照常跑，只是那条通知不显示（见 `CornerSettingsActivity`
+     * 的 `renderNotificationPermHint`，那里有直达入口）。
      */
     private fun createNotificationChannel() {
         val manager = getSystemService(NotificationManager::class.java) ?: return
@@ -520,59 +535,43 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 ),
             )
         }
-        if (manager.getNotificationChannel(CHANNEL_ID_QUIET) == null) {
-            manager.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID_QUIET,
-                    getString(R.string.notification_channel_quiet_name),
-                    NotificationManager.IMPORTANCE_MIN,
-                ).apply {
-                    setShowBadge(false)
-                    enableVibration(false)
-                    enableLights(false)
-                    setSound(null, null)
-                },
-            )
-        }
     }
 
     /**
-     * 前台身份与那条常驻通知**是否已经挂好**，以及挂的是哪一版。
+     * 前台身份与那条常驻通知**是否已经挂好**。
      *
      * [startAsForeground] 被调得极频繁（`ACTION_PREVIEW_SYNC` 是拖动滑块时**每帧一次**），
      * 而配置没变时重挂一遍通知毫无意义——挂好了就直接返回。
      */
     private var foregroundReady = false
-    private var foregroundQuiet = false
 
+    /**
+     * 拿前台身份 + 挂那条常驻通知。**这里必须无条件调用 `startForeground()`。**
+     *
+     * 记两个真机事故，别再往回调（平板 `b37664b8` / Android 16 / ColorOS 16）：
+     *
+     * 1. **不调 `startForeground()` 会被系统直接杀进程。** 只要有人调过
+     *    `Context.startForegroundService()`（就是 [Companion.start]，`BootReceiver` 开机自启
+     *    与设置页那个按钮都走它），系统就要求在超时内出现一次 `startForeground()`；否则抛
+     *    `RemoteServiceException$ForegroundServiceDidNotStartInTimeException` 终结整个进程。
+     *    旧实现在「关掉常驻通知」时**直接 return** 不调它，于是每次冷启动必崩——用户报的
+     *    「没连电脑时软件总是自己闪退」就是它，`logcat -b crash` 里两条栈都指向这里。
+     * 2. **没有前台身份会被 ROM 冻结。** 同一版实现里侥幸没崩的那些次，服务也掉出了前台，
+     *    ColorOS 随即按后台应用处理（`Osense-BaseDecisionMaker: excutingPolicy: freezer`），
+     *    无障碍服务跟着被判无响应、被系统**反复解绑重绑**——用户报的是「无障碍明明开着，
+     *    却一直显示重新连接」。实测两侧日志对齐：断开/重连每隔十几秒一轮。
+     *
+     * 所以「让用户看不见那条通知」**绝不能**靠「不发通知」实现。真要一条都不显示，走系统里
+     * **关掉本应用的通知权限**那条路：被拒时 `startForeground` 不抛异常、服务照跑，只是通知
+     * 不显示（入口见 `CornerSettingsActivity.renderNotificationPermHint`）。曾经的
+     * 「显示常驻通知 / 隐藏状态栏通知」两个开关因此一并删除。
+     */
     private fun startAsForeground() {
-        // 用户关掉「显示常驻通知」= **一条都不发**。
-        //
-        // 曾经试过两条更绕的路，都不可靠，已废弃（真机实测，平板 `b37664b8` / Android 16）：
-        //
-        // 1. 用 Shizuku 执行 `cmd appops set [--uid] <pkg> POST_NOTIFICATION ignore` 屏蔽通知：
-        //    `cmd appops get` 明明显示 `Uid mode: POST_NOTIFICATION: ignore`，服务重启后
-        //    `startForeground` 照样把通知挂进状态栏。uid 级、包级两种写法都拦不住。
-        // 2. 先 `startForeground` 拿前台身份，再 `STOP_FOREGROUND_DETACH` + `cancel` 撤掉通知：
-        //    通知确实没了（`NotificationRecord` 为 0），但那一下**前台身份也一起丢了**
-        //    （`dumpsys activity services` 里 `isForeground=` 直接消失）。
-        //
-        // 结论：Android 里「既是前台服务、又一条通知都不显示」做不到。既然用户不要通知，
-        // 那就干脆**不挂前台服务通知**——不 post、不 cancel、不 detach，什么都不做。
-        if (!store.showForegroundNotification) {
-            // 中途关掉的：把上一次已经挂着的那条撤掉。
-            if (foregroundReady) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                foregroundReady = false
-            }
-            return
-        }
         // 渠道要在这儿再确保一次：服务是长活的，`onCreate` 只跑一次，而用户可能是在服务已经
-        // 跑着的时候才打开「隐藏状态栏通知」——那时静默渠道还不存在。往一条不存在的渠道发通知
-        // 在 Android 8 以上是**静默丢弃**，前台服务因此会失去那条通知，后果比没通知严重得多。
+        // 跑着的时候才打开通知权限——那时渠道还不存在。往一条不存在的渠道发通知在 Android 8
+        // 以上是**静默丢弃**，前台服务因此会失去那条通知，后果比没通知严重得多。
         createNotificationChannel()
-        val quiet = store.hideForegroundNotification
-        if (foregroundReady && quiet == foregroundQuiet) return
+        if (foregroundReady) return
         val openApp =
             PendingIntent.getActivity(
                 this,
@@ -580,25 +579,14 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 Intent(this, MainActivity::class.java),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-        val builder =
-            Notification.Builder(this, if (quiet) CHANNEL_ID_QUIET else CHANNEL_ID)
+        val notification: Notification =
+            Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle(getString(R.string.notification_title))
-                .setContentText(
-                    getString(if (quiet) R.string.notification_text_quiet else R.string.notification_text),
-                )
+                .setContentText(getString(R.string.notification_text))
                 .setSmallIcon(android.R.drawable.ic_menu_compass)
                 .setContentIntent(openApp)
-        if (quiet) {
-            // 可划掉 + 不进锁屏 + 不显示时间。**静音由渠道保证**（[CHANNEL_ID_QUIET] 的
-            // IMPORTANCE_MIN + 关掉声音、震动、呼吸灯），不用在这里逐条设置。
-            builder
-                .setOngoing(false)
-                .setShowWhen(false)
-                .setVisibility(Notification.VISIBILITY_SECRET)
-        } else {
-            builder.setOngoing(true)
-        }
-        val notification: Notification = builder.build()
+                .setOngoing(true)
+                .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
@@ -609,7 +597,6 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             startForeground(NOTIFICATION_ID, notification)
         }
         foregroundReady = true
-        foregroundQuiet = quiet
     }
 
     // ---- 悬浮窗 ----
@@ -868,6 +855,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      *   （见 [resolvedLandscapeSide]）。**必须在撤轮盘之前取好**——`activeSide` 那时已经空了。
      */
     private fun showDrawer(side: CornerSide?) {
+        // 「用户点了『更多』」的那一刻 = 呼出性能链路的起点（终点是 `PERF_FIRST_FRAME`）。
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "PERF_DRAWER_ENTER side=$side ts=${System.currentTimeMillis()}",
+        )
         drawerSide = side
         hideDrawer()
         // 应用目录是**服务启动时加载的一份快照**，新装的应用不会自己出现。
@@ -891,22 +883,55 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      *
      * 读完之后**只更新数据**：服务里的 [appEntries]，以及当前那个面板（[AppDrawerPanel.updateApps]）。
      * 不重建面板——用户可能已经在里面滑到一半了。
+     *
+     * ## 两处刻意的「不做」
+     *
+     * 1. **读回来发现目录没变就整段跳过**（[sameCatalog]）。这是绝大多数情况——用户不会
+     *    每次呼出面板之间都装 / 卸一个应用。早先无脑往下走，于是每次都得在主线程上重算
+     *    90 项（`buildSections` / `buildFlatItems` / `notifyDataSetChanged` → ListView 整表
+     *    重排），手感和冷启动那次一样顿。用户的原话是「像是有个缓存，缓存一到就重新加载」，
+     *    说的就是这条 TTL 到期后的重算（`CATALOG_TTL_MS = 10s`）。
+     * 2. **重读延后 [CATALOG_REFRESH_DELAY_MS] 再起**。`AppCatalog.load` 要给每个应用解析
+     *    图标再裁圆角，是几百毫秒的 CPU 活；它跟面板**构造 + 开场动画**挤在同一瞬间时，
+     *    主线程会被抢帧——这正是「会停一下然后才出来」。错开之后面板先顺顺当当出来，
+     *    目录在后台慢慢读，读完（且真的变了）才动列表。
      */
     private fun refreshCatalogInBackground() {
         if (catalogRefreshing) return
         catalogRefreshing = true
-        worker.execute {
-            val catalog = AppCatalog.load(this)
-            handler.post {
-                catalogRefreshing = false
-                appEntries = catalog
-                allApps = toolEntries + catalog
-                catalogLoadedAt = android.os.SystemClock.elapsedRealtime()
-                // 固定的应用可能已被卸载：重算一次，免得扇形里留一个点不动的格子。
-                applyPins()
-                drawerView?.updateApps(catalog)
-            }
-        }
+        handler.postDelayed(
+            {
+                worker.execute {
+                    val catalog = AppCatalog.load(this)
+                    handler.post {
+                        catalogRefreshing = false
+                        catalogLoadedAt = android.os.SystemClock.elapsedRealtime()
+                        if (sameCatalog(catalog, appEntries)) {
+                            DebugLog.info("DRAWER_CATALOG_SAME", "应用目录没变，跳过重画")
+                            return@post
+                        }
+                        appEntries = catalog
+                        allApps = toolEntries + catalog
+                        // 固定的应用可能已被卸载：重算一次，免得扇形里留一个点不动的格子。
+                        applyPins()
+                        drawerView?.updateApps(catalog)
+                    }
+                }
+            },
+            CATALOG_REFRESH_DELAY_MS,
+        )
+    }
+
+    /**
+     * 两份应用目录「看上去一样」吗。
+     *
+     * **只比 `component` 与 `label`**：图标由 component（加上图标包设置）唯一决定，而重读出来的
+     * `Bitmap` 几乎每次都是**新对象**（`Bitmap` 不重写 `equals`，比的是引用），拿整个
+     * [AppEntry] 去 `equals` 等于永远判「变了」、优化直接失效。
+     */
+    private fun sameCatalog(a: List<AppEntry>, b: List<AppEntry>): Boolean {
+        if (a.size != b.size) return false
+        return a.indices.all { a[it].component == b[it].component && a[it].label == b[it].label }
     }
 
     /**
@@ -933,9 +958,14 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     /** 真正把面板建出来（应用目录已经确保是新的）。 */
     private fun showDrawerNow() {
+        // 逐段计时。用户报「第一次呼出能卡一秒多、不是行云流水」，但一秒可能是**构造**、
+        // 也可能是 **addView 建窗口**，两者的修法完全不同——先量再说，别猜。
+        // 刻意绕开 DebugLog 的开关直写 logcat：这条是要用户复现一次就能拿到的证据。
+        val tStart = android.os.SystemClock.elapsedRealtime()
         // 先清干净：这一路上有好几条异步路径（目录刷新完回来、启动应用前的延迟）都能走到这里，
         // 不先撤掉旧的就会叠出「关了上面那个、下面还有一个」的僵尸面板。
         hideDrawer()
+        val tHidden = android.os.SystemClock.elapsedRealtime()
         if (appEntries.isEmpty() && toolEntries.isEmpty()) {
             DebugLog.warn("DRAWER_EMPTY", "应用列表与工具都为空")
             return
@@ -995,6 +1025,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 )
                 return
             }
+        val tBuilt = android.os.SystemClock.elapsedRealtime()
         // 面板窗口铺满整屏，卡片画在内部居中；点卡片外的遮罩即关闭。
         // 关键：加 FLAG_NOT_FOCUSABLE——否则面板窗口抢走输入焦点，角落触摸条收不到触摸，
         // 「轮盘呼不出」；而 modal（不加 NOT_TOUCH_MODAL）则让点卡片外能关闭。
@@ -1017,6 +1048,14 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         try {
             windowManager.addView(panel, params)
             drawerPanels += panel
+            // 呼出性能打点（见 [showDrawerNow] 开头）。单位 ms，都是 elapsedRealtime 的**绝对值**，
+            // 和 AppDrawerPanel 里那几条 `PERF_*` 直接相减就是各段耗时。
+            android.util.Log.i(
+                "FlymeFreeformNoRoot",
+                "PERF_DRAWER hide=${tHidden - tStart} build=${tBuilt - tHidden} " +
+                    "addView=${android.os.SystemClock.elapsedRealtime() - tBuilt} " +
+                    "ts=${System.currentTimeMillis()}",
+            )
             DebugLog.info(
                 "DRAWER_SHOWN",
                 "应用 ${appEntries.size} 个 · 工具 ${toolEntries.size} 个",
@@ -1049,6 +1088,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     // ---- 手势回调（主线程） ----
 
     override fun onGestureStart(side: CornerSide) {
+        // 呼出性能链路的**起点**：手指落在角落的那一刻。见 [showDrawerNow] 开头的说明。
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "PERF_GESTURE_START side=$side ts=${System.currentTimeMillis()}",
+        )
         // 新一次手势开始：先把上次可能残留的「手势排除暂停」清干净。
         // 上一次手势如果在轮盘里点了应用、被小窗弹出打断，收尾回调可能根本没跑到，
         // 残留的状态会让系统继续把这个角落的滑动当成自己的手势——于是就「呼不出来了」。
@@ -1060,6 +1104,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     override fun onGestureActivate(side: CornerSide, cornerX: Float, cornerY: Float) {
+        // 判定为「呼出」、触摸条/轮盘开始展开的时刻。
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "PERF_GESTURE_ACTIVATE side=$side ts=${System.currentTimeMillis()}",
+        )
         expandTrigger(side, true)
         showMenu(side)
     }
@@ -1750,14 +1799,6 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     companion object {
         private const val CHANNEL_ID = "noroot_corner_gesture"
 
-        /**
-         * 静默渠道（见 [createNotificationChannel]）。
-         *
-         * **必须是另一个 id**：渠道的重要性在创建之后由用户 / 系统说了算，应用再改也只会被
-         * 忽略（改了等于没改）。所以要换观感只能换一条新渠道。
-         */
-        private const val CHANNEL_ID_QUIET = "noroot_corner_gesture_quiet"
-
         private const val NOTIFICATION_ID = 1001
 
         /**
@@ -1789,10 +1830,19 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         /**
          * 应用目录的保鲜期。
          *
-         * 超过它，下次打开「更多」面板就先重读一遍再把面板画出来——这样刚装好的应用立刻就能
-         * 出现在列表里，而不用重启服务。代价是多等一次 PackageManager 查询（几十毫秒）。
+         * 超过它，下次打开「更多」面板时会在**后台**重读一遍（面板照旧用手头这份立刻显示），
+         * 读回来若真的变了再就地换掉——这样刚装好的应用不用重启服务也会自己冒出来。
+         * 见 [refreshCatalogInBackground]。
          */
         private const val CATALOG_TTL_MS = 10_000L
+
+        /**
+         * 后台重读应用目录的起跑延迟（ms）。
+         *
+         * 让它**错开面板的构造与开场动画**：`AppCatalog.load` 要给每个应用解析图标再裁圆角，
+         * 几百毫秒的 CPU 活，和开场挤在一起就是「点了之后停一下才出来」。
+         */
+        private const val CATALOG_REFRESH_DELAY_MS = 700L
 
         private const val DRAWER_LAUNCH_DELAY_MS = 180L
 

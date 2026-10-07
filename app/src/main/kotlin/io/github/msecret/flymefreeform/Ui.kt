@@ -2,6 +2,7 @@ package io.github.msecret.flymefreeform
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -196,15 +197,15 @@ object Ui {
     /**
      * 尺寸基准：以 400dp 短边的屏幕为设计基准，其它屏幕按短边比例等比缩放。
      *
-     * 这样大屏 / 小屏上元素占屏幕的比例一致，不会「大屏显得小、小屏显得挤」。
+     * 实际算出来的是 [CornerGeometry.designShortEdgePx] —— 它用的是 **dp 短边**口径，
+     * 并且**把大屏的放大封了顶**（见那里的说明）。早先这里直接拿短边**像素**当基数，
+     * 手机上凑巧对（1272px ÷ 3.5 ≈ 363dp ≈ 400dp），平板就被放大 2.29 倍，
+     * 条目巨大、底栏顶到天花板。
      */
     private const val BASE_SHORT_EDGE_DP = 400f
 
-    private fun shortEdge(context: Context): Float =
-        min(
-            context.resources.displayMetrics.widthPixels,
-            context.resources.displayMetrics.heightPixels,
-        ).toFloat()
+    /** 等效短边（px），见 [CornerGeometry.designShortEdgePx]。 */
+    private fun shortEdge(context: Context): Float = CornerGeometry.designShortEdgePx(context)
 
     /** 按屏幕短边比例算尺寸（px）。参数是「400dp 屏上的 dp 值」。 */
     internal fun dp(context: Context, value: Int): Int =
@@ -257,6 +258,10 @@ object Ui {
      *
      * [ScrollView.setFillViewport] 打开：内容比屏幕矮时根容器也会被拉到整屏高，
      * 底色因此能铺满，不会在下方露出一条白。
+     *
+     * **内容一律铺满宽度、不设上限**：早先在这里（以及 [TabbedPage]）给大屏加过「收进
+     * 640dp 居中窄列」的限宽，实机（平板 3392×2400）一看是**左右各空出 278dp**，
+     * 观感就是「组件没贴边」——用户直接否掉了。大屏要的是**用满**这块屏，不是把它裁成手机。
      */
     fun scrollPage(context: Context, content: View): ScrollView =
         ScrollView(context).apply {
@@ -921,7 +926,8 @@ class TabItem(val title: String, val iconRes: Int)
  * | --- | --- |
  * | 位置 | **贴屏幕底部**；上方一条 **1dp** outline 分隔线把它和内容分开 |
  * | 布局 | 横向**等宽平分**（不用自适应宽，否则切换时标签会左右跳）；每格整格可点 |
- * | 格内 | **图标在上、文字在下**（[ICON_DP] / 文字 12sp），整格垂直居中 |
+ * | 格内 | **图标在上、文字在下**（[ICON_DP] / [LABEL_SP]），整格垂直居中 |
+ * | 高度 | 竖屏整条约 **64dp**（手机）；横屏再乘 [COMPACT_SCALE] 收一档 |
  * | 选中 | `primaryContainer` 药丸底**只裹住图标** + `onPrimaryContainer` 图文 + medium 字重 |
  * | 未选 | 无底，`onSurfaceVariant` 图文 |
  * | 按压 | 水波纹同样是那颗药丸的范围，不铺满整格 |
@@ -984,6 +990,19 @@ class TabStrip(
     /** 当前高亮项；`-1` = 还没选过。 */
     private var selected = -1
 
+    /**
+     * 横屏时整套尺寸的收缩系数，见 [COMPACT_SCALE]。
+     *
+     * 在构造期读一次就够：配置变化会重建 Activity（`MainActivity` 没有声明 `configChanges`），
+     * 这个 View 跟着重建。
+     */
+    private val compactScale: Float =
+        if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+            COMPACT_SCALE
+        } else {
+            1f
+        }
+
     init {
         orientation = VERTICAL
 
@@ -1004,7 +1023,7 @@ class TabStrip(
                 TextView(context).apply {
                     text = item.title
                     gravity = Gravity.CENTER
-                    setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(context, 12f))
+                    setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(LABEL_SP))
                     maxLines = 1
                 }
             // 药丸只裹图标：它就是 M3 navigation bar 的 indicator，尺寸固定在
@@ -1013,28 +1032,19 @@ class TabStrip(
                 FrameLayout(context).apply {
                     addView(
                         icon,
-                        FrameLayout.LayoutParams(
-                            Ui.dp(context, ICON_DP),
-                            Ui.dp(context, ICON_DP),
-                            Gravity.CENTER,
-                        ),
+                        FrameLayout.LayoutParams(dp(ICON_DP), dp(ICON_DP), Gravity.CENTER),
                     )
                 }
             val cell =
                 LinearLayout(context).apply {
                     orientation = VERTICAL
                     gravity = Gravity.CENTER_HORIZONTAL
-                    // 上下内边距把格子撑到 ~60dp：图标多了之后底栏本来就该高一点，
-                    // 手指点起来也不费劲。
-                    setPadding(Ui.dp(context, 4), Ui.dp(context, 7), Ui.dp(context, 4), Ui.dp(context, 7))
-                    addView(
-                        pill,
-                        LayoutParams(Ui.dp(context, PILL_WIDTH_DP), Ui.dp(context, PILL_HEIGHT_DP)),
-                    )
+                    setPadding(dp(CELL_PAD_H), dp(CELL_PAD_V), dp(CELL_PAD_H), dp(CELL_PAD_V))
+                    addView(pill, LayoutParams(dp(PILL_WIDTH_DP), dp(PILL_HEIGHT_DP)))
                     addView(
                         label,
                         LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-                            topMargin = Ui.dp(context, LABEL_GAP_DP)
+                            topMargin = dp(LABEL_GAP_DP)
                         },
                     )
                     // 触摸区是**整格**；水波纹的可视范围就是那颗药丸（见类注释）。
@@ -1117,7 +1127,7 @@ class TabStrip(
      * 屏幕上看得见的下方空隙正好也是 slack/2。
      */
     private fun setGap(systemBottom: Int) {
-        val slack = Ui.dp(context, if (systemBottom > 0) SLACK_DP else SLACK_FALLBACK_DP)
+        val slack = dp(if (systemBottom > 0) SLACK_DP else SLACK_FALLBACK_DP)
         // 刻意绕开 DebugLog 的开关直接写 logcat：**窗口 inset 是排版前提**，以后凡是
         // 「底栏位置不对 / 被手势条压住」，第一件事都是看这一行。它只在 attach 与 inset
         // 变化时打，不会刷屏（旋转、切导航方式、弹键盘才各来一次）。
@@ -1174,34 +1184,63 @@ class TabStrip(
      */
     private fun pillShape(color: Int): GradientDrawable =
         GradientDrawable().apply {
-            cornerRadius = Ui.dp(context, PILL_HEIGHT_DP / 2).toFloat()
+            cornerRadius = dp(PILL_HEIGHT_DP / 2).toFloat()
             setColor(color)
         }
 
+    /**
+     * 底栏自己的一把尺子：先按屏幕缩放（[Ui.dpF]），横屏再**整体收一档**。
+     *
+     * 横屏的手机屏高只有 363dp，底栏按竖屏那一套排下来要占掉近四分之一屏——用户反馈的
+     * 「底栏太大」在横屏里最刺眼。所以横屏整套尺寸（图标、药丸、内边距、留白、字号）乘
+     * [COMPACT_SCALE]，**版面结构不变**、只是等比收小。
+     */
+    private fun dp(value: Int): Int = Ui.dpF(context, value * compactScale).toInt()
+
+    /** 同 [dp]，给字号用（sp 与 dp 在 [Ui] 里同一口径）。 */
+    private fun sp(value: Float): Float = Ui.sp(context, value * compactScale)
+
     private companion object {
         /**
-         * 内容上下**合计**的呼吸量（一半在上、一半在下）。**系统报得出底栏高度时**用这一档。
+         * 横屏时整套底栏尺寸再乘的系数。
+         *
+         * 0.82 是「明显小一圈但还点得着」的位置：再小图标和文字就开始糊，
+         * 再大横屏底栏又会顶回两成屏高。
          */
-        const val SLACK_DP = 28
+        const val COMPACT_SCALE = 0.82f
 
         /**
-         * 系统**报不出**底栏高度时的兜底呼吸量。
+         * 内容上下**合计**的呼吸量（一半在上、一半在下）。**系统报得出底栏高度时**用这一档。
+         *
+         * 从 28 收到 14：这几档留白是底栏「高」的主要来源，而用户连着两轮要的就是它矮下来。
+         */
+        const val SLACK_DP = 14
+
+        /**
+         * 系统**报不出**底栏高度时的兜底呼吸量（从 36 收到 18，理由同上）。
          *
          * `targetSdk 37` 下窗口本来就画到系统栏底下，正常该由 inset 把这一段让出来；但 inset
          * 也可能在传递途中被别处消费掉、到这一层已经是 0（本机实测三个来源全是 0）。那时如果
          * 只留 [SLACK_DP] 这么一点，底栏就贴住了屏幕底、被手势条压着。
          */
-        const val SLACK_FALLBACK_DP = 36
+        const val SLACK_FALLBACK_DP = 18
 
         /** 图标边长；药丸比它大一圈，正好是 M3 indicator 的观感。 */
-        const val ICON_DP = 24
+        const val ICON_DP = 22
 
-        /** 选中药丸（也就是 M3 的 indicator）的尺寸。宽度沿用 M3 navigation bar 的 64dp。 */
-        const val PILL_WIDTH_DP = 64
-        const val PILL_HEIGHT_DP = 32
+        /** 选中药丸（也就是 M3 的 indicator）的尺寸。 */
+        const val PILL_WIDTH_DP = 52
+        const val PILL_HEIGHT_DP = 26
 
         /** 图标与文字之间那一线空隙。 */
-        const val LABEL_GAP_DP = 3
+        const val LABEL_GAP_DP = 2
+
+        /** 标签字号（设计 sp）。 */
+        const val LABEL_SP = 11f
+
+        /** 格子的内边距：横向撑开触摸区，纵向只留一点点——底栏的高度主要不该喂给这里。 */
+        const val CELL_PAD_H = 4
+        const val CELL_PAD_V = 5
 
         /** logcat 标签，与 [DebugLog] 用同一个，便于一条 `-s` 全捞出来。 */
         const val TAG = "FlymeFreeformNoRoot"
@@ -1283,6 +1322,7 @@ class TabbedPage(
                     setBackgroundColor(Ui.COLOR_SURFACE)
                     // 内容比屏幕矮时也把根容器拉到整屏高，底色才能铺满（同 [Ui.scrollPage]）。
                     isFillViewport = true
+                    // 宽度铺满、不限宽（理由见 [Ui.scrollPage]）。
                     addView(content)
                 }
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))

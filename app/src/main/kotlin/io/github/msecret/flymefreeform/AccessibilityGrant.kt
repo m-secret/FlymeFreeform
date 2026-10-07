@@ -35,7 +35,14 @@ object AccessibilityGrant {
     fun component(context: Context): ComponentName =
         ComponentName(context, FreeformAccessibilityService::class.java)
 
-    /** 系统名单里有没有我们（不依赖服务是否活着）。 */
+    /**
+     * 系统名单里有没有我们（不依赖服务是否活着）。
+     *
+     * ⚠️ **只当诊断看，别拿它做判据。** ColorOS 会瞬时把本服务从这条设置里抹掉（见
+     * [FreeformAccessibilityService.isEnabledInSettings]），据此判断「没开」会白白写一次设置，
+     * 而每次写都会让 ColorOS 弹一次「检测到…获取无障碍权限」。要判断开没开，用
+     * `FreeformAccessibilityService.isEnabledInSettings(context)`（见 [restoreIfMissing]）。
+     */
     fun isListed(context: Context): Boolean {
         val raw = runCatching {
             Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
@@ -84,23 +91,64 @@ object AccessibilityGrant {
     }
 
     /**
-     * 「名单里没有我们就写回去」——只在这种情况下动手。
+     * 「系统认定我们没开」时才写回去——而且**判据用权威那一路，并带冷却**。
      *
-     * 名单里**有**、只是服务没连上，那是另一类问题（系统还没 bind、或进程刚被杀），
-     * 这时候乱写设置反而可能把一个正常配置改坏。
+     * ## 为什么不能用 [isListed]（读 Secure 原始串）当判据
      *
-     * 调用时机：Shizuku binder 回来的时候（开机后 Shizuku 服务就绪那一刻）。
+     * 这是 2026-10-08 用户报的「**为什么总是提示检测到 Flyme 小窗获取无障碍权限**」的根因。
+     *
+     * 系统里那条 `enabled_accessibility_services` **不能当真**：ColorOS 会瞬时把本服务从里面
+     * 抹掉（见 `FreeformAccessibilityService.isEnabledInSettings` 的注释），几十秒后又自己写回来。
+     * 而**每一次** `settings put` 都会让系统记一笔「本应用刚获得无障碍权限」
+     * （`AccessibilityManagerServiceExtImpl: uploadCollectData … type=AccessibilityEnablePkgName`），
+     * ColorOS 安全中心（`com.oplus.securitypermission`）于是**弹一次**「检测到…获取无障碍权限」。
+     *
+     * 真机上这个误判极密集：轨迹文件（`files/a11y-trace.log`）里 30 分钟出现 **10 次**
+     * `GRANT_AUTO → GRANT_RESTORE`，而每次紧跟着的那行 `BOOT … 无障碍已开=true` 都说明
+     * **权威判据本来就认为「已启用」**——也就是说这 10 次写入全是白写，纯属自己弹自己。
+     *
+     * 所以判据换成 [FreeformAccessibilityService.isEnabledInSettings]（它除了读那条原始串，
+     * 还会问 `AccessibilityManager.getEnabledAccessibilityServiceList()`，正是 `dumpsys
+     * accessibility` 里 `Enabled services:` 的来源），外加「已经连上就绝不动手」。
+     *
+     * ## 冷却
+     *
+     * 即便真到了「确实没开」那一步，也不要每次进程启动都重写一遍：那同样会反复弹提示。
+     * 记录上一次**自动**写回的时刻（[SettingsStore.lastAutoA11yGrantAt]），冷却期内直接跳过。
+     * 用户主动点的那些入口（磁贴 / 设置页那个药丸）走 [restore]，**不受冷却限制**。
      *
      * @return true 表示确实动手写了。
      */
     fun restoreIfMissing(context: Context): Boolean {
-        if (isListed(context)) {
-            DebugLog.info("A11Y_GRANT_OK", "系统名单里已经有本服务，不用动")
+        if (FreeformAccessibilityService.isConnected ||
+            FreeformAccessibilityService.isEnabledInSettings(context)
+        ) {
+            DebugLog.info("A11Y_GRANT_OK", "无障碍已连上 / 系统认定已启用，不写设置")
             return false
         }
-        A11yTrace.append(context, "GRANT_AUTO 名单里没有本服务，尝试用 Shizuku 写回")
-        return restore(context)
+        val store = SettingsStore(context)
+        val since = System.currentTimeMillis() - store.lastAutoA11yGrantAt
+        if (since in 0 until AUTO_RESTORE_COOLDOWN_MS) {
+            DebugLog.info(
+                "A11Y_GRANT_COOLDOWN",
+                "距上次自动写回 ${since / 1000}s，冷却中（${AUTO_RESTORE_COOLDOWN_MS / 60000} 分钟内不再写）",
+            )
+            return false
+        }
+        A11yTrace.append(context, "GRANT_AUTO 系统认定本服务没开，尝试用 Shizuku 写回")
+        val ok = restore(context)
+        // 只有写成功了才记冷却：写失败（没 Shizuku / 命令被拒）不该把下一次机会一起吃掉。
+        if (ok) store.lastAutoA11yGrantAt = System.currentTimeMillis()
+        return ok
     }
+
+    /**
+     * 自动写回的冷却时长。
+     *
+     * 10 分钟：短到「开机后权限真被清掉」能及时修回来（开机广播本来也不会密集重放），
+     * 长到足以把「同一段时间内反复误判 → 反复写 → 反复弹安全提示」压成一次。
+     */
+    private const val AUTO_RESTORE_COOLDOWN_MS = 10 * 60 * 1000L
 
     /** 用 Shizuku **关掉**本服务（写名单时把我们从列表里摘掉）。 */
     fun revoke(context: Context): Boolean {

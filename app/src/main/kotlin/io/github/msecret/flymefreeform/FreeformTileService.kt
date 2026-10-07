@@ -60,20 +60,22 @@ class FreeformTileService : TileService() {
     /** 按当前状态刷新磁贴：能用了是实心，不能用是空心 + 副标题写明原因。 */
     private fun refreshTile() {
         val tile = qsTile ?: return
-        val listed = AccessibilityGrant.isListed(this)
+        // 判据用**权威那一路**（`AccessibilityManager`），不要读那条 Secure 原始串：
+        // ColorOS 会瞬时把本服务从里面抹掉，读它就会把「其实开着、只是没连上」说成「被关了」。
+        val enabled = FreeformAccessibilityService.isEnabledInSettings(this)
         val connected = FreeformAccessibilityService.isConnected
         tile.state = if (connected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.label = "免root小窗"
         tile.subtitle =
             when {
                 connected -> "无障碍已就绪"
-                listed -> "服务未连上，点一下修复"
+                enabled -> "服务未连上，点一下修复"
                 else -> "无障碍被关了，点一下修复"
             }
         runCatching { tile.icon = Icon.createWithResource(this, R.mipmap.ic_launcher_round) }
             .onFailure { runCatching { tile.icon = Icon.createWithResource(this, R.mipmap.ic_launcher) } }
         runCatching { tile.updateTile() }
-        DebugLog.info("TILE_REFRESH", "listed=$listed connected=$connected")
+        DebugLog.info("TILE_REFRESH", "enabled=$enabled connected=$connected")
     }
 
     private fun openApp() {
