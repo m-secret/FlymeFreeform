@@ -1184,13 +1184,23 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 按**点击坐标**在一屏自由窗里认出「用户点的是哪一扇的窗外」。
+     * 在一屏自由窗里认出「这次该关哪一扇」。
      *
-     * 判据是**到窗口边框的距离**（点在某扇窗里就算 0）：把落点归给最近的那一扇。
-     * 平手时优先拿焦点的——那通常就是用户刚刚在用的那扇。
+     * **规则（2026-10-07 用户明确要求）**：**有焦点就关有焦点的那扇**；一扇都没有焦点时，
+     * **按「打开最晚 → 最早」**，也就是 [lastFreeformWindows] 的顺序——无障碍窗口表是 z 序，
+     * 最新开的那扇排在最前面。用户原话：「关闭的顺序是关最早开的，这个和不对，应该关最后开的」。
      *
-     * 这是「点哪扇关哪扇」的核心。屏上只有一扇时它的结果与旧的全局 best 完全一致，
-     * 所以单窗场景不会因为这个判据而变化。
+     * 真机验证（平板 `b37664b8`，按 计算器 → 时钟 → 设置 的顺序打开）：
+     * `WINDOW_SCAN` 的顺序是 `设置(focused=true) → 时钟 → 计算器`，**最新的排最前** ✓。
+     *
+     * ★ 这条**取代**了早先的「按点击坐标取最近的那扇」
+     * （`minWithOrNull(compareBy({ 到落点的距离 }, { 焦点 }))`）。那一版是为了修
+     * 「点右边那扇的窗外却关了左边那扇」加的，但它带来另一个后果：几扇窗叠在一起时，
+     * **离窗外落点最近的那扇常常是摆得最早的那扇**，于是「依次关闭」变成了
+     * 「从最早的开始关」——正是用户这次报的问题。旧写法在 git 历史里
+     * （`d59694b` 之前的 `resolveCloseTarget`），要回退照它抄即可。
+     *
+     * 落点 (x,y) 现在**只用于记日志**，不再参与选目标。
      */
     private fun resolveCloseTarget(x: Float, y: Float): FreeformWindow? {
         val list = lastFreeformWindows
@@ -1200,17 +1210,15 @@ class FreeformAccessibilityService : AccessibilityService() {
         val scan = list.joinToString(" ") { w ->
             "${w.pkg ?: "?"}${if (w.focused) "*" else ""}距离=${rectGapToPoint(w.bounds, px, py)}${w.bounds.toShortString()}"
         }
-        val picked =
-            list.minWithOrNull(
-                compareBy({ rectGapToPoint(it.bounds, px, py) }, { if (it.focused) 0 else 1 }),
-            )
-        if (picked != null) {
-            DebugLog.info(
-                "OUTSIDE_TAP_TARGET",
-                "落点($px,$py) → 目标=${picked.pkg ?: "未知"} ${picked.bounds.toShortString()} " +
-                    "有焦点=${picked.focused}（屏上 ${list.size} 扇：$scan）",
-            )
-        }
+        // 有焦点关焦点；都没焦点时 list 的第一个就是「打开最晚」的那扇。
+        val focused = list.firstOrNull { it.focused }
+        val picked = focused ?: list.first()
+        DebugLog.info(
+            "OUTSIDE_TAP_TARGET",
+            "落点($px,$py) → 目标=${picked.pkg ?: "未知"} ${picked.bounds.toShortString()} " +
+                "有焦点=${picked.focused} 依据=${if (focused != null) "焦点窗" else "打开最晚"}" +
+                "（屏上 ${list.size} 扇：$scan）",
+        )
         return picked
     }
 
@@ -1236,12 +1244,23 @@ class FreeformAccessibilityService : AccessibilityService() {
             kotlin.math.abs(a.right - b.right) +
             kotlin.math.abs(a.bottom - b.bottom)
 
-    /** 每边差都不超过 [slack] 才算这两个矩形是同一扇窗（见 [CLOSE_SAME_SLACK_PX]）。 */
+    /** 每边差都不超过 [slack] 才算这两个矩形是同一扇窗（见 [CLOSE_SAME_SLACK_DP]）。 */
     private fun withinSlack(a: Rect, b: Rect, slack: Int): Boolean =
         kotlin.math.abs(a.left - b.left) <= slack &&
             kotlin.math.abs(a.top - b.top) <= slack &&
             kotlin.math.abs(a.right - b.right) <= slack &&
             kotlin.math.abs(a.bottom - b.bottom) <= slack
+
+    /**
+     * [CLOSE_SAME_SLACK_DP] 的像素值。
+     *
+     * 这两个容差**必须过一遍 dp 换算**，不能像早先那样直接写死 48px——理由见两个常量自己的
+     * 说明：它们要和「两扇窗之间的实际间距」比大小，而间距是屏幕尺寸的函数。
+     */
+    private val closeSameSlackPx: Int get() = CornerGeometry.dp(this, CLOSE_SAME_SLACK_DP)
+
+    /** [CLOSE_CAPTION_SLACK_DP] 的像素值。 */
+    private val closeCaptionSlackPx: Int get() = CornerGeometry.dp(this, CLOSE_CAPTION_SLACK_DP)
 
     /**
      * 把「发起那一刻算出的目标」对齐到**最新一次布局**里的同一扇窗。
@@ -1254,7 +1273,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (list.isEmpty()) return null
         val pkg = target.pkg
         if (pkg != null) {
-            list.firstOrNull { it.pkg == pkg && withinSlack(it.bounds, target.bounds, CLOSE_SAME_SLACK_PX) }
+            list.firstOrNull { it.pkg == pkg && withinSlack(it.bounds, target.bounds, closeSameSlackPx) }
                 ?.let { return it }
             list.firstOrNull { it.pkg == pkg }?.let { return it }
         }
@@ -1265,14 +1284,14 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 本次关闭的目标窗在**最新一次布局**里的矩形；已经不在屏上返回 null。
      *
      * 「还有自由窗」不等于「没关掉」——屏上可能还开着另一扇。按**身份**判断：
-     * 包名认得出就必须一致，边界每边差不超过 [CLOSE_SAME_SLACK_PX] 才算同一扇。
+     * 包名认得出就必须一致，边界每边差不超过 [closeSameSlackPx] 才算同一扇。
      */
     private fun currentTargetBounds(): Rect? {
         val want = closeTargetBounds ?: return null
         val targetPkg = closeTargetPackage
         for (w in lastFreeformWindows) {
             if (targetPkg != null && w.pkg != null && w.pkg != targetPkg) continue
-            if (withinSlack(w.bounds, want, CLOSE_SAME_SLACK_PX)) return w.bounds
+            if (withinSlack(w.bounds, want, closeSameSlackPx)) return w.bounds
         }
         // 边界对不上，但**同包的窗还在屏上** —— 它只是被系统缩放/回弹了，并没有关掉。
         // 必须把它的**当前**矩形交出去，让 [recheck] 走到「补刀」那条路。若在这里返回 null，
@@ -1566,12 +1585,12 @@ class FreeformAccessibilityService : AccessibilityService() {
         return point
     }
 
-    /** 坐标是否落在（或紧贴）小窗里。给 [CLOSE_CAPTION_SLACK_PX] 的余量容错。 */
+    /** 坐标是否落在（或紧贴）小窗里。给 [closeCaptionSlackPx] 的余量容错。 */
     private fun nearFreeform(point: android.graphics.Point, bounds: Rect): Boolean =
-        point.x >= bounds.left - CLOSE_CAPTION_SLACK_PX &&
-            point.x <= bounds.right + CLOSE_CAPTION_SLACK_PX &&
-            point.y >= bounds.top - CLOSE_CAPTION_SLACK_PX &&
-            point.y <= bounds.bottom + CLOSE_CAPTION_SLACK_PX
+        point.x >= bounds.left - closeCaptionSlackPx &&
+            point.x <= bounds.right + closeCaptionSlackPx &&
+            point.y >= bounds.top - closeCaptionSlackPx &&
+            point.y <= bounds.bottom + closeCaptionSlackPx
 
     // ---- 在小横条上注入手势 ----
 
@@ -1598,8 +1617,19 @@ class FreeformAccessibilityService : AccessibilityService() {
             minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
         // 距离与时长都可由用户在设置页调：判定「快速上滑」的阈值各家 ROM 不一样，写死就会
         // 出现「先缩一下再关」（被当成拖动）或「滑了没反应」（太短）。
-        val distance = (shortEdge * store.closeSwipeDistancePercent / 100f) *
-            (if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f)
+        //
+        // ★ 距离另加一条**绝对下限** [MIN_CLOSE_SWIPE_DP]。百分比是按屏幕短边算的，
+        // 而 ColorOS 判「快速上滑」用的是 `minDistanceDp = 75`（系统日志原文，
+        // 与 `quickSwipeMinDis=197px` 在平板上恰好对上：75dp × 2.625 ≈ 197px）——
+        // 低于它一律判成「缩小回弹」＝用户说的「缩一下就停住」。
+        // 平时够不着这条下限（默认 40%：平板 960px、手机 509px），但设置项允许拉到
+        // 4%（`MIN_CLOSE_SWIPE_DISTANCE`），那在平板上只有 96px ≈ 36dp，**必然回弹**。
+        val floor = CornerGeometry.dp(this, MIN_CLOSE_SWIPE_DP).toFloat()
+        val distance = maxOf(
+            (shortEdge * store.closeSwipeDistancePercent / 100f) *
+                (if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f),
+            floor,
+        )
         val durationMs = store.closeSwipeDurationMs
 
         // 「先确保目标窗是焦点窗」那一步已经提到 [performCloseMode] 开头了——它对**所有**
@@ -1655,7 +1685,7 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 找不到对应窗口时返回 false：身份都对不上就别乱点。
      */
     private fun needsFocusBeforeSwipe(bounds: Rect): Boolean {
-        val me = lastFreeformWindows.firstOrNull { withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+        val me = lastFreeformWindows.firstOrNull { withinSlack(it.bounds, bounds, closeSameSlackPx) }
             ?: return false
         return !me.focused
     }
@@ -1721,7 +1751,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         val inset = CornerGeometry.dp(this, ACTIVATION_INSET_DP)
         val others =
             lastFreeformWindows
-                .filter { !withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+                .filter { !withinSlack(it.bounds, bounds, closeSameSlackPx) }
                 .map { it.bounds }
         // 自上而下、左右交替各试几个点，取第一个「在窗口内、且不被别的窗盖住」的。
         val offsets = intArrayOf(inset, inset * 2, inset * 3)
@@ -1785,7 +1815,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         val y = point.second.toInt()
         val covered =
             lastFreeformWindows
-                .filter { !withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+                .filter { !withinSlack(it.bounds, bounds, closeSameSlackPx) }
                 .any { it.bounds.contains(x, y) }
         if (covered) {
             DebugLog.info(
@@ -1810,7 +1840,7 @@ class FreeformAccessibilityService : AccessibilityService() {
             if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
             if (!w.isFocused) continue
             val b = Rect().also { w.getBoundsInScreen(it) }
-            if (withinSlack(b, bounds, CLOSE_SAME_SLACK_PX)) return true
+            if (withinSlack(b, bounds, closeSameSlackPx)) return true
         }
         return false
     }
@@ -2273,17 +2303,28 @@ class FreeformAccessibilityService : AccessibilityService() {
          */
         private const val CLOSING_TIMEOUT_MS = 2_500L
 
-        /** 校验「学到的小横条坐标」是否属于当前小窗时给的容错余量（px）。 */
-        private const val CLOSE_CAPTION_SLACK_PX = 48
+        /**
+         * 校验「学到的小横条坐标」是否属于当前小窗时给的容错余量。
+         *
+         * **用 dp 不用 px**：这个余量要和「两扇小窗之间的实际间距」比大小，而那个间距跟着
+         * **屏幕尺寸**走、不跟密度走。写成 48px 时，密度 3 的机器上是 16dp，密度 2 的小屏机器
+         * 上却是 24dp——小屏上两扇窗可能只差三四十像素，余量反而更大，会把隔壁那扇窗的坐标
+         * 认成这一扇的。取 16dp，在两台真机上正好复现原来的 48px。
+         */
+        private const val CLOSE_CAPTION_SLACK_DP = 16
 
         /**
-         * 判定「这是不是同一扇窗」时容许的每边偏差（px）。
+         * 判定「这是不是同一扇窗」时容许的每边偏差。
          *
          * 用「每边差」而不是「重叠比例」：两扇小窗尺寸相同、只差一个位置时重叠仍有 87%，
          * 按重叠算就会把**另一扇**当成「本次目标还在」，于是复检判「没关掉」再补一刀——
          * 用户看到的是「一关关俩」。每边都贴近才算同一扇，才能把「另一扇」排除掉。
+         *
+         * **用 dp 不用 px**，理由同 [CLOSE_CAPTION_SLACK_DP]：这个余量必须小于两扇窗之间的
+         * 实际间距，而那个间距是屏幕尺寸的函数。真机实测间距：平板层叠 63px、手机层叠 84px
+         * （都约 24~28dp），16dp 留了足够余量。取 16dp 在两台真机上正好复现原来的 48px。
          */
-        private const val CLOSE_SAME_SLACK_PX = 48
+        private const val CLOSE_SAME_SLACK_DP = 16
 
         /** 关闭流程收尾后补的那一拍重排的延时（见 [finishCloseFlow]）。 */
         private const val MASK_RESTORE_EXTRA_MS = 250L
@@ -2332,6 +2373,17 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 平板竖屏那扇距屏底 1120px，怎么都够不着。见 [captionNearScreenBottom]。
          */
         private const val CAPTION_NEAR_BOTTOM_DP = 48
+
+        /**
+         * 关闭上滑距离的**绝对下限**（dp）。见 [swipeUpOnCaption] 里算距离那一段。
+         *
+         * ColorOS 判「快速上滑」的阈值是 `minDistanceDp = 75`（系统日志原文，平板上
+         * `quickSwipeMinDis=197px` 恰好等于 75dp × 2.625）。真机实测：192px(73dp) 回弹、
+         * 300px(114dp) 关闭。取 150dp 留出余量，同时远小于默认的 40% 短边
+         * （平板 960px、手机 509px），所以对现状零影响——它只在用户把设置项拉到很小
+         * （最低 4%）、或屏幕特别小的机器上才起作用。
+         */
+        private const val MIN_CLOSE_SWIPE_DP = 150
 
         /** 无障碍回退路径下，「点一下」的按压时长。 */
         private const val CLOSE_FOCUS_TAP_MS = 60L
