@@ -541,6 +541,25 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 跑着的时候才打开「隐藏状态栏通知」——那时静默渠道还不存在。往一条不存在的渠道发通知
         // 在 Android 8 以上是**静默丢弃**，前台服务因此会失去那条通知，后果比没通知严重得多。
         createNotificationChannel()
+        // 「不显示常驻通知」：**必须在 startForeground 之前**把 appops 设好。
+        //
+        // 顺序很关键——先 post 通知、再改 appops 是**没用**的：那条通知已经建好记录，
+        // 系统不会因为 appops 之后变成 ignore 就把它撤掉（真机实测：记录数一直是 1）。
+        // 所以这里同步跑，代价是一条 shell 命令（几百毫秒），且只在开关关掉时才有；
+        // Shizuku 没连上时它会立刻返回，不阻塞。
+        //
+        // 只在「要屏蔽」时写，反过来不写：开关是开着的却去写 allow，会**覆盖用户在系统设置里
+        // 的手动选择**——那是用户自己的决定，不该被我们改回去。
+        if (!store.showForegroundNotification) {
+            setNotificationBlocked(this, true)
+            // 还要把**上一次那条**撤掉。
+            //
+            // 系统只在「通知被 post 的那一刻」看 appops；把 appops 改成 ignore 之后，
+            // 已经挂出去的那条**不会**自己消失。用户点开关看到的就是「没反应，通知还在」。
+            // 用 `STOP_FOREGROUND_REMOVE` 而不是 `NotificationManager.cancel()`——它是官方撤
+            // 前台通知的方式，紧随其后的 `startForeground` 会把前台身份立刻接回去。
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
         val openApp =
             PendingIntent.getActivity(
                 this,
@@ -1873,6 +1892,43 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         fun stop(context: Context) {
             val intent = Intent(context, OverlayGestureService::class.java).setAction(ACTION_STOP)
             context.startService(intent)
+        }
+
+        /**
+         * 用 Shizuku 把本应用的通知**整体屏蔽 / 恢复**——设置里「完全不显示通知」的实现。
+         *
+         * ## 为什么只有这一条路
+         *
+         * Android 不允许应用自己把那条前台服务通知关掉。两条看似可行的路都试过（真机实测，
+         * 平板 `b37664b8` / Android 16）：
+         *
+         * - **删通知渠道**（让通知 post 不出去）：`startForeground` 会抛
+         *   `RemoteServiceException$CannotPostForegroundServiceNotificationException`
+         *   （`Bad notification for startForeground`），**服务当场崩溃**。别试。
+         * - **`NotificationManager.cancel()`**：撤掉已经 post 出去的通知，部分 ROM 会因此
+         *   判定服务失去前台身份（见 [createNotificationChannel] 的说明）。
+         *
+         * 而「通知被系统屏蔽」是**允许**的——它等价于用户在系统设置里关掉本应用的通知：
+         * 实测 `cmd appops set --uid <pkg> POST_NOTIFICATION ignore` 之后通知记录数为 0，
+         * 而 `dumpsys activity services` 里 `isForeground=true`、`foregroundId=1001` 照旧，
+         * 服务不崩也不被降级。Android 13 起官方也明确「用户拒绝通知权限时前台服务照常运行」。
+         *
+         * 只有 shell 身份写得动 appops，所以这一步需要 Shizuku。
+         *
+         * @return true 表示命令发出去了（不代表立刻生效，系统还要过一下）。
+         */
+        fun setNotificationBlocked(context: Context, blocked: Boolean): Boolean {
+            if (!ShizukuShell.hasPermission) return false
+            val mode = if (blocked) "ignore" else "allow"
+            val result =
+                ShizukuShell.run(
+                    "cmd appops set --uid ${context.packageName} POST_NOTIFICATION $mode",
+                )
+            DebugLog.info(
+                "NOTIFICATION_BLOCK",
+                "POST_NOTIFICATION=$mode 发出=${result.isSuccess}",
+            )
+            return result.isSuccess
         }
 
         /** 设置变化后重读配置。已运行则重启服务，未运行则忽略。 */

@@ -592,6 +592,26 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean(KEY_HIDE_NOTIFICATION, false)
         set(value) = preferences.edit().putBoolean(KEY_HIDE_NOTIFICATION, value).apply()
 
+    /**
+     * 要不要那条「主动呼出已开启」的**常驻通知**。默认**开**（保持原有行为）。
+     *
+     * 关掉它 = 通知栏里彻底没有这条通知。做法是把本应用的通知**整体屏蔽**
+     * （等价于用户在系统设置里关掉「允许通知」），靠 Shizuku 执行
+     * `cmd appops set --uid <pkg> POST_NOTIFICATION ignore` 做到——
+     * 见 `OverlayGestureService.setNotificationBlocked`，那里记着两条被实测否掉的路
+     * （**删通知渠道会让 `startForeground` 抛异常、服务当场崩溃**，别试）。
+     *
+     * 与 [hideForegroundNotification]（静默）的区别：那个只是把通知压到最低重要级、
+     * 变成可划掉，它**仍然躺在通知栏里**；这个是真的一点都不显示。
+     *
+     * 真机实测（平板 `b37664b8` / Android 16）：屏蔽之后通知记录数为 0，而
+     * `dumpsys activity services` 里 `isForeground=true`、`foregroundId=1001` 照旧，
+     * 服务不崩也不被降级。
+     */
+    var showForegroundNotification: Boolean
+        get() = preferences.getBoolean(KEY_SHOW_NOTIFICATION, true)
+        set(value) = preferences.edit().putBoolean(KEY_SHOW_NOTIFICATION, value).apply()
+
     /** 调试日志开关。默认关闭，只在排查问题时打开（否则 WINDOW_SCAN 等日志会刷爆）。 */
     var debugLogEnabled: Boolean
         get() = preferences.getBoolean(KEY_DEBUG_LOG, false)
@@ -856,6 +876,7 @@ class SettingsStore(context: Context) {
         private const val KEY_LANDSCAPE_PANEL_SIDE = "landscape_panel_side"
         private const val KEY_LANDSCAPE_SIDE_MIGRATED_AUTO = "landscape_side_migrated_to_auto"
         private const val KEY_HIDE_NOTIFICATION = "hide_foreground_notification"
+        private const val KEY_SHOW_NOTIFICATION = "show_foreground_notification"
         private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
         const val CLICK_MODE_SINGLE = "single"

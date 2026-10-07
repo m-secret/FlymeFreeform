@@ -1,14 +1,10 @@
 package io.github.msecret.flymefreeform
 
-import android.Manifest
 import android.app.Activity
-import android.app.NotificationManager
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -44,7 +40,6 @@ class MainActivity : Activity() {
     private lateinit var appManageButton: LinearLayout
     private lateinit var serviceButton: TextView
     private lateinit var overlayRow: PermissionRow
-    private lateinit var notificationRow: PermissionRow
     private lateinit var shizukuRow: PermissionRow
     private lateinit var accessibilityRow: PermissionRow
 
@@ -111,17 +106,6 @@ class MainActivity : Activity() {
                     Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
                 )
             }
-        notificationRow =
-            permissionRow(
-                label = "通知权限 · 只影响常驻通知",
-                grantedText = "已授予",
-                deniedText = "未授权（可选）",
-                actionText = "去授权",
-            ) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION)
-                }
-            }
         shizukuRow =
             permissionRow(
                 label = "Shizuku · 增强项，可选",
@@ -144,7 +128,6 @@ class MainActivity : Activity() {
         root.addView(
             CardGroup(this)
                 .row(overlayRow.root)
-                .row(notificationRow.root)
                 .row(shizukuRow.root)
                 .row(accessibilityRow.root),
         )
@@ -256,14 +239,12 @@ class MainActivity : Activity() {
 
     private fun refreshStatus() {
         val overlayGranted = Settings.canDrawOverlays(this)
-        val notifications = getSystemService(NotificationManager::class.java)?.areNotificationsEnabled() != false
         val shizukuGranted = ShizukuShell.hasPermission
         val a11yEnabled = FreeformAccessibilityService.isEnabledInSettings(this@MainActivity)
         val a11yConnected = FreeformAccessibilityService.isConnected
 
         // 状态文字保持**短**：用途已经写在每行标题里了，这里再说一遍只会把整块撑长。
         updatePermissionRow(overlayRow, overlayGranted, "已授予", "未授予")
-        updatePermissionRow(notificationRow, notifications, "已授予", "未授权（可选）")
         updatePermissionRow(shizukuRow, shizukuGranted, "已授权", "未授权（可选）")
         updatePermissionRow(
             accessibilityRow,
@@ -337,10 +318,28 @@ class MainActivity : Activity() {
                         if (ok) "已写回系统名单，稍等片刻会自动连上" else "写回失败，请手动去无障碍设置里打开",
                         android.widget.Toast.LENGTH_SHORT,
                     ).show()
-                    mainHandler.postDelayed({ refreshStatus() }, 1_500L)
+                    pollAccessibilityConnected(0)
                 },
             )
         }
+    }
+
+    /**
+     * 写回无障碍之后**轮询**到服务真的连上（或超时），再刷新界面。
+     *
+     * 只刷一次是不够的：`AccessibilityGrant.restore` 只是把组件写进系统名单，系统还要过一会儿
+     * 才把服务 bind 起来。用户反馈「用 Shizuku 开启无障碍后软件识别不到，得退出重进才行」，
+     * 就是这里只刷了一次、而那一刻服务还没连上——退出重进会走 `onResume` → `refreshStatus`，
+     * 所以看起来「重进就好」。
+     */
+    private fun pollAccessibilityConnected(attempt: Int) {
+        if (isFinishing || isDestroyed) return
+        // 每 400ms 看一次，最多 25 次（≈10 秒）。
+        if (FreeformAccessibilityService.isConnected || attempt >= 25) {
+            refreshStatus()
+            return
+        }
+        mainHandler.postDelayed({ pollAccessibilityConnected(attempt + 1) }, 400L)
     }
 
     private fun toggleService() {
@@ -364,21 +363,7 @@ class MainActivity : Activity() {
     /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
     private fun scaledSp(designSp: Float): Float = designSp / 400f * shortEdgePx
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_NOTIFICATION) {
-            val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
-            DebugLog.info("NOTIFICATION_PERMISSION", if (granted) "已授予" else "被拒绝")
-            refreshStatus()
-        }
-    }
-
     private companion object {
-        const val REQUEST_NOTIFICATION = 100
         const val REQUEST_SHIZUKU = 200
     }
 }

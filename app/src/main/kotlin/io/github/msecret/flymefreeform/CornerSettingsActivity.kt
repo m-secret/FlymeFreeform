@@ -1,12 +1,15 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.Switch
@@ -49,8 +52,18 @@ class CornerSettingsActivity : Activity() {
     private lateinit var touchDiagram: EdgeInsetPreview
     private lateinit var touchDiagramCaption: TextView
 
-    /** 「触摸区」那一组卡片。示意图加不加要整组重画，所以得留个引用（见 [applyTouchDiagramRow]）。 */
+    /** 「触摸区」这一组卡片。示意图加不加要整组重画，所以得留个引用（见 [applyTouchDiagramRow]）。 */
     private lateinit var touchGroup: CardGroup
+
+    /**
+     * 「通知权限没给」这句提示的容器。
+     *
+     * 它**不常显**：通知权限是可选项（不给也不影响任何功能，只是常驻通知不出现），
+     * 所以它不该占着主设置页的「基础权限」栏向用户要——那里只列**真会影响功能**的权限。
+     * 只有当用户在本页把「显示常驻通知」打开、而系统里本应用的通知确实是关的，才在这里露一句
+     * + 一个跳系统设置的小动作。见 [renderNotificationPermHint]。
+     */
+    private lateinit var notificationPermBox: LinearLayout
 
     /** 「触摸区」这一组里**除示意图之外**的行。建一次、反复复用（见 [applyTouchDiagramRow]）。 */
     private lateinit var touchCoreRows: List<View>
@@ -62,6 +75,15 @@ class CornerSettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         setContentView(buildContent())
+        renderNotificationPermHint()
+    }
+
+    /**
+     * 从系统设置回来时重算那条通知提示：用户可能刚在系统里把本应用的通知打开了。
+     */
+    override fun onResume() {
+        super.onResume()
+        renderNotificationPermHint()
     }
 
     /**
@@ -342,30 +364,45 @@ class CornerSettingsActivity : Activity() {
         // ---- 通知 ----
         root.addView(Ui.sectionTitle(this, "通知"))
         root.addView(
-            CardGroup(this).row(
-                Ui.switchRow(
-                    this,
-                    "隐藏状态栏通知",
-                    store.hideForegroundNotification,
-                    detail = "把「主动呼出已开启」那条通知变成静默、可划掉",
-                ) { checked ->
-                    store.hideForegroundNotification = checked
-                    // 通知是前台服务启动时挂上去的，改完得让它按新渠道重挂一次。
-                    OverlayGestureService.reload(this)
-                },
-            ),
+            CardGroup(this)
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "显示常驻通知",
+                        store.showForegroundNotification,
+                        detail = "关掉 = 通知栏里彻底没有它（需要 Shizuku）",
+                    ) { checked ->
+                        store.showForegroundNotification = checked
+                        applyNotificationVisibility(!checked)
+                        renderNotificationPermHint()
+                    },
+                )
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "隐藏状态栏通知",
+                        store.hideForegroundNotification,
+                        detail = "通知还在，但静默、不进锁屏、可划掉",
+                    ) { checked ->
+                        store.hideForegroundNotification = checked
+                        OverlayGestureService.reload(this)
+                    },
+                ),
         )
         root.addView(
             Ui.hint(
                 this,
-                "启动主动呼出后，通知栏里会常驻一条「主动呼出已开启」。**Android 要求前台服务必须" +
-                    "挂一条通知，彻底去掉是做不到的**——强行取消它，部分系统会判定这条服务失去了前台" +
-                    "身份、把它收掉，那就变成「主动呼出自己停了」，比多一行通知严重得多。\n" +
-                    "打开这个开关后它切到**静默渠道**：不出声、不弹横幅、不亮屏、不显示角标、不进锁屏，" +
-                    "并且**可以划掉**——划掉之后这一轮就不会再出现，直到服务下次重启（开机或再次" +
-                    "「启动主动呼出」）才会重新挂一条。",
+                "启动主动呼出后会常驻一条「主动呼出已开启」。\n" +
+                    "· **显示常驻通知**关掉后，通知栏里彻底没有它——靠 Shizuku 把本应用的通知" +
+                    "整体屏蔽；前台服务不受影响（真机实测服务照常运行）。\n" +
+                    "· **隐藏状态栏通知**打开后，通知还在，但切到静默渠道——不出声、不弹横幅、" +
+                    "不亮屏、不显示角标、不进锁屏，并且**可以划掉**；划掉之后这一轮不再出现，" +
+                    "直到服务下次重启（开机或再次「启动主动呼出」）。\n" +
+                    "上面那个关掉时，这一项就没有意义了。",
             ),
         )
+        notificationPermBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(notificationPermBox)
 
         // ---- 图标包 ----
         root.addView(Ui.sectionTitle(this, "图标包"))
@@ -380,6 +417,75 @@ class CornerSettingsActivity : Activity() {
 
         renderTouchDiagram()
         return Ui.scrollPage(this, root)
+    }
+
+    /**
+     * 「系统里本应用的通知是关着的」这句提示——**只在真的缺、且真的会用到**时才露出来。
+     *
+     * 通知权限是这一个应用里唯一的**纯可选项**：不给它，主动呼出、窗外点击关闭、识屏、截屏、
+     * 一键锁屏全都照常，只是「主动呼出已开启」那条常驻通知不出现（Android 13+ 前台服务通知要
+     * `POST_NOTIFICATIONS`；被拒时 `startForeground` 不抛异常、服务照跑，真机实测过）。
+     *
+     * 所以它**不该**占着主设置页「基础权限」栏的一行去要——那一栏现在只列真会影响功能的权限。
+     * 这里也不弹系统权限框，而是直接把人送到系统设置页：一次到位，而且能覆盖「之前点过拒绝、
+     * 系统已经不再弹框」的情况（那种情况下再调 `requestPermissions` 会立刻静默返回失败）。
+     */
+    private fun renderNotificationPermHint() {
+        notificationPermBox.removeAllViews()
+        // 用户自己就没打算显示常驻通知 → 这句话没有意义。
+        if (!store.showForegroundNotification) return
+        val notificationsEnabled =
+            getSystemService(NotificationManager::class.java)?.areNotificationsEnabled() != false
+        if (notificationsEnabled) return
+        notificationPermBox.addView(
+            Ui.hint(
+                this,
+                "**系统里本应用的通知是关着的**：那条「主动呼出已开启」的常驻通知不会出现。" +
+                    "其余功能不受影响——不想要它就放着不管也行。",
+            ),
+        )
+        notificationPermBox.addView(
+            Ui.smallAction(this, "去系统设置里打开通知", emphasized = false) {
+                runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+                    )
+                }
+            },
+        )
+    }
+
+    /**
+     * 「完全不显示通知」：让 Shizuku 去把本应用的通知**整体屏蔽 / 恢复**。
+     *
+     * 为什么必须借 Shizuku：Android 不允许应用自己把那条前台服务通知关掉——
+     * **删通知渠道会让 `startForeground` 抛异常、把服务直接干掉**（真机实测，
+     * 平板 `b37664b8` / Android 16），所以只能动系统级的 `POST_NOTIFICATION` 开关，
+     * 而那个只有 shell 身份写得动。依据见 `OverlayGestureService.setNotificationBlocked`。
+     *
+     * 放后台线程：一条 shell 命令要几百毫秒，压在 UI 线程上开关会卡一下。
+     */
+    private fun applyNotificationVisibility(hidden: Boolean) {
+        Thread(
+            {
+                val ok = OverlayGestureService.setNotificationBlocked(this, hidden)
+                runOnUiThread {
+                    android.widget.Toast.makeText(
+                        this,
+                        when {
+                            ok && hidden -> "已隐藏常驻通知"
+                            ok -> "已恢复显示通知"
+                            else -> "没有 Shizuku 权限，没法彻底隐藏；可去系统设置里关掉本应用的通知"
+                        },
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    // 通知是前台服务启动时挂上去的，改完得让它重新挂一次。
+                    OverlayGestureService.reload(this)
+                }
+            },
+            "notification-visibility",
+        ).start()
     }
 
     /**
