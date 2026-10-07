@@ -398,8 +398,11 @@ class FreeformAccessibilityService : AccessibilityService() {
         val panelShown = OverlayGestureService.fullScreenSurfaceShown
         val needMask = store.outsideTapCloseEnabled && !panelShown
         val screen = screenBounds()
-        val avoid = if (needMask) triggerBarRects(screen, store) else emptyList()
-        logTriggerAvoid(avoid, needMask && (store.leftCornerEnabled || store.rightCornerEnabled))
+        val avoid = if (needMask) triggerBarRects(screen) else emptyList()
+        // 「本该抠洞却一个都没抠出来」才是故障（小窗开着时角落会被遮罩盖住）。
+        // 触摸条压根不在屏上（「主动呼出」关掉、服务被停）时不该报警，所以判据取自**发布方**。
+        val expectHoles = needMask && OverlayGestureService.maskAvoidRects().isNotEmpty()
+        logTriggerAvoid(avoid, expectHoles)
         when {
             !needMask -> {
                 if (target.activeCount > 0) {
@@ -773,6 +776,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     private var lastTriggerAvoidLog = ""
 
     /**
+     * 上一轮那两块让位矩形**是从哪来的**（[triggerBarRects]）。
+     *
+     * 单独记一笔是为了排查时分得开「触摸条不在屏上」和「在屏上但定位不到」——
+     * 这两者的修法完全不同，而日志里的表现（`avoid` 为空）一模一样。
+     */
+    private var lastAvoidSource = ""
+
+    /**
      * 记下这一轮遮罩给触摸条让开了哪些地方。
      *
      * **关键证据**：[expectHoles] 为真却一个洞都没抠出来，就意味着小窗开着时角落触摸条
@@ -781,44 +792,57 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private fun logTriggerAvoid(avoid: List<Rect>, expectHoles: Boolean) {
         val text = avoid.joinToString(" ") { it.toShortString() }
-        val summary = if (expectHoles) text else "off"
+        val summary = if (expectHoles) "$lastAvoidSource|$text" else "off"
         if (summary == lastTriggerAvoidLog) return
         lastTriggerAvoidLog = summary
         if (!expectHoles) return
         if (text.isEmpty()) {
             DebugLog.warn(
                 "OUTSIDE_TAP_AVOID",
-                "没定位到触摸条窗口，本轮遮罩不抠洞：小窗开着时角落会被盖住",
+                "没定位到触摸条窗口（来源=$lastAvoidSource），本轮遮罩不抠洞：小窗开着时角落会被盖住",
             )
         } else {
-            DebugLog.info("OUTSIDE_TAP_AVOID", "给触摸条让开 ${avoid.size} 块：$text")
+            DebugLog.info("OUTSIDE_TAP_AVOID", "给触摸条让开 ${avoid.size} 块（来源=$lastAvoidSource）：$text")
         }
     }
 
     /**
      * 角落触摸条此刻占着的屏幕矩形（左、右各一块），供遮罩抠洞用。
      *
-     * 遮罩是 `TYPE_ACCESSIBILITY_OVERLAY`、触摸条是 `TYPE_APPLICATION_OVERLAY`，而这两种类型的
-     * WMS 层级是 **31 : 11**（见 [OutsideTapBlocker.computeRegions] 里的说明）——
-     * **遮罩一定压在触摸条之上**，小窗一开触摸条就被盖住，从角落起手的手势全部变成「点了窗外」。
-     * 修法就是让遮罩把这两块抠出来，所以这里的矩形必须和 [OverlayGestureService.triggerParams]
-     * 摆出来的窗口**完全对齐**：同一个 [CornerGeometry] 口径、同样 `BOTTOM` 重力 + `x = 0` + `y = bottomInset`。
+     * **触摸条在不在屏上，只问它的拥有者**（[OverlayGestureService.maskAvoidRects]）。
      *
-     * 两个前提都满足才让位，缺一不可：
-     * 1. 设置里这个角落是开的；
-     * 2. **窗口列表里真的找到了那块窗口** —— 触摸条窗口不存在（服务没起、刚重建、addView 失败）
-     *    时抠出来的就是「点下去穿透到下层应用」的洞，比轮盘难呼出更糟。
+     * 早先这里拿无障碍窗口列表去找那块窗口（`type=TYPE_SYSTEM` + 包名是自己 + 主体落在角落矩形内），
+     * 那个口径有一个**自锁**：触摸条是 `TYPE_APPLICATION_OVERLAY`（WMS 层级 11），遮罩是
+     * `TYPE_ACCESSIBILITY_OVERLAY`（层级 31）——遮罩本来就压在触摸条之上。于是只要有一拍
+     * 没抠出洞、遮罩整块铺进了角落，触摸条就被判成 `isVisible=false`；而无障碍**只上报可见窗口**，
+     * 它从此从列表里消失 → 以后每一拍都定位不到 → 永远不再抠洞。
+     *
+     * 实测（2026-10-07 手机竖屏，三扇小窗被系统挤成一扇之后）：点触摸条内部 `(60,2600)`
+     * 得到的是 `OUTSIDE_TAP_DISPATCH`（顺带关掉一扇小窗），而不是 `GESTURE_DOWN`；
+     * 把那一轮小窗全关掉、遮罩撤下之后，两条触摸条立刻在列表里重新出现（WMS 侧
+     * 也回到 `isVisible=true`）。也就是说「点角落关掉小窗、轮盘再也呼不出来」会**永久**持续。
+     *
+     * 拥有者给的矩形不是估算：它就是摆放那个窗口时用的 `gravity` / `x` / `y` / 宽高，
+     * 与 WMS 摆放它用的是同一份数据（实测与窗口真实 bounds 逐像素相同：
+     * 期望 `[0,2457][140,2702]` == 实际 `[0,2457][140,2702]`）。
+     *
+     * 窗口列表**仍然参与**，但只当精度修正：报得出那块窗口时用它报的真实 bounds
+     * （能吃掉 WMS 的取整/夹取），报不出就用上面那份。两级来源都拿不到才算失败。
      */
-    private fun triggerBarRects(screen: Rect, store: SettingsStore): List<Rect> {
-        val width = CornerGeometry.triggerWidth(this, store)
-        val height = CornerGeometry.triggerHeight(this, store)
-        if (width <= 0 || height <= 0) return emptyList()
-        val bottom = screen.bottom - CornerGeometry.bottomInset(this, store)
-        val top = bottom - height
-        val expected = ArrayList<Rect>(2)
-        if (store.leftCornerEnabled) expected += Rect(screen.left, top, screen.left + width, bottom)
-        if (store.rightCornerEnabled) expected += Rect(screen.right - width, top, screen.right, bottom)
-        return expected.mapNotNull { candidate -> actualTriggerBounds(candidate) }
+    private fun triggerBarRects(screen: Rect): List<Rect> {
+        val owned = OverlayGestureService.maskAvoidRects()
+        if (owned.isEmpty()) {
+            lastAvoidSource = "无（触摸条不在屏上）"
+            return emptyList()
+        }
+        val rects = ArrayList<Rect>(owned.size)
+        for (expected in owned) {
+            val clipped = Rect(expected)
+            if (!clipped.intersect(screen) || clipped.isEmpty) continue
+            rects += actualTriggerBounds(clipped) ?: clipped
+        }
+        lastAvoidSource = if (rects.size == owned.size) "窗口所有者" else "窗口所有者（部分在屏外）"
+        return rects
     }
 
     /**
@@ -1611,19 +1635,40 @@ class FreeformAccessibilityService : AccessibilityService() {
     /**
      * 把目标窗「点亮」的落点。
      *
-     * **不能直接用 [captionPoint]**（窗口底部那条小横条）。手机上多扇小窗是大面积
-     * **层叠**摆放的，横条正好落在窗口水平居中处 —— 那也恰好是与其它小窗重叠最厉害的位置，
-     * 这一下会打到**上层那扇**窗上，目标窗压根没被点到。
+     * **首选「横条落点」**（[captionPrimePoint]）。这一条是 2026-10-07 真机上把机理钉死之后
+     * 才反过来的——原先这里**刻意避开**横条，改点窗口左上角标题区，理由是「横条正好在窗口
+     * 水平居中处，那也恰恰是与其它小窗重叠最厉害的位置」。那个理由**只对『层叠且横条被压住』
+     * 那一种摆法成立**，当普适规则用是错的：它把唯一能让这一刀稳赢的落点让掉了。
      *
-     * 真机实测（手机竖屏两扇小窗）：两扇的横条落点都在 x=636，点完 `mCurrentFocus` 仍是
-     * 另一扇；紧接着的上滑又打在那扇窗的**非横条**区域上，于是一刀都关不掉，
-     * 日志里是 `OUTSIDE_TAP_STILL_OPEN 点击没关掉小窗`。
+     * 真机 A/B（手机横屏 2772×1272，一扇 764×1103 的小窗 `[143,143][907,1246]`，
+     * 屏底 1272，横条落点 `(525,1232)`，全程同一个上滑 `(525,1232)->(525,732) 40ms`）：
      *
-     * 所以改点**只有目标窗自己覆盖**的位置：窗口内、避开其它小窗矩形、贴着上边缘
-     * （标题栏那一带，不是内容区，点下去不会误触应用按钮）。
-     * 实测这样一点，焦点立刻落到目标窗上，随后的上滑一次命中。
+     * | 先点哪里 | 再上滑 | 结果 |
+     * |---|---|---|
+     * | 标题区 `(213,213)`（旧写法） | 同一点 | **2 关 / 2 回桌面**；另一批 8 轮是 3 关 / 5 回桌面 |
+     * | **横条 `(525,1232)`** | 同一点 | **11 关 / 0 回桌面**；交接 300ms 那批再 5 关 / 0 回桌面 |
+     * | 什么都不点 | 同一点 | 2 关 / 5 回桌面（见 `capture_trials`） |
+     *
+     * 合计「点横条」19 关 / 20、**零次回桌面**；「点标题区」5 关 / 12、6 次回桌面。
+     * 机理（系统侧日志对比，8/8 相关）也指向同一个点：落在横条上那一下会被
+     * `FlexiblePointerHandler` 认领（`startScaleSpringAnimInAnimHandler mStartHandleBottomPoint=Point(525,1232)`），
+     * 而同一个坐标**先点标题区**再上滑时没人认领，事件标成
+     * `channel Embedded{FlexibleTaskCaptionView#N} MotionEvent action_down is in interception region`
+     * 并被 SystemUI 导航栏抢走（`SystemUiProxy: startRecentsActivity` → `START_RECENTS_TRANSITION`）。
+     *
+     * **为什么不能靠「换个更高的落点」绕开冲突**：同一批实测把横屏屏幕底部 77px 量成了
+     * 系统手势拦截带（`SystemUi--NavBar: bottomGestureAreaHeight = 77  mDisplaySize.y = 1272`，
+     * 即 y ≥ 1195），而横条的可抓带只有 y ∈ [1215,1246]——**整条横条都躺在拦截带里，
+     * 没有任何「安全起点」**。落点扫描（y=1150/1180/1195 一律无效，y=1215/1225/1232/1240
+     * 各约 1/3 成功）说明「瞄得更准」这条路走不通；**先把横条点一下**才是钥匙。
+     *
+     * 横条落点被**别的**小窗压住时才退回下面这套「点只有目标窗自己覆盖的位置」：
+     * 窗口内、避开其它小窗矩形、贴着上边缘（标题栏那一带，不是内容区，点下去不会误触
+     * 应用按钮）。真机实测（手机竖屏两扇小窗）两扇的横条落点都在 x=636、点完
+     * `mCurrentFocus` 仍是另一扇，所以那种摆法必须退。
      */
     private fun activationPoint(bounds: Rect): Pair<Float, Float> {
+        captionPrimePoint(bounds)?.let { return it }
         val inset = CornerGeometry.dp(this, ACTIVATION_INSET_DP)
         val others =
             lastFreeformWindows
@@ -1642,6 +1687,35 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         // 极端层叠（每个可试点都被别的窗盖住）→ 退回横条落点，至少保证落在窗口内。
         return captionPoint(bounds, SettingsStore(this))
+    }
+
+    /**
+     * 「点亮」目标窗时该点的**横条落点**；横条被别的小窗压住时返回 null（由 [activationPoint] 退让）。
+     *
+     * 点这里不只是为了转移焦点——**这一下是让后面那一刀上滑能稳赢的唯一办法**（机理与实测数据
+     * 见 [activationPoint]）。所以它必须严格落在横条上，也就是和随后的上滑**同一个点**
+     * （[captionPoint]，横向按 [SettingsStore.closeAnchorXPercent]、纵向从窗口底边往上
+     * [SettingsStore.closeAnchorYDp]）。
+     *
+     * 唯一要排除的是「这一点被别的自由窗盖住」：那时点下去会打到上层那扇窗上，
+     * 等于把「钥匙」交给了错误的窗（关错窗/关不掉两条都试过）。
+     */
+    private fun captionPrimePoint(bounds: Rect): Pair<Float, Float>? {
+        val point = captionPoint(bounds, SettingsStore(this))
+        val x = point.first.toInt()
+        val y = point.second.toInt()
+        val covered =
+            lastFreeformWindows
+                .filter { !withinSlack(it.bounds, bounds, CLOSE_SAME_SLACK_PX) }
+                .any { it.bounds.contains(x, y) }
+        if (covered) {
+            DebugLog.info(
+                "CLOSE_SWIPE_PRIME_BLOCKED",
+                "横条落点($x,$y)被别的小窗盖住，这次退回标题区点亮（会回到 1/3 的拼运气）",
+            )
+            return null
+        }
+        return point
     }
 
     /**
@@ -1679,7 +1753,12 @@ class FreeformAccessibilityService : AccessibilityService() {
         val point = activationPoint(bounds)
         val x = point.first.toInt()
         val y = point.second.toInt()
-        DebugLog.info("CLOSE_SWIPE_ACTIVATE", "目标窗不是焦点窗，先点它的专属区域($x,$y)让它拿到焦点")
+        val onCaption = captionPrimePoint(bounds) != null
+        DebugLog.info(
+            "CLOSE_SWIPE_ACTIVATE",
+            "目标窗不是焦点窗，先点($x,$y)让它拿到焦点" +
+                (if (onCaption) "（落在横条上＝这一刀上滑的钥匙）" else "（横条被压住，退成标题区）"),
+        )
         val tapped =
             if (ShizukuShell.hasPermission) {
                 ShizukuShell.injectTap(x, y)
@@ -2138,8 +2217,21 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val REPLAY_RETRY_MS = 120L
         private const val REPLAY_MAX_TRIES = 4
 
-        /** 把目标窗点成焦点窗后，等焦点真的过去的轮询参数。 */
-        private const val CLOSE_FOCUS_WAIT_MS = 150L
+        /**
+         * 「点亮」目标窗之后、真正上滑之前要留的**交接窗口**。
+         *
+         * 这个值不是「等焦点转过去」用的——真机实测焦点 350ms 内就过去了，而**焦点过去了也
+         * 不保证那一刀不丢**（先点标题区那批：焦点已确认转移，8 轮里照样 5 轮回桌面）。
+         * 它等的是**系统手势处理器把这一下认领下来**：只有先把横条点一下，ColorOS 才会在
+         * 那一刻锁定起手点，之后那一刀上滑才归小窗而不是归 SystemUI 导航栏。
+         *
+         * 真机实测（手机横屏，先点横条 `(525,1232)` 再上滑同一点）：
+         *   · 交接 150ms：3 关 / 1 没反应 / **0 回桌面**（偏短，偶尔还没认领完）
+         *   · 交接 300ms：5 关 / **0 回桌面**
+         *   · 交接 400ms：11 关 / **0 回桌面**
+         * 150ms 那次丢的也只是「没反应」而不是「回桌面」，所以宁可多等一点：取 300ms。
+         */
+        private const val CLOSE_FOCUS_WAIT_MS = 300L
         private const val CLOSE_FOCUS_POLL_MS = 30L
 
         /**

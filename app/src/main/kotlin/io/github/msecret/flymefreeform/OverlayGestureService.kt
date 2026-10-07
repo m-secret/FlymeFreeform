@@ -398,6 +398,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     resyncTrigger(side, "重排失败")
                 }
         }
+        publishMaskAvoidRects()
     }
 
     /**
@@ -610,6 +611,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 if (expandedSide == side) expandedSide = null
                 DebugLog.info("TRIGGER_REMOVED", "side=$side")
             }
+            publishMaskAvoidRects()
             return
         }
         if (existing != null) return
@@ -623,6 +625,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         } catch (exception: RuntimeException) {
             DebugLog.error("TRIGGER_ADD_FAILED", "side=$side", exception)
         }
+        publishMaskAvoidRects()
     }
 
     /**
@@ -663,6 +666,42 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             setFitInsetsTypes(0)
             title = "FlymeFreeformNoRootTrigger-${side.name}"
         }
+    }
+
+    /**
+     * 把触摸条此刻的真实矩形发布给遮罩（见 [avoidRectsForMask]）。
+     *
+     * **必须在每一处会改变「哪些触摸条窗口挂在屏上 / 摆在哪」的地方之后调用**：加窗、移除、
+     * 重排、重建、以及 [checkTriggers] 的巡检。漏掉一处，就可能留下“遮罩没有给某条触摸条抠洞”
+     * 的那一拍，而那一拍正是自锁的入口。
+     *
+     * 矩形由**摆放该窗口时用的参数**推出，不是估算：`gravity` 锚在自己那一边、`x = 0`、
+     * `y` 是离屏幕底边的距离、尺寸就是 `params.width/height`。天花板只做防御性夹取
+     * （真出现“比屏幕还高”的极端设置时，抠出来的仍然是屏幕上那一段）。
+     */
+    private fun publishMaskAvoidRects() {
+        val screen = realScreenBounds()
+        val rects = ArrayList<Rect>(triggerViews.size)
+        triggerViews.forEach { (side, view) ->
+            // 只认真的挂在窗口上的：`addView` 抛异常、或被系统摘掉的窗口不该抠洞，
+            // 那种洞的下方没有任何东西接管，点下去会穿透到下层应用。
+            if (!view.isAttachedToWindow) return@forEach
+            val params = view.layoutParams as? WindowManager.LayoutParams ?: return@forEach
+            val width = params.width
+            val height = params.height
+            if (width <= 0 || height <= 0) return@forEach
+            val bottom = screen.bottom - params.y
+            val top = bottom - height
+            if (bottom <= screen.top || top >= screen.bottom) return@forEach
+            val visibleTop = maxOf(top, screen.top)
+            rects +=
+                if (side == CornerSide.Left) {
+                    Rect(screen.left, visibleTop, screen.left + width, bottom)
+                } else {
+                    Rect(screen.right - width, visibleTop, screen.right, bottom)
+                }
+        }
+        avoidRectsForMask = rects
     }
 
     /**
@@ -707,6 +746,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         triggerViews.values.forEach { view -> runCatching { windowManager.removeViewImmediate(view) } }
         triggerViews.clear()
         expandedSide = null
+        // 服务停下 / 「主动呼出」被关掉：屏上已经没有触摸条了，遮罩不该再给任何东西抠洞。
+        publishMaskAvoidRects()
     }
 
     private fun showMenu(side: CornerSide) {
@@ -1205,6 +1246,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val enabled = if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
         if (!enabled) {
             DebugLog.warn("TRIGGER_RESYNCED", "side=$side 已禁用，直接移除（原因：$reason）")
+            publishMaskAvoidRects()
             return
         }
         val view = CornerTriggerView(this, side, this)
@@ -1217,6 +1259,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         } catch (exception: RuntimeException) {
             DebugLog.error("TRIGGER_RESYNC_FAILED", "side=$side", exception)
         }
+        publishMaskAvoidRects()
     }
 
     /**
@@ -1257,6 +1300,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 每次只记录**真的修了什么**，没坏时不产生任何日志，免得把调试日志刷爆。
      */
     private fun checkTriggers() {
+        // **每一轮巡检都先把让位矩形重新发布一次。** 它是「遮罩要不要给角落抠洞」的唯一来源，
+        // 而“某一拍没有它”正是自锁的入口（见 [avoidRectsForMask]）——用一次几微秒的遍历
+        // 把状态收敛回来，比事后排查「为什么角落突然呼不出轮盘」便宜得多。
+        // 放在所有早退之前：下面的早退条件（手势进行中 / 轮盘挂着）可能持续很久。
+        publishMaskAvoidRects()
         if (!store.enabled) return
         // **先把「轮盘」这条死引用清掉。** 下面的早退本意是「用户正在挑图标，别去打扰」，
         // 但 `removeMenu` 里那次 `removeViewImmediate` 是 `runCatching` 的，静默失败时窗口已经
@@ -1678,6 +1726,31 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val CHANNEL_ID_QUIET = "noroot_corner_gesture_quiet"
 
         private const val NOTIFICATION_ID = 1001
+
+        /**
+         * 遮罩要给角落触摸条让开的两块矩形，供 [FreeformAccessibilityService] 抠洞用。
+         *
+         * **发布者是触摸条窗口的拥有者（本服务），来源不是无障碍窗口列表**，这一点是刻意的：
+         *
+         * - 触摸条是 `TYPE_APPLICATION_OVERLAY`（WMS 层级 **11**），遮罩是
+         *   `TYPE_ACCESSIBILITY_OVERLAY`（层级 **31**）——遮罩本来就压在触摸条之上。只要有一拍
+         *   没能抠出洞、遮罩整块铺进了角落，触摸条就会被判成 `isVisible=false`，而无障碍
+         *   **只上报可见窗口**，它从此从列表里消失 → 以后每一拍都定位不到它 → **再也不抠洞**。
+         *   这是一个自锁，实测（2026-10-07 手机竖屏）点触摸条内部 `(60,2600)` 得到的是
+         *   `OUTSIDE_TAP_DISPATCH`（关掉了一扇小窗）而不是 `GESTURE_DOWN`；把那一轮小窗全关掉、
+         *   遮罩撤下之后，两条触摸条立刻在列表里重新出现（WMS 侧也回到 `isVisible=true`）。
+         * - 丢给“窗口在不在”的那个判据，本服务比任何人都准：窗口是它自己 `addView` 的，
+         *   位置由 [triggerParams] 的 `gravity=BOTTOM|LEFT/RIGHT` + `x=0` + `y=bottomInset`
+         *   **唯一确定**，与 WMS 摆放它用的是同一份数据（实测与窗口真实 bounds 逐像素相同）。
+         *
+         * 只登记**真的挂在窗口上**（`isAttachedToWindow`）且尺寸为正的触摸条；本服务被停掉时
+         * 会清空（见 [removeTriggers]），避免留下“洞比窗口大”的空档——那种洞点下去会穿透到下层应用。
+         */
+        @Volatile
+        private var avoidRectsForMask: List<Rect> = emptyList()
+
+        /** 见 [avoidRectsForMask]。本进程内只读快照，调用方是 [FreeformAccessibilityService]。 */
+        fun maskAvoidRects(): List<Rect> = avoidRectsForMask
 
         /** 「更多」面板退场到发起启动之间的等待，用来让窗口与焦点彻底收回。 */
         /**
