@@ -14,6 +14,7 @@ class SettingsStore(context: Context) {
         migrateInsetDefaultTo10IfNeeded()
         migrateCornerRangeDefaultsIfNeeded()
         migrateMenuDimDefaultsIfNeeded()
+        migrateOutsideTapPaddingIfNeeded()
         migrateCloseModeToSystemIfNeeded()
         migrateCloseModeAwayFromBackIfNeeded()
         migrateTapCloseModeToSwipe()
@@ -117,6 +118,21 @@ class SettingsStore(context: Context) {
         }
         editor.putBoolean(KEY_MENU_DIM_MIGRATED_170, true)
         editor.apply()
+    }
+
+    /**
+     * 「标题栏预留」的新默认：12 → 3，只跑一次。
+     *
+     * 和其它默认值迁移同一套口径：只有**仍然等于旧默认 12** 的才重置，用户自己拖过的值不动。
+     */
+    private fun migrateOutsideTapPaddingIfNeeded() {
+        if (preferences.getBoolean(KEY_OUTSIDE_TAP_PADDING_MIGRATED_3, false)) return
+        if (preferences.getInt(KEY_OUTSIDE_TAP_PADDING_DP, -1) == LEGACY_DEFAULT_OUTSIDE_TAP_PADDING_DP) {
+            preferences.edit()
+                .putInt(KEY_OUTSIDE_TAP_PADDING_DP, DEFAULT_OUTSIDE_TAP_PADDING_DP)
+                .apply()
+        }
+        preferences.edit().putBoolean(KEY_OUTSIDE_TAP_PADDING_MIGRATED_3, true).apply()
     }
 
     /**
@@ -858,8 +874,18 @@ class SettingsStore(context: Context) {
         /** 旧版「距顶边」落点的 key，语义和新 key 相反，迁移时删除。 */
         private const val KEY_CLOSE_ANCHOR_Y_DP = "close_anchor_y_dp"
 
-        const val DEFAULT_OUTSIDE_TAP_PADDING_DP = 12
+        /**
+         * 「标题栏预留」的默认外扩量（dp）：遮罩相对小窗边界外扩这么多，避免盖住小窗标题栏拖不动。
+         *
+         * 原默认 **12**，现按用户要求改为 **3**。老配置由 [migrateOutsideTapPaddingIfNeeded] 迁移
+         * （只重置「仍等于旧默认 12」的那些，用户自己调过的不动）。
+         */
+        const val DEFAULT_OUTSIDE_TAP_PADDING_DP = 3
         const val MAX_OUTSIDE_TAP_PADDING_DP = 48
+
+        /** 旧默认外扩量（12dp），迁移时用来识别「没改过」。 */
+        private const val LEGACY_DEFAULT_OUTSIDE_TAP_PADDING_DP = 12
+        private const val KEY_OUTSIDE_TAP_PADDING_MIGRATED_3 = "outside_tap_padding_migrated_to_3"
 
         const val MIN_CLOSE_ANCHOR_X_PERCENT = 0
         const val MAX_CLOSE_ANCHOR_X_PERCENT = 100
