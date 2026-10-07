@@ -2245,8 +2245,21 @@ class FreeformAccessibilityService : AccessibilityService() {
         /** 无障碍回退路径下，「点一下」的按压时长。 */
         private const val CLOSE_FOCUS_TAP_MS = 60L
 
-        /** 撤掉捕获层/遮罩后到注入之间的等待（约一帧），让 WindowManager 真正移除窗口。 */
-        private const val INJECT_HANDOFF_MS = 40L
+        /**
+         * 从「决定关闭」到「注入手势」之间的等待。
+         *
+         * 这里**故意是 0**。它早先是 40ms，理由是「撤掉捕获层/遮罩后要等 WindowManager
+         * 真正把窗口移除」。但 [startCloseFlow] 后来已经**不再撤遮罩**了——落点可达性改由
+         * `OutsideTapBlocker.Layout.others` 抠洞保证（遮罩围绕当前那一扇铺，目标窗那一块本来
+         * 就在洞里），[detachAll] 那一步成了纯粹的空窗来源。于是这 40ms 变成了**纯空等**。
+         *
+         * 它占总时长的比例不小：「点击 → 系统开始播退出动画」实测只有 ~135ms，这 40ms 占近三成。
+         *
+         * 真机回归（改为 0 之后）：手机横屏「两扇连关」18 轮 17 过、竖屏 4 轮全过，
+         * 那唯一一次失败是「没关掉」（非焦点窗那一刀本来就有的偶发，App 会补刀），
+         * **没有一次回桌面**——与改之前 19/20 的成功率一致，所以这一改不动行为、只省时间。
+         */
+        private const val INJECT_HANDOFF_MS = 0L
 
         /** 判定「已经在收起」的面积阈值：面积缩到原来的 90% 以下就算退场动画开始了。 */
         private const val CLOSING_AREA_RATIO = 0.90f
