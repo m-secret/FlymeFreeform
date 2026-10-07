@@ -150,29 +150,9 @@ class MainActivity : Activity() {
         )
         permissionHintBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(permissionHintBox)
-        root.addView(Ui.spacer(this))
-        root.addView(
-            Ui.tonalButton(this, "用 Shizuku 把无障碍写回来") {
-                // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是 WRITE_SECURE_SETTINGS
-                // 保护的系统设置），但 Shizuku 的 shell 身份写得动。没 Shizuku 就只能跳设置页。
-                val ok = AccessibilityGrant.restore(this)
-                android.widget.Toast.makeText(
-                    this,
-                    if (ok) "已写回系统名单，稍等片刻会自动连上" else "没有 Shizuku 权限，只能手动去无障碍设置里打开",
-                    android.widget.Toast.LENGTH_SHORT,
-                ).show()
-                mainHandler.postDelayed({ refreshStatus() }, 1_500L)
-            },
-        )
-        root.addView(
-            Ui.hint(
-                this,
-                "重启后如果发现开关被系统关掉了，多半是服务在开机那一下出过错。" +
-                    "本版本会在开机 / Shizuku 就绪时自动写回（记在「调试日志」页的 A11Y_TRACE 里）。" +
-                    "也在通知栏放了快捷磁贴「免root小窗」。若仍出现，请允许本应用「自启动」并关掉电池优化。",
-            ),
-        )
-
+        // 「用 Shizuku 写回无障碍」**不常显**了（见 [renderPermissionHints]）：它只在无障碍
+        // 真的没连上、且 Shizuku 可用时才露出来。用户反馈原来那个常显的大按钮 + 四行说明
+        // 「太显眼、占用了一大块」——而它本来只是「重启后开关被系统清掉」时的兜底动作。
         root.addView(Ui.spacer(this))
         // 一屏只有一个 filled button，它是这一页的主行动。
         serviceButton = Ui.filledButton(this, "启动主动呼出") { toggleService() }
@@ -337,6 +317,28 @@ class MainActivity : Activity() {
                     this,
                     "**没有 Shizuku**：只是「小窗启动被拒时的兜底」和「关不掉时强制停掉该应用」用不了。",
                 ),
+            )
+        }
+        // 无障碍没连上、又有 Shizuku —— 给一个「一键写回」的小动作。
+        //
+        // 它原来是一个常显的 tonal 大按钮 + 四行说明，用户反馈「太显眼、占用了一大块」。
+        // 现在只在**真的缺**的时候才露出来：平时无障碍正常，这一块完全不存在。
+        if (!a11yConnected && shizukuGranted) {
+            permissionHintBox.addView(
+                Ui.hint(this, "重启后系统常把无障碍开关清掉，可一键写回系统名单。"),
+            )
+            permissionHintBox.addView(
+                Ui.smallAction(this, "用 Shizuku 写回无障碍", emphasized = false) {
+                    // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是 WRITE_SECURE_SETTINGS
+                    // 保护的系统设置），但 Shizuku 的 shell 身份写得动。
+                    val ok = AccessibilityGrant.restore(this)
+                    android.widget.Toast.makeText(
+                        this,
+                        if (ok) "已写回系统名单，稍等片刻会自动连上" else "写回失败，请手动去无障碍设置里打开",
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    mainHandler.postDelayed({ refreshStatus() }, 1_500L)
+                },
             )
         }
     }

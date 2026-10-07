@@ -618,7 +618,9 @@ object Ui {
     /**
      * Tonal button：primaryContainer 底 + onPrimaryContainer 字。
      *
-     * 次级行动用它，例如「用 Shizuku 把无障碍写回来」——重要但不是主路径。
+     * 次级行动用它，例如「前往开启无障碍服务」——重要但不是主路径。
+     * 需要**更轻**的行内动作（例如主界面那个「用 Shizuku 写回无障碍」）用 [smallAction]，
+     * 它是 wrap_content 的小药丸，不会横占一整行。
      */
     fun tonalButton(context: Context, text: String, onClick: () -> Unit): TextView =
         buttonBase(context, text, onClick).apply {
