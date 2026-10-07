@@ -20,6 +20,8 @@ class SettingsStore(context: Context) {
         migrateTapCloseModeToSwipe()
         migrateSwipeDurationIfNeeded()
         migrateCloseAnchorYToZeroIfNeeded()
+        migrateCloseAnchorYToFourIfNeeded()
+        migrateOffCaptionAutoMode()
         migrateLandscapeSideToAutoIfNeeded()
         dropRetiredTools()
     }
@@ -61,9 +63,41 @@ class SettingsStore(context: Context) {
     private fun migrateCloseAnchorYToZeroIfNeeded() {
         if (preferences.getBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_0, false)) return
         if (preferences.getInt(KEY_CLOSE_BAR_Y_DP, -999) == LEGACY_DEFAULT_CLOSE_ANCHOR_Y_DP) {
-            preferences.edit().putInt(KEY_CLOSE_BAR_Y_DP, DEFAULT_CLOSE_ANCHOR_Y_DP).apply()
+            preferences.edit().putInt(KEY_CLOSE_BAR_Y_DP, PREVIOUS_DEFAULT_CLOSE_ANCHOR_Y_DP).apply()
         }
         preferences.edit().putBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_0, true).apply()
+    }
+
+    /**
+     * 「小横条落点距小窗底边」的默认从 0 改成 **4dp**，只跑一次。
+     *
+     * 0 是紧贴底边；用户 2026-10-07 定稿用 4dp（往窗内让一点，更稳地压在小横条上）。
+     * 等于上一版默认 0 的视为「没改过」才重置，用户自己调过的值（比如 6）不动。
+     */
+    private fun migrateCloseAnchorYToFourIfNeeded() {
+        if (preferences.getBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_4, false)) return
+        if (preferences.getInt(KEY_CLOSE_BAR_Y_DP, -999) == PREVIOUS_DEFAULT_CLOSE_ANCHOR_Y_DP) {
+            preferences.edit().putInt(KEY_CLOSE_BAR_Y_DP, DEFAULT_CLOSE_ANCHOR_Y_DP).apply()
+        }
+        preferences.edit().putBoolean(KEY_CLOSE_ANCHOR_Y_MIGRATED_4, true).apply()
+    }
+
+    /**
+     * 把「Shizuku 自动定位后再上滑小横条」（[CLOSE_MODE_CAPTION_AUTO]）折回
+     * 「按小窗边界估算」（[CLOSE_MODE_SWIPE_UP]），只跑一次。
+     *
+     * 用户 2026-10-07 要求**隐藏这个选项**：它读系统日志拿小横条真实坐标，实测「位置不对」
+     * ——学到的是**绝对坐标**，而它属于学到那一刻的那一扇窗；屏上两扇以上时几乎必然是
+     * 上一扇窗留下的坐标，只能整条作废退回估算。多扇窗是常态，所以它实际帮不上忙，
+     * 反而多一次 Shizuku 子进程。
+     *
+     * 折回估算**没有行为回归**：这条自动路本来就一直在 `CLOSE_CAPTION_MISS` 之后退回估算
+     * （真机统计：自动路 297 次尝试、0 次成功），用户现在拿到的就是估算的结果。
+     */
+    private fun migrateOffCaptionAutoMode() {
+        if (preferences.getString(KEY_OUTSIDE_TAP_CLOSE_MODE, null) == CLOSE_MODE_CAPTION_AUTO) {
+            preferences.edit().putString(KEY_OUTSIDE_TAP_CLOSE_MODE, CLOSE_MODE_SWIPE_UP).apply()
+        }
     }
 
     /**
@@ -899,16 +933,21 @@ class SettingsStore(context: Context) {
         /**
          * 「上滑关闭」的落点距小窗底边的距离。
          *
-         * **默认 0**——紧贴小窗底边，正好压在小横条上。
+         * **默认 4**——往小窗内让 4dp，压在底边内侧的小横条上。
          *
-         * 早先给的是 8dp，是按「小横条贴在底边内侧」估的；实测太靠里，落点会落到横条**上方**的
-         * 应用内容上，于是「点了窗外却没关掉」。要微调的话正数往窗内移、负数移到窗沿外。
+         * 早先给的是 8dp（太靠里，落点跑到横条**上方**的应用内容上，点了窗外却没关掉），
+         * 中间试过 0（紧贴底边）；用户 2026-10-07 定稿 **4dp**。
+         * 要微调的话正数往窗内移、负数移到窗沿外。
          */
-        const val DEFAULT_CLOSE_ANCHOR_Y_DP = 0
+        const val DEFAULT_CLOSE_ANCHOR_Y_DP = 4
 
         /** 旧默认（8dp），迁移时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_CLOSE_ANCHOR_Y_DP = 8
+
+        /** 上一版默认（0dp），迁移时用来识别「没改过」。 */
+        private const val PREVIOUS_DEFAULT_CLOSE_ANCHOR_Y_DP = 0
         private const val KEY_CLOSE_ANCHOR_Y_MIGRATED_0 = "close_anchor_y_migrated_to_0"
+        private const val KEY_CLOSE_ANCHOR_Y_MIGRATED_4 = "close_anchor_y_migrated_to_4"
 
         const val MIN_CLOSE_SWIPE_DISTANCE = 4
         const val MAX_CLOSE_SWIPE_DISTANCE = 60

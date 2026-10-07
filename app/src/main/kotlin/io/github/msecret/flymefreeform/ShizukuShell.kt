@@ -143,9 +143,13 @@ object ShizukuShell {
                 ?: return ShellResult(-1, "", "无法在 Shizuku 侧创建进程（newProcess 不可访问）")
         val stdout = StringBuilder()
         val stderr = StringBuilder()
+        // 读线程**建在 try 外面**：catch 里要用它们（见下面「异常提前返回」那段），
+        // 而 Kotlin 里 try 块内声明的局部变量在 catch 里不可见。
+        val stdoutReader =
+            Thread { runCatching { process.inputStream.bufferedReader().forEachLine { stdout.appendLine(it) } } }
+        val stderrReader =
+            Thread { runCatching { process.errorStream.bufferedReader().forEachLine { stderr.appendLine(it) } } }
         return try {
-            val stdoutReader = Thread { runCatching { process.inputStream.bufferedReader().forEachLine { stdout.appendLine(it) } } }
-            val stderrReader = Thread { runCatching { process.errorStream.bufferedReader().forEachLine { stderr.appendLine(it) } } }
             stdoutReader.start()
             stderrReader.start()
             val finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -153,15 +157,29 @@ object ShizukuShell {
                 process.destroy()
                 return ShellResult(-1, stdout.toString(), "命令超时：$command")
             }
-            stdoutReader.join(1_000L)
-            stderrReader.join(1_000L)
+            stdoutReader.join(READER_JOIN_MS)
+            stderrReader.join(READER_JOIN_MS)
             ShellResult(process.exitValue(), stdout.toString(), stderr.toString())
         } catch (exception: IllegalArgumentException) {
             // Shizuku 的 Process.waitFor() 在进程退出状态尚未收敛时会抛
             // `IllegalArgumentException: process hasn't exited`。对 `input` 这类即时命令而言，
             // 命令本身已经执行完成（注入已发生），这只是退出状态查询的时序问题，
             // 应视为成功而非失败——否则上层会误判失败并重复注入（日志里连续多次 SHIZUKU_INJECT_*）。
+            //
+            // ★ 但**绝不能立刻返回**。两个读线程是**异步**往 StringBuilder 里灌的，抛异常那一刻
+            // `stdout` 基本还是空的。`input tap/swipe` 没有 stdout，所以差别看不出来；
+            // `logcat -d` 这种**慢慢吐输出**的命令则会 100% 拿到空串。
+            // 真机实测（2026-10-07）：`FreeformCaption` 的自动校准 297/297 次都读回空、**0 次成功**，
+            // 就是这么来的——这条「异常提前返回」是它从来没生效过的**唯一**原因。
+            // 所以这里先等进程真正退出，再把读线程收干，最后才返回。
             DebugLog.warn("SHIZUKU_EXEC_BENIGN_EXIT", command, null)
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                if (runCatching { process.exitValue() }.isSuccess) break
+                Thread.sleep(EXIT_POLL_MS)
+            }
+            stdoutReader.join(READER_JOIN_MS)
+            stderrReader.join(READER_JOIN_MS)
             ShellResult(0, stdout.toString(), stderr.toString())
         } catch (exception: Exception) {
             DebugLog.error("SHIZUKU_EXEC_FAILED", command, exception)
@@ -171,6 +189,12 @@ object ShizukuShell {
             ShellResult(-1, "", "Shizuku 运行时不可用")
         }
     }
+
+    /** 等进程退出时的轮询间隔（见 [run] 的「异常提前返回」分支）。 */
+    private const val EXIT_POLL_MS = 20L
+
+    /** 进程退出后，等读线程把剩余输出收干的上限。 */
+    private const val READER_JOIN_MS = 1_000L
 
     /**
      * `Shizuku.newProcess` 在 Shizuku 13 里不是公开 API（编译期不可见），但它确实存在于

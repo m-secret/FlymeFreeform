@@ -447,11 +447,18 @@ object Ui {
      *
      * 整行可点：手指落在文字上也应该切换开关，不然点起来要够那个小小的滑块。
      */
+    /**
+     * 开关行。
+     *
+     * [enabled] = false 时整行不可点、开关也置灰——用于「前置条件没满足就不该能开」的场景，
+     * 例如无障碍服务没连上时，「启用窗外点击关闭」开了也不会生效，就不该让人打开。
+     */
     fun switchRow(
         context: Context,
         text: String,
         checked: Boolean,
         detail: String? = null,
+        enabled: Boolean = true,
         onChange: (Boolean) -> Unit,
     ): View {
         val container = row(context)
@@ -465,11 +472,18 @@ object Ui {
         val toggle =
             Switch(context).apply {
                 isChecked = checked
+                isEnabled = enabled
                 setOnCheckedChangeListener { _, v -> onChange(v) }
             }
         container.addView(toggle)
-        container.isClickable = true
-        container.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        if (enabled) {
+            container.isClickable = true
+            container.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        } else {
+            // 不可点时把点击去掉，[CardGroup] 会据此不再给这一行刷涟漪（见 restyle 里的 clickable）。
+            texts.alpha = DISABLED_ALPHA
+            toggle.alpha = DISABLED_ALPHA
+        }
         return container
     }
 
@@ -577,6 +591,18 @@ object Ui {
             isClickable = true
             setOnClickListener { onClick() }
         }
+
+    /**
+     * 把按钮切成**禁用 / 可用**。
+     *
+     * `View.isEnabled = false` 会让 `OnClickListener` 不再触发，但背景与文字色不会自动变，
+     * 所以这里再用 alpha 统一压暗一遍（[DISABLED_ALPHA]，和列表行的禁用观感一致）。
+     */
+    fun setButtonEnabled(button: TextView, enabled: Boolean) {
+        button.isEnabled = enabled
+        button.isClickable = enabled
+        button.alpha = if (enabled) 1f else DISABLED_ALPHA
+    }
 
     /**
      * Filled button：primary 底 + onPrimary 字。

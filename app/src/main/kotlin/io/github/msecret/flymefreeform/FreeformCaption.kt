@@ -56,7 +56,12 @@ object FreeformCaption {
      */
     private const val CACHE_TTL_MS = 30 * 60 * 1000L
 
-    /** 「快速上滑关闭」的距离与时长——和 ColorOS 自带手势一致（520px / 260ms 量级）。 */
+    /**
+     * 一次 [closeSwipe] 用的**上滑距离与时长**——和 ColorOS 自带手势同量级（555px / 260ms）。
+     *
+     * 真机实测（平板，横条点上滑 555px/260ms）：3/3 全部判成关闭
+     * （`startGestureUpOrDown currY=-555 yVel=-2121` → `mGeatureMode.get()=0`）。
+     */
     private const val CLOSE_SWIPE_DISTANCE_PX = 555
     private const val CLOSE_SWIPE_DURATION_MS = 260
 

@@ -1574,9 +1574,10 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 两种用法（上滑关闭 / 单击关闭）都要这一层校验，所以抽在这里。
      */
     private fun usableCaptionPoint(bounds: Rect?, tag: String): android.graphics.Point? {
-        if (!FreeformCaption.isUsable()) {
-            FreeformCaption.refresh(this, force = true)
-        }
+        // **只读缓存，绝不在这里同步学**：本函数跑在 `closeHandler`（主 looper）上，
+        // 而读一次 `logcat -d` 要几百毫秒（真机实测 200~500ms），同步做会把整条关闭流程拖住。
+        // 学习由 [maybeLearnCaption] 在**每次窗口刷新时**丢到 [captionWorker] 后台做
+        // （[FreeformCaption] 自带 3 秒节流），窗口一出现坐标就备好了，这里直接用。
         val point = FreeformCaption.cachedPoint() ?: return null
         if (bounds != null && !nearFreeform(point, bounds)) {
             DebugLog.warn("${tag}_STALE", "学到的坐标 $point 不在当前小窗 $bounds 里（多半是上一扇窗留下的），忽略")

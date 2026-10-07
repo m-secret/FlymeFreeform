@@ -32,6 +32,14 @@ class OutsideTapSettingsActivity : Activity() {
      */
     private lateinit var switchSection: LinearLayout
 
+    /**
+     * 「关闭落点校准」那一段的容器。
+     *
+     * 它**不在折叠区里**：这是「小窗关不掉 / 把下层应用滑走了」时唯一能自救的旋钮，
+     * 用户明确要求别藏起来；打开准星之后整组还会高亮（见 [renderCalibration]）。
+     */
+    private lateinit var calibrationSection: LinearLayout
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
@@ -46,6 +54,15 @@ class OutsideTapSettingsActivity : Activity() {
                 this,
                 "在小窗**外面**点一下（或两下）就把小窗关掉。实现方式是在小窗四周铺一层透明遮罩，" +
                     "所以必须先开无障碍服务。",
+            ),
+        )
+        // 用户 2026-10-07：「关闭落点校准这个优先级比较高，得让用户知道它在不生效时应该调它」。
+        // 放在**页首**——出问题的人第一眼就该看到这条路，而不是翻到折叠区里找。
+        root.addView(
+            Ui.hint(
+                this,
+                "**小窗关不掉、或者关的时候把下层应用滑走了？** 那是落点没压在小横条上 —— " +
+                    "去下面的**「关闭落点校准」**，打开准星照着红点调一下就好。",
             ),
         )
 
@@ -67,61 +84,45 @@ class OutsideTapSettingsActivity : Activity() {
             ),
         )
         root.addView(Ui.spacer(this))
-        root.addView(
-            Ui.tonalButton(this, "打开无障碍设置") {
-                FreeformAccessibilityService.openSettings(this)
-            },
-        )
-
-        // ---- 遮罩范围 ----
-        root.addView(Ui.sectionTitle(this, "遮罩范围"))
-        root.addView(
-            CardGroup(this)
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "只遮左右两边",
-                        store.outsideTapSidesOnly,
-                        detail = "减少误触上下",
-                    ) { checked ->
-                        store.outsideTapSidesOnly = checked
-                        FreeformAccessibilityService.refreshIfRunning()
-                    },
-                )
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "只遮上下两边",
-                        store.outsideTapVerticalOnly,
-                        detail = "避开左右返回手势",
-                    ) { checked ->
-                        store.outsideTapVerticalOnly = checked
-                        FreeformAccessibilityService.refreshIfRunning()
-                    },
-                ),
-        )
-        root.addView(
-            Ui.hint(
-                this,
-                "两项都不开 = 四边全遮（默认）。两项是同一件事的两端、互斥：都开等于哪边都不遮，所以选一个就会自动取消另一个。",
-            ),
-        )
 
         // ---- 关闭方式 ----
         root.addView(Ui.sectionTitle(this, "关闭方式"))
-        val selectedMode = store.outsideTapCloseMode
         val modeGroup = CardGroup(this)
         root.addView(modeGroup)
-        renderCloseMode(modeGroup, selectedMode == SettingsStore.CLOSE_MODE_CAPTION_AUTO)
+        renderCloseMode(modeGroup)
         root.addView(
             Ui.hint(
                 this,
-                "两种方式执行的都是同一个动作：在小窗底部的小横条上模拟一次快速上滑" +
-                    "（那是 ColorOS 手势模式**自带**的关闭手势）。区别只在落点怎么定：\n" +
-                    "第一种按小窗边界估算，不需要额外权限；第二种从系统日志里读小横条的**真实坐标**，" +
-                    "窗口拉伸也不会偏，但需要 Shizuku，且失效时会自动回退到估算。",
+                "动作是：在小窗底部的小横条上模拟一次快速上滑（那是 ColorOS 手势模式**自带**的关闭手势），" +
+                    "落点按小窗边界估算，不需要额外权限。",
             ),
         )
+        root.addView(
+            Ui.hint(
+                this,
+                "如果小窗关不掉、或者把下层应用滑动了，多半是落点没压在小横条上 —— " +
+                    "打开下面的**「显示关闭落点准星」**，红点会画在落点上，照着调那两项即可。",
+            ),
+        )
+
+        // ---- 关闭落点校准（常显，不折叠）----
+        //
+        // 用户 2026-10-07 要求：**不要把它藏起来**。这是「小窗关不掉 / 把下层应用滑走了」时
+        // 唯一能自救的旋钮；打开准星之后整组会高亮，提示用户照着红点校准。
+        root.addView(Ui.sectionTitle(this, "关闭落点校准"))
+        calibrationSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(calibrationSection)
+        renderCalibration()
+
+        // ---- 遮罩范围 ----
+        //
+        // 两项**互斥**，必须整组重画（见 [renderMaskRange]）：只在提示里写「互斥」而代码不管，
+        // 用户实测「只遮左右」和「只遮上下」还是能同时打开。
+        // 位置放在「关闭落点校准」之后：落点不对是「关不掉」的头号原因，优先让人看到。
+        root.addView(Ui.sectionTitle(this, "遮罩范围"))
+        val maskSection = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(maskSection)
+        renderMaskRange(maskSection)
 
         // ---- 高级设置 ----
         root.addView(Ui.sectionTitle(this, "高级设置"))
@@ -167,52 +168,8 @@ class OutsideTapSettingsActivity : Activity() {
             ),
         )
 
-        advanced.addView(Ui.sectionTitle(this, "校准关闭落点"))
-        advanced.addView(
-            CardGroup(this)
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "显示关闭落点准星",
-                        store.closeAnchorMarkerEnabled,
-                        detail = "在有「按边界估算」的小窗上画一个红点",
-                    ) { checked ->
-                        store.closeAnchorMarkerEnabled = checked
-                        FreeformAccessibilityService.refreshIfRunning()
-                    },
-                )
-                .row(
-                    seekRow(
-                        label = "点击位置横向",
-                        value = store.closeAnchorXPercent,
-                        min = SettingsStore.MIN_CLOSE_ANCHOR_X_PERCENT,
-                        max = SettingsStore.MAX_CLOSE_ANCHOR_X_PERCENT,
-                        detail = "占小窗宽度 %（50 = 水平中点）",
-                    ) { value ->
-                        store.closeAnchorXPercent = value
-                        FreeformAccessibilityService.refreshIfRunning()
-                    },
-                )
-                .row(
-                    seekRow(
-                        label = "点击位置距小窗底边",
-                        value = store.closeAnchorYDp,
-                        min = SettingsStore.MIN_CLOSE_ANCHOR_Y_DP,
-                        max = SettingsStore.MAX_CLOSE_ANCHOR_Y_DP,
-                        detail = "dp，正数往窗内、负数往窗外",
-                    ) { value ->
-                        store.closeAnchorYDp = value
-                        FreeformAccessibilityService.refreshIfRunning()
-                    },
-                ),
-        )
-        advanced.addView(
-            Ui.hint(
-                this,
-                "只在「按边界估算」的关闭方式下生效。打开准星后小窗底部会出现红点，" +
-                    "调到正好压在小横条上即可。",
-            ),
-        )
+        // 「校准关闭落点」原来在这一节里，已按用户要求**搬到页面常显区**（见 [renderCalibration]）：
+        // 它是「关不掉 / 把下层应用滑走了」时唯一能自救的旋钮，不该藏在折叠区后面。
 
         advanced.addView(Ui.sectionTitle(this, "兜底与调试"))
         advanced.addView(
@@ -256,6 +213,122 @@ class OutsideTapSettingsActivity : Activity() {
     }
 
     /**
+     * 重画「遮罩范围」两个开关。
+     *
+     * 两项是**同一件事的两端**（`sidesOnly` 只遮左右、`verticalOnly` 只遮上下），都开等于
+     * 哪边都不遮——窗外点击直接失效。所以它们**必须互斥**：选一个就把另一个关掉。
+     * 之前只在提示里写了「选一个会自动取消另一个」而代码里没做，用户实测「两个还是能同时打开」。
+     *
+     * 用 [CardGroup] 整组重画（不是往 `rows` 追加），否则会复制出一堆行。
+     */
+    private fun renderMaskRange(section: LinearLayout) {
+        section.removeAllViews()
+        section.addView(
+            CardGroup(this)
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "只遮左右两边",
+                        store.outsideTapSidesOnly,
+                        detail = "减少误触上下",
+                    ) { checked ->
+                        store.outsideTapSidesOnly = checked
+                        // 互斥：开这个就关另一个。
+                        if (checked) store.outsideTapVerticalOnly = false
+                        FreeformAccessibilityService.refreshIfRunning()
+                        renderMaskRange(section)
+                    },
+                )
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "只遮上下两边",
+                        store.outsideTapVerticalOnly,
+                        detail = "避开左右返回手势",
+                    ) { checked ->
+                        store.outsideTapVerticalOnly = checked
+                        if (checked) store.outsideTapSidesOnly = false
+                        FreeformAccessibilityService.refreshIfRunning()
+                        renderMaskRange(section)
+                    },
+                ),
+        )
+        section.addView(
+            Ui.hint(
+                this,
+                "两项都不开 = 四边全遮（默认）。两项是同一件事的两端、**互斥**：" +
+                    "选一个会自动取消另一个（都开等于哪边都不遮，窗外点击就失效了）。",
+            ),
+        )
+    }
+
+    /**
+     * 重画「关闭落点校准」。
+     *
+     * 打开「显示关闭落点准星」之后整组**高亮**：标题下多一枚主色药丸 + 一句加粗提示。
+     * 这是用户 2026-10-07 的要求——「开启时突出这个，让用户知道不对要校准」。
+     *
+     * 这一段**故意不放进折叠区**：落点不对时（关不掉、或者把下层应用滑走）它就是唯一的自救手段。
+     */
+    private fun renderCalibration() {
+        val on = store.closeAnchorMarkerEnabled
+        calibrationSection.removeAllViews()
+        if (on) {
+            calibrationSection.addView(Ui.pill(this, "照着小窗底部的红点调下面两项"))
+        }
+        calibrationSection.addView(
+            CardGroup(this)
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "显示关闭落点准星",
+                        on,
+                        detail = "小窗底部画一个红点，就是即将点击的位置",
+                    ) { checked ->
+                        store.closeAnchorMarkerEnabled = checked
+                        FreeformAccessibilityService.refreshIfRunning()
+                        renderCalibration()
+                    },
+                )
+                .row(
+                    seekRow(
+                        label = "点击位置横向",
+                        value = store.closeAnchorXPercent,
+                        min = SettingsStore.MIN_CLOSE_ANCHOR_X_PERCENT,
+                        max = SettingsStore.MAX_CLOSE_ANCHOR_X_PERCENT,
+                        detail = "占小窗宽度 %（50 = 水平中点）",
+                    ) { value ->
+                        store.closeAnchorXPercent = value
+                        FreeformAccessibilityService.refreshIfRunning()
+                    },
+                )
+                .row(
+                    seekRow(
+                        label = "点击位置距小窗底边",
+                        value = store.closeAnchorYDp,
+                        min = SettingsStore.MIN_CLOSE_ANCHOR_Y_DP,
+                        max = SettingsStore.MAX_CLOSE_ANCHOR_Y_DP,
+                        detail = "dp，正数往窗内、负数往窗外（默认 ${SettingsStore.DEFAULT_CLOSE_ANCHOR_Y_DP}）",
+                    ) { value ->
+                        store.closeAnchorYDp = value
+                        FreeformAccessibilityService.refreshIfRunning()
+                    },
+                ),
+        )
+        calibrationSection.addView(
+            Ui.hint(
+                this,
+                if (on) {
+                    "把红点调到**正好压在小窗底部那条小横条上**。调完把准星关掉即可，设置会保留。"
+                } else {
+                    "小窗关不掉、或者关的时候把下层应用滑动了？打开上面的准星——红点就是即将点击的位置，" +
+                        "照着它调下面两项。"
+                },
+            ),
+        )
+    }
+
+    /**
      * 重画「开关」整组。
      *
      * 顺序是用户点名的：**总开关在最上面**，单击 / 双击是它的子项——总开关关着的时候，
@@ -263,19 +336,23 @@ class OutsideTapSettingsActivity : Activity() {
      */
     private fun renderSwitchSection() {
         val on = store.outsideTapCloseEnabled
+        // 遮罩是**无障碍服务**铺的：无障碍没连上，这个开关开了也不会生效，所以**不让它开**
+        // （用户 2026-10-07 明确要求）。显示上也当成「关」，免得看着是开的、实际什么都不做。
+        val accessible = FreeformAccessibilityService.isConnected
         val group =
             CardGroup(this)
                 .row(
                     Ui.switchRow(
                         this,
                         "启用窗外点击关闭",
-                        on,
+                        on && accessible,
                         detail =
-                            if (on) {
-                                "遮罩已铺开，点小窗外即可关闭"
-                            } else {
-                                "关闭后遮罩不铺，窗外点击回到系统处理"
+                            when {
+                                !accessible -> "需要先开启无障碍服务，否则开了也不生效"
+                                on -> "遮罩已铺开，点小窗外即可关闭"
+                                else -> "关闭后遮罩不铺，窗外点击回到系统处理"
                             },
+                        enabled = accessible,
                     ) { checked ->
                         store.outsideTapCloseEnabled = checked
                         FreeformAccessibilityService.refreshIfRunning()
@@ -283,18 +360,18 @@ class OutsideTapSettingsActivity : Activity() {
                         renderSwitchSection()
                     },
                 )
-                .row(clickModeRow(SettingsStore.CLICK_MODE_SINGLE, "单击", "点一下窗外就关闭", on))
-                .row(clickModeRow(SettingsStore.CLICK_MODE_DOUBLE, "双击", "连点两下才关闭，减少误触", on))
+                .row(clickModeRow(SettingsStore.CLICK_MODE_SINGLE, "单击", "点一下窗外就关闭", on && accessible))
+                .row(clickModeRow(SettingsStore.CLICK_MODE_DOUBLE, "双击", "连点两下才关闭，减少误触", on && accessible))
         switchSection.removeAllViews()
         switchSection.addView(group)
         // 前置条件没满足时把话说清楚：遮罩是**无障碍服务**铺的，无障碍没连上，这里怎么开都不会生效。
         // 另外要说明「只在小窗存在时才铺」——用户在桌面上试一下，很容易以为开关坏了。
-        if (!FreeformAccessibilityService.isConnected) {
+        if (!accessible) {
             switchSection.addView(
                 Ui.hint(
                     this,
-                    "现在还不会生效：遮罩由无障碍服务铺开，需要先在主界面开启**无障碍服务**。" +
-                        "另外遮罩只在小窗存在时铺开，在桌面上看不出变化是正常的。",
+                    "现在还不会生效：遮罩由无障碍服务铺开，需要先在**系统设置 → 无障碍**里开启本应用的服务" +
+                        "（主界面也有入口）。另外遮罩只在小窗存在时铺开，在桌面上看不出变化是正常的。",
                 ),
             )
         }
@@ -319,32 +396,33 @@ class OutsideTapSettingsActivity : Activity() {
             renderSwitchSection()
         }
 
-    /** 重画「关闭方式」两行。注意用 [CardGroup.setRows]（替换）而不是 `rows`（追加），否则会复制。 */
-    private fun renderCloseMode(group: CardGroup, captionAuto: Boolean) {
-        group.setRows(
-            listOf(
-                Ui.choiceRow(
-                    context = this,
-                    title = "按小窗边界估算位置，上滑小横条关闭",
-                    detail = "不需要 Shizuku，由无障碍模拟手势",
-                    selected = !captionAuto,
-                ) {
-                    store.outsideTapCloseMode = SettingsStore.CLOSE_MODE_SWIPE_UP
-                    FreeformAccessibilityService.refreshIfRunning()
-                    renderCloseMode(group, false)
-                },
-                Ui.choiceRow(
-                    context = this,
-                    title = "Shizuku 自动定位后再上滑小横条",
-                    detail = "读小横条真实坐标，失效时回退到边界估算",
-                    selected = captionAuto,
-                ) {
-                    store.outsideTapCloseMode = SettingsStore.CLOSE_MODE_CAPTION_AUTO
-                    FreeformAccessibilityService.refreshIfRunning()
-                    renderCloseMode(group, true)
-                },
-            ),
-        )
+    /**
+     * 重画「关闭方式」。
+     *
+     * ★ 用户 2026-10-07 要求**隐藏「Shizuku 自动定位」那个选项**：它读系统日志拿小横条真实坐标，
+     * 但学到的是**绝对坐标**、属于学到那一刻的那一扇窗；屏上两扇以上时几乎必然是上一扇窗留下的
+     * 坐标，只能整条作废退回估算——用户实测「识别的位置不对」。多扇窗是常态，所以它实际帮不上忙，
+     * 还白起一个 Shizuku 子进程。
+     *
+     * 折回估算**没有行为回归**：那条自动路本来就一直在失败后退回估算
+     * （真机统计：297 次尝试、**0 次成功**）。见 [SettingsStore.migrateOffCaptionAutoMode]。
+     *
+     * 只剩一种行为，就不再是「单选」了，用一行纯说明呈现。
+     * 注意用 [CardGroup.setRows]（替换）而不是 `rows`（追加），否则会复制。
+     */
+    private fun renderCloseMode(group: CardGroup) {
+        val texts =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(Ui.rowTitle(this@OutsideTapSettingsActivity, "上滑小横条关闭"))
+                addView(
+                    Ui.rowDetail(
+                        this@OutsideTapSettingsActivity,
+                        "落点按小窗边界估算；不需要 Shizuku，由无障碍模拟手势",
+                    ),
+                )
+            }
+        group.setRows(listOf(Ui.row(this).apply { addView(texts) }))
     }
 
     /**

@@ -48,6 +48,14 @@ class MainActivity : Activity() {
     private lateinit var shizukuRow: PermissionRow
     private lateinit var accessibilityRow: PermissionRow
 
+    /**
+     * 「哪个功能要哪个权限」+「当前缺什么、少了它哪些用不了」的说明区。
+     *
+     * 用容器而不是一个固定 TextView：[refreshStatus] 每次按当前权限状态重建，
+     * 文案才能跟着变（[Ui.hint] 的加粗是在创建时处理的，事后改 `.text` 会丢掉加粗）。
+     */
+    private lateinit var permissionHintBox: LinearLayout
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppContext.attach(this)
@@ -94,7 +102,7 @@ class MainActivity : Activity() {
 
         overlayRow =
             permissionRow(
-                label = "悬浮窗权限",
+                label = "悬浮窗权限 · 主动呼出必需",
                 grantedText = "已授予",
                 deniedText = "未授予（必须）",
                 actionText = "去授权",
@@ -105,9 +113,9 @@ class MainActivity : Activity() {
             }
         notificationRow =
             permissionRow(
-                label = "通知权限",
+                label = "通知权限 · 只影响常驻通知",
                 grantedText = "已授予",
-                deniedText = "未授权",
+                deniedText = "未授权（可选）",
                 actionText = "去授权",
             ) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -116,7 +124,7 @@ class MainActivity : Activity() {
             }
         shizukuRow =
             permissionRow(
-                label = "Shizuku",
+                label = "Shizuku · 增强项，可选",
                 grantedText = "已授权",
                 deniedText = "未授权（可选）",
                 actionText = "去授权",
@@ -126,7 +134,7 @@ class MainActivity : Activity() {
             }
         accessibilityRow =
             permissionRow(
-                label = "无障碍服务",
+                label = "无障碍服务 · 窗外关闭 / 识屏 / 截屏",
                 grantedText = "已开启",
                 deniedText = "未开启",
                 actionText = "去开启",
@@ -140,6 +148,8 @@ class MainActivity : Activity() {
                 .row(shizukuRow.root)
                 .row(accessibilityRow.root),
         )
+        permissionHintBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(permissionHintBox)
         root.addView(Ui.spacer(this))
         root.addView(
             Ui.tonalButton(this, "用 Shizuku 把无障碍写回来") {
@@ -271,21 +281,64 @@ class MainActivity : Activity() {
         val a11yEnabled = FreeformAccessibilityService.isEnabledInSettings(this@MainActivity)
         val a11yConnected = FreeformAccessibilityService.isConnected
 
-        updatePermissionRow(overlayRow, overlayGranted, "已授予 · 主动呼出可用", "未授予（主动呼出必需）")
-        updatePermissionRow(notificationRow, notifications, "已授予", "未授权")
-        updatePermissionRow(shizukuRow, shizukuGranted, "已授权 · 自动定位/增强功能可用", "未授权 · 基础功能仍可用")
+        // 状态文字保持**短**：用途已经写在每行标题里了，这里再说一遍只会把整块撑长。
+        updatePermissionRow(overlayRow, overlayGranted, "已授予", "未授予")
+        updatePermissionRow(notificationRow, notifications, "已授予", "未授权（可选）")
+        updatePermissionRow(shizukuRow, shizukuGranted, "已授权", "未授权（可选）")
         updatePermissionRow(
             accessibilityRow,
             a11yEnabled && a11yConnected,
-            if (a11yConnected) "已连接 · 窗外关闭/点击透传/识屏/截屏可用" else "开关${if (a11yEnabled) "已开但未连接" else "未开"} · 相关功能暂不可用",
-            "未开启 · 相关功能暂不可用",
+            if (a11yConnected) "已连接" else "已开但未连接",
+            "未开启",
         )
         accessibilityRow.actionButton.text = if (a11yEnabled && !a11yConnected) "重新连接" else "去开启"
         accessibilityRow.actionButton.visibility = if (a11yConnected) View.GONE else View.VISIBLE
 
+        renderPermissionHints(overlayGranted, a11yConnected, shizukuGranted)
+
         serviceButton.text = if (OverlayGestureService.isRunning) "停止主动呼出" else "启动主动呼出"
+        // 悬浮窗权限是「主动呼出」的**唯一硬前提**：触摸条和扇形面板都是悬浮窗，没有它什么都铺不出来。
+        // 没授权就**置灰、点不动**（用户要求），而不是点下去才弹一句提示。
+        // 已经跑起来时永远允许点（那是「停止」），哪怕权限中途被撤。
+        Ui.setButtonEnabled(serviceButton, OverlayGestureService.isRunning || overlayGranted)
         (appManageButton.tag as? TextView)?.text =
             "管理扇形应用（已固定 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}）"
+    }
+
+    /**
+     * 只在**缺东西的时候**给一句可读的提示：少了它，哪些功能用不了、怎么补。
+     *
+     * 原来这里还挂着一整块「哪个功能要哪个权限」的说明，用户反馈「太丑了，一大块」——
+     * 那份对应关系已经压缩进每一行的**标题**里（见 [permissionRow] 的 label），
+     * 这里就只留真正需要用户动作的内容，没有缺项时这一块**什么都不显示**。
+     */
+    private fun renderPermissionHints(overlayGranted: Boolean, a11yConnected: Boolean, shizukuGranted: Boolean) {
+        permissionHintBox.removeAllViews()
+        val running = OverlayGestureService.isRunning
+        if (!overlayGranted) {
+            permissionHintBox.addView(
+                Ui.hint(
+                    this,
+                    "**缺悬浮窗权限**：主动呼出启动不了（下面按钮是灰的）。点上面那一行的按钮授权即可。",
+                ),
+            )
+        }
+        if (running && !a11yConnected) {
+            permissionHintBox.addView(
+                Ui.hint(
+                    this,
+                    "**缺无障碍服务**：扇形里的「点小窗外关闭」「识屏」「截屏」点了没反应，其余工具不受影响。",
+                ),
+            )
+        }
+        if (running && !shizukuGranted) {
+            permissionHintBox.addView(
+                Ui.hint(
+                    this,
+                    "**没有 Shizuku**：只是「小窗启动被拒时的兜底」和「关不掉时强制停掉该应用」用不了。",
+                ),
+            )
+        }
     }
 
     private fun toggleService() {
