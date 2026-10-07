@@ -614,12 +614,16 @@ class SettingsStore(context: Context) {
     /**
      * 「后台隐藏」：开启后本应用不出现在系统「最近任务」（Recents）里。
      *
-     * 默认关闭。**生效方式是运行时** `ActivityManager.AppTask.setExcludeFromRecents()`
-     * （见 [MainActivity.applyHideFromRecents]），**不是** manifest 里的
-     * `android:excludeFromRecents`——那个是编译期写死的，一旦加上就永远隐藏，用户没法随手关掉。
+     * 默认关闭。生效方式是**用户主动离开应用时把整个 task 结束并移除**（见 [AppContext]，
+     * 挂在 Application 的 `onActivityUserLeaveHint` 上）。
      *
-     * 注意这个标记是打在**当时已存在的 task** 上的：应用被从最近任务划掉后重新打开会新建
-     * 一个 task，所以每次回到界面都要按这个开关重新应用一遍。
+     * 这里有两个走过弯路的方案，都别再退回去：
+     * - manifest 里的静态 `android:excludeFromRecents`：编译期写死，一旦加上就永远隐藏，
+     *   用户没法随手关掉，不符合「开关」的语义。
+     * - `ActivityManager.AppTask.setExcludeFromRecents()`：**看着最对症但实测无效**。
+     *   真机（PMX110 / ColorOS 17 / Android 16）上它只把标志写进 task 的 baseIntent
+     *   （`dumpsys activity recents` 能看到 `flg=0x10800000`），**并不会把已经在「最近任务」
+     *   列表里的 task 移除**——AOSP 的 `RecentTasks` 只在 task 首次入列时看这个标志。
      */
     var hideFromRecents: Boolean
         get() = preferences.getBoolean(KEY_HIDE_FROM_RECENTS, false)

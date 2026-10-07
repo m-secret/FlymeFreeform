@@ -28,6 +28,15 @@ class LogActivity : Activity() {
         mainHandler.post { logView.text = lines.takeLast(LOG_VISIBLE_LINES).joinToString("\n") }
     }
 
+    /**
+     * 「后台隐藏」：用户主动离开应用时，把整个 task 结束并移出「最近任务」。
+     * 为什么必须逐个 Activity 挂、为什么不用别的 API，都写在 [AppContext.hideFromRecentsOnLeave]。
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        AppContext.hideFromRecentsOnLeave(this)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 同步日志开关到进程内 DebugLog（Service/无障碍同进程共享）。

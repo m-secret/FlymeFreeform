@@ -1,5 +1,6 @@
 package io.github.msecret.flymefreeform
 
+import android.app.Activity
 import android.content.Context
 
 /**
@@ -11,6 +12,8 @@ import android.content.Context
  *
  * 于是在进程最早能拿到 Context 的地方（[BootReceiver] / [OverlayGestureService] /
  * [MainActivity]）记一份 applicationContext，之后按需取。
+ *
+ * 另附一个「后台隐藏」的共享入口，见 [hideFromRecentsOnLeave]。
  */
 object AppContext {
     @Volatile
@@ -19,5 +22,49 @@ object AppContext {
     fun attach(context: Context) {
         val app = context.applicationContext
         if (app != null) value = app
+    }
+
+    /**
+     * 「后台隐藏」：在 Activity 的 `onUserLeaveHint()` 里调这一句。
+     *
+     * 用户**主动离开**应用时（按 Home、切到别的应用），把整个 task 结束掉，一并从系统的
+     * 「最近任务」里摘除。
+     *
+     * ## 为什么是「每个 Activity 各挂一行」而不是一处集中
+     *
+     * `Application.ActivityLifecycleCallbacks` **没有** user-leave-hint 这一类回调（只有
+     * created / started / resumed / paused / stopped / destroyed 那套，`javap` 确认过），
+     * 所以只能挂在各 Activity 的 `onUserLeaveHint()` 上。而「主动离开」可能发生在**任何一个**
+     * 界面上（主设置页、主动呼出、窗外点击关闭、应用管理、日志……），少挂一个就会出现
+     * 「在那个页面按 Home 就没隐藏」。
+     *
+     * ## 为什么不用 `AppTask.setExcludeFromRecents()`
+     *
+     * 第一版用的就是它（API 30+，看着最对症），真机实测（PMX110 / ColorOS 17 / Android 16）
+     * **不生效**，证据很明确：
+     * - 它**只生效了一半**——`dumpsys activity recents` 里能看到 task 的 baseIntent 变成了
+     *   `flg=0x10800000`（含 `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`），而 `am start` 自己只会给
+     *   `0x10000000`，那个标志确实是我们的代码写上去的；
+     * - 但 **task 依旧留在最近任务列表里**（按 Home 退到后台后仍在 `Recent #1`）。
+     *
+     * 原因是 AOSP 的 `RecentTasks` 只在 **task 首次加入列表那一刻**看这个标志；而应用代码最早
+     * 也只能跑到 `onCreate`／`onResume`，那时 task 早就进去了。之后再调
+     * `setExcludeFromRecents` **只改字段，不会把已在列表里的 task 移除**。所以这条路在「本次
+     * 开机、本次 task 生命周期」内兑现不了，只能改为主动移除。
+     *
+     * ## 为什么用 `onUserLeaveHint` 而不是 `onStop`
+     *
+     * `onStop` 在「点『去授权』跳到系统设置」时也会触发——那种情况用户是要回来的，不该把 task
+     * 摘掉；`onUserLeaveHint` 只在**用户主动离开**（Home / 切应用）时回调。
+     * （程序自己 `startActivity` 跳外部页面不会触发它，所以「去授权」那条路安全。）
+     *
+     * 代价说清楚：按 Home 后整个 Activity 栈会被结束，下次打开是冷启动（回到首页）。但这只影响
+     * 界面——[OverlayGestureService] 是独立的前台服务、无障碍服务更是系统级的，**功能一律不受
+     * 影响**。开关关掉时不走这个分支，行为与从前完全一致。
+     */
+    fun hideFromRecentsOnLeave(activity: Activity) {
+        // 已经在结束路上的（比如自己 finish）就不要再插一脚。
+        if (activity.isFinishing || activity.isDestroyed) return
+        if (SettingsStore(activity).hideFromRecents) activity.finishAndRemoveTask()
     }
 }
