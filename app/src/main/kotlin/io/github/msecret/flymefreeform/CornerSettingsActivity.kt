@@ -370,10 +370,11 @@ class CornerSettingsActivity : Activity() {
                         this,
                         "显示常驻通知",
                         store.showForegroundNotification,
-                        detail = "关掉 = 通知栏里彻底没有它（需要 Shizuku）",
+                        detail = "关掉 = 完全不发通知",
                     ) { checked ->
                         store.showForegroundNotification = checked
-                        applyNotificationVisibility(!checked)
+                        // 通知是前台服务启动时挂上去的，改完得让它按新设置重挂/撤掉一次。
+                        OverlayGestureService.reload(this)
                         renderNotificationPermHint()
                     },
                 )
@@ -392,13 +393,8 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "启动主动呼出后会常驻一条「主动呼出已开启」。\n" +
-                    "· **显示常驻通知**关掉后，通知栏里彻底没有它——靠 Shizuku 把本应用的通知" +
-                    "整体屏蔽；前台服务不受影响（真机实测服务照常运行）。\n" +
-                    "· **隐藏状态栏通知**打开后，通知还在，但切到静默渠道——不出声、不弹横幅、" +
-                    "不亮屏、不显示角标、不进锁屏，并且**可以划掉**；划掉之后这一轮不再出现，" +
-                    "直到服务下次重启（开机或再次「启动主动呼出」）。\n" +
-                    "上面那个关掉时，这一项就没有意义了。",
+                "「显示常驻通知」关掉后就**完全不发通知**；" +
+                    "「隐藏状态栏通知」是让它静默、不进锁屏、可划掉。",
             ),
         )
         notificationPermBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -445,47 +441,19 @@ class CornerSettingsActivity : Activity() {
             ),
         )
         notificationPermBox.addView(
-            Ui.smallAction(this, "去系统设置里打开通知", emphasized = false) {
-                runCatching {
-                    startActivity(
-                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
-                    )
-                }
-            },
+            // 套一层横向容器：纵向 LinearLayout 里直接 addView 会**整宽拉满**，那就不是「小药丸」了。
+            Ui.actionRow(
+                this,
+                Ui.smallAction(this, "去系统设置里打开通知", emphasized = false) {
+                    runCatching {
+                        startActivity(
+                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName),
+                        )
+                    }
+                },
+            ),
         )
-    }
-
-    /**
-     * 「完全不显示通知」：让 Shizuku 去把本应用的通知**整体屏蔽 / 恢复**。
-     *
-     * 为什么必须借 Shizuku：Android 不允许应用自己把那条前台服务通知关掉——
-     * **删通知渠道会让 `startForeground` 抛异常、把服务直接干掉**（真机实测，
-     * 平板 `b37664b8` / Android 16），所以只能动系统级的 `POST_NOTIFICATION` 开关，
-     * 而那个只有 shell 身份写得动。依据见 `OverlayGestureService.setNotificationBlocked`。
-     *
-     * 放后台线程：一条 shell 命令要几百毫秒，压在 UI 线程上开关会卡一下。
-     */
-    private fun applyNotificationVisibility(hidden: Boolean) {
-        Thread(
-            {
-                val ok = OverlayGestureService.setNotificationBlocked(this, hidden)
-                runOnUiThread {
-                    android.widget.Toast.makeText(
-                        this,
-                        when {
-                            ok && hidden -> "已隐藏常驻通知"
-                            ok -> "已恢复显示通知"
-                            else -> "没有 Shizuku 权限，没法彻底隐藏；可去系统设置里关掉本应用的通知"
-                        },
-                        android.widget.Toast.LENGTH_SHORT,
-                    ).show()
-                    // 通知是前台服务启动时挂上去的，改完得让它重新挂一次。
-                    OverlayGestureService.reload(this)
-                }
-            },
-            "notification-visibility",
-        ).start()
     }
 
     /**

@@ -595,18 +595,17 @@ class SettingsStore(context: Context) {
     /**
      * 要不要那条「主动呼出已开启」的**常驻通知**。默认**开**（保持原有行为）。
      *
-     * 关掉它 = 通知栏里彻底没有这条通知。做法是把本应用的通知**整体屏蔽**
-     * （等价于用户在系统设置里关掉「允许通知」），靠 Shizuku 执行
-     * `cmd appops set --uid <pkg> POST_NOTIFICATION ignore` 做到——
-     * 见 `OverlayGestureService.setNotificationBlocked`，那里记着两条被实测否掉的路
-     * （**删通知渠道会让 `startForeground` 抛异常、服务当场崩溃**，别试）。
+     * 关掉它 = 通知栏里彻底没有这条通知。做法（见 `OverlayGestureService.startAsForeground`）：
+     * 先 `startForeground` 把**前台身份**立起来，再 `STOP_FOREGROUND_DETACH` 把通知与前台身份
+     * 解绑（前台身份保留），最后 `cancel` 掉那条通知本身。服务照旧是前台服务，不会被当成
+     * 后台服务收掉。**不需要 Shizuku。**
+     *
+     * 曾经用 `cmd appops set [--uid] <pkg> POST_NOTIFICATION ignore` 实现（需 Shizuku）——
+     * 真机实测（平板 `b37664b8` / Android 16，2026-10-07）**它拦不住前台服务通知**：
+     * appops 已是 `ignore`，服务重启后通知照样出现在状态栏。uid 级、包级都试过，已废弃。
      *
      * 与 [hideForegroundNotification]（静默）的区别：那个只是把通知压到最低重要级、
      * 变成可划掉，它**仍然躺在通知栏里**；这个是真的一点都不显示。
-     *
-     * 真机实测（平板 `b37664b8` / Android 16）：屏蔽之后通知记录数为 0，而
-     * `dumpsys activity services` 里 `isForeground=true`、`foregroundId=1001` 照旧，
-     * 服务不崩也不被降级。
      */
     var showForegroundNotification: Boolean
         get() = preferences.getBoolean(KEY_SHOW_NOTIFICATION, true)

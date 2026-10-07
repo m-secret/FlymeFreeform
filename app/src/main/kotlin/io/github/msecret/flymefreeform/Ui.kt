@@ -425,6 +425,21 @@ object Ui {
             )
         }
 
+    /**
+     * 把一枚「行内小动作」（[smallAction]）放进**不撑满宽度**的容器里。
+     *
+     * 纵向 `LinearLayout` 直接 `addView(view)`，默认布局参数是 **MATCH_PARENT 宽**
+     * （`LinearLayout.generateDefaultLayoutParams()`：竖排 = 整宽 + wrap 高），
+     * 于是那枚「小药丸」会被拉成一整条大按钮——用户反馈「太显眼、占用了一大块」就是这个。
+     * 横向容器里的默认参数才是 wrap 宽，药丸才是药丸。
+     */
+    fun actionRow(context: Context, action: View): LinearLayout =
+        LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(action)
+        }
+
     /** `bodyLarge`：行里的主文字。 */
     fun rowTitle(context: Context, text: String): TextView =
         TextView(context).apply {

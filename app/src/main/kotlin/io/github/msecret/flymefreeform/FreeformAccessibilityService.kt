@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
 import android.content.ContentValues
@@ -23,9 +24,11 @@ import android.view.View
 import kotlin.math.abs
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.FrameLayout
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * 「窗外点击关闭」的无障碍近似实现。
@@ -205,6 +208,9 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 第一次布局交给消息队列：`refresh()` 要查窗口（IPC），占着 `onServiceConnected`
         // 会拖长连接过程，卡太久同样会被系统当成无响应。
         handler.post { safeRefresh() }
+        // 设置页正等着这个信号（见 [addConnectionListener]）：**连上就当场刷新**，
+        // 不用靠时间窗口去轮询猜。放在最后调：这时 `instance` 和遮罩都已经就位。
+        notifyConnectionChanged()
     }
 
     /**
@@ -276,6 +282,7 @@ class FreeformAccessibilityService : AccessibilityService() {
             A11yTrace.append(this, "A11Y_DISCONNECTED 无障碍服务被断开（若紧接着系统把开关关了，就是被停用）")
         }.onFailure { DebugLog.error("A11Y_UNBIND_FAILED", null, it) }
         instance = null
+        notifyConnectionChanged()
         return super.onUnbind(intent)
     }
 
@@ -2472,6 +2479,30 @@ class FreeformAccessibilityService : AccessibilityService() {
         private var instance: FreeformAccessibilityService? = null
 
         /**
+         * 「无障碍服务连上 / 断开」的监听器（设置页用）。
+         *
+         * 为什么要事件而不是轮询：用户报过「用 Shizuku 写回无障碍后**识别不到**，退出软件
+         * 再进来才行」。原来点完「写回」是**轮询**等 `isConnected`（每 400ms、最多 10 秒），
+         * 而 `settings put` 之后系统要过一会儿才 bind 本服务，**开机后第一次尤其慢**——
+         * 一旦超过 10 秒，界面就再也不刷了，只能靠退出重进（那时走 `onResume` 才又读一次）。
+         * 现在改成：连上的那一刻由服务自己通知界面，多长时间都不会漏。
+         */
+        private val connectionListeners = CopyOnWriteArrayList<() -> Unit>()
+
+        fun addConnectionListener(listener: () -> Unit) {
+            connectionListeners.addIfAbsent(listener)
+        }
+
+        fun removeConnectionListener(listener: () -> Unit) {
+            connectionListeners.remove(listener)
+        }
+
+        /** 在**主线程**上调用（`onServiceConnected` / `onUnbind` 都跑在主线程）。 */
+        private fun notifyConnectionChanged() {
+            connectionListeners.forEach { runCatching { it() } }
+        }
+
+        /**
          * 小窗刚被拉起时调一次（见 [OverlayGestureService.launch]）。
          *
          * 让服务在接下来两秒多里密集重探窗口，把小窗「落定」的那一刻尽早抓住——
@@ -2559,8 +2590,23 @@ class FreeformAccessibilityService : AccessibilityService() {
         fun takeScreenshot(context: Context, callback: (Boolean, String) -> Unit): Boolean =
             instance?.captureScreenshot(context.applicationContext, callback) ?: false
 
-        /** 从系统设置里读「本服务是否已被用户开启」，比内存标志更可靠。 */
-        fun isEnabledInSettings(context: Context): Boolean {
+        /**
+         * 本服务在系统里是不是「开着」。
+         *
+         * **不能只看 `Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES`**：真机实测
+         * （平板 `b37664b8` / Android 16 / ColorOS 16）把应用从最近任务划掉再重开时，
+         * 那条设置会**短暂地丢掉本服务**——`settings get` 只剩别的服务，而无障碍服务其实
+         * 已经由系统连上了，几十秒后系统又把那条设置自己写回来。界面要是只认设置，这个
+         * 窗口里就会显示「未开启」，正是用户报的「无障碍是开着的，但还是显示未开启」。
+         *
+         * 所以再加一路更权威的判据：问 [AccessibilityManager] 要「已启用的服务列表」，
+         * 那正是 `dumpsys accessibility` 里 `Enabled services:` 那一行的来源。
+         */
+        fun isEnabledInSettings(context: Context): Boolean =
+            listedInSecureSettings(context) || enabledAccordingToManager(context)
+
+        /** 系统设置里点名的那一份名单（会被 ColorOS 短暂改写，见 [isEnabledInSettings]）。 */
+        private fun listedInSecureSettings(context: Context): Boolean {
             val raw =
                 runCatching {
                     Settings.Secure.getString(
@@ -2574,6 +2620,29 @@ class FreeformAccessibilityService : AccessibilityService() {
                 val component = ComponentName.unflattenFromString(entry) ?: return@any false
                 component.packageName == packageName && component.className == className
             }
+        }
+
+        /**
+         * 问无障碍服务管理器要「已启用的服务」，比读设置可靠。
+         *
+         * 注意它反映的是**框架认定的启用状态**，与「服务进程有没有连上」（[isConnected]）
+         * 是两件事：这里是「开关是开的」。
+         */
+        private fun enabledAccordingToManager(context: Context): Boolean {
+            val manager =
+                runCatching { context.getSystemService(AccessibilityManager::class.java) }.getOrNull()
+                    ?: return false
+            val expected = ComponentName(context, FreeformAccessibilityService::class.java)
+            return runCatching {
+                manager
+                    .getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+                    .any { info ->
+                        val service = info.resolveInfo?.serviceInfo
+                        service != null &&
+                            service.packageName == expected.packageName &&
+                            service.name == expected.className
+                    }
+            }.getOrDefault(false)
         }
 
         fun openSettings(context: Context) {

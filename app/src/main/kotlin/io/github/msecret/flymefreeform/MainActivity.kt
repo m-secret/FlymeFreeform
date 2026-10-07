@@ -51,11 +51,23 @@ class MainActivity : Activity() {
      */
     private lateinit var permissionHintBox: LinearLayout
 
+    /**
+     * 无障碍「连上 / 断开」的回调，注册在服务端（见 [FreeformAccessibilityService.addConnectionListener]）。
+     *
+     * 用事件而不是轮询：原来点完「用 Shizuku 写回无障碍」是等 10 秒（每 400ms 看一次），
+     * 而系统 bind 本服务可能更慢——开机后第一次尤其慢。用户看到的就成了「写回之后识别不到，
+     * 退出软件再进来才行」。现在服务一连上就回调这里，多久都不会漏。
+     */
+    private val a11yConnectionListener: () -> Unit = { if (!isFinishing && !isDestroyed) refreshStatus() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AppContext.attach(this)
         store = SettingsStore(this)
         setContentView(buildContent())
+        // **先挂监听、再刷状态**：反过来的话，「刷状态」与服务「连上」挤在同一瞬间时，
+        // 那次回调会因为监听还没挂上而丢掉，界面就停在旧状态（用户报的「重进后显示未开启」）。
+        FreeformAccessibilityService.addConnectionListener(a11yConnectionListener)
         refreshStatus()
         // Shizuku 服务可用时自动重连/恢复授权，减少系统重启、软件更新后手动再点。
         ShizukuShell.startAutoReconnect()
@@ -74,6 +86,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        FreeformAccessibilityService.removeConnectionListener(a11yConnectionListener)
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -246,16 +259,19 @@ class MainActivity : Activity() {
         // 状态文字保持**短**：用途已经写在每行标题里了，这里再说一遍只会把整块撑长。
         updatePermissionRow(overlayRow, overlayGranted, "已授予", "未授予")
         updatePermissionRow(shizukuRow, shizukuGranted, "已授权", "未授权（可选）")
+        // ✓ 与否**只看「有没有连上」**，不看那个可能被系统短暂改写的开关（见
+        // [FreeformAccessibilityService.isEnabledInSettings]）：连上了就是连上了，
+        // 这时候还显示「未开启」正是用户报的那个 bug。
         updatePermissionRow(
             accessibilityRow,
-            a11yEnabled && a11yConnected,
+            a11yConnected || a11yEnabled,
             if (a11yConnected) "已连接" else "已开但未连接",
             "未开启",
         )
         accessibilityRow.actionButton.text = if (a11yEnabled && !a11yConnected) "重新连接" else "去开启"
         accessibilityRow.actionButton.visibility = if (a11yConnected) View.GONE else View.VISIBLE
 
-        renderPermissionHints(overlayGranted, a11yConnected, shizukuGranted)
+        renderPermissionHints(overlayGranted, a11yConnected, a11yEnabled, shizukuGranted)
 
         serviceButton.text = if (OverlayGestureService.isRunning) "停止主动呼出" else "启动主动呼出"
         // 悬浮窗权限是「主动呼出」的**唯一硬前提**：触摸条和扇形面板都是悬浮窗，没有它什么都铺不出来。
@@ -273,7 +289,12 @@ class MainActivity : Activity() {
      * 那份对应关系已经压缩进每一行的**标题**里（见 [permissionRow] 的 label），
      * 这里就只留真正需要用户动作的内容，没有缺项时这一块**什么都不显示**。
      */
-    private fun renderPermissionHints(overlayGranted: Boolean, a11yConnected: Boolean, shizukuGranted: Boolean) {
+    private fun renderPermissionHints(
+        overlayGranted: Boolean,
+        a11yConnected: Boolean,
+        a11yEnabled: Boolean,
+        shizukuGranted: Boolean,
+    ) {
         permissionHintBox.removeAllViews()
         val running = OverlayGestureService.isRunning
         if (!overlayGranted) {
@@ -304,42 +325,34 @@ class MainActivity : Activity() {
         //
         // 它原来是一个常显的 tonal 大按钮 + 四行说明，用户反馈「太显眼、占用了一大块」。
         // 现在只在**真的缺**的时候才露出来：平时无障碍正常，这一块完全不存在。
-        if (!a11yConnected && shizukuGranted) {
+        // 「一键写回」只在**开关真的没了**（系统把名单清了）时给。
+        //
+        // 开关还在、只是服务还没连上（重开应用后那一两秒就是这种状态）时不给：那种情况写回
+        // 也帮不上忙，而且会让这颗药丸在启动瞬间闪一下又消失。
+        if (!a11yConnected && !a11yEnabled && shizukuGranted) {
             permissionHintBox.addView(
                 Ui.hint(this, "重启后系统常把无障碍开关清掉，可一键写回系统名单。"),
             )
+            // 外面套一层横向容器：纵向 `LinearLayout.addView(view)` 的默认布局参数是
+            // **整宽**（MATCH_PARENT），不套的话这颗「小药丸」会被拉成一整条大按钮
+            // ——用户说的「太显眼、占用了一大块」就是这个。
             permissionHintBox.addView(
-                Ui.smallAction(this, "用 Shizuku 写回无障碍", emphasized = false) {
-                    // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是 WRITE_SECURE_SETTINGS
-                    // 保护的系统设置），但 Shizuku 的 shell 身份写得动。
-                    val ok = AccessibilityGrant.restore(this)
-                    android.widget.Toast.makeText(
-                        this,
-                        if (ok) "已写回系统名单，稍等片刻会自动连上" else "写回失败，请手动去无障碍设置里打开",
-                        android.widget.Toast.LENGTH_SHORT,
-                    ).show()
-                    pollAccessibilityConnected(0)
-                },
+                Ui.actionRow(
+                    this,
+                    Ui.smallAction(this, "用 Shizuku 写回无障碍", emphasized = false) {
+                        // 系统把开关清掉之后，应用自己**没有权限**再打开它（那是
+                        // WRITE_SECURE_SETTINGS 保护的系统设置），但 Shizuku 的 shell 身份写得动。
+                        val ok = AccessibilityGrant.restore(this)
+                        android.widget.Toast.makeText(
+                            this,
+                            if (ok) "已写回系统名单，系统连上后状态会自动变" else "写回失败，请手动去无障碍设置里打开",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                        // 不用在这里等：服务连上时自己会回调（见 [a11yConnectionListener]）。
+                    },
+                ),
             )
         }
-    }
-
-    /**
-     * 写回无障碍之后**轮询**到服务真的连上（或超时），再刷新界面。
-     *
-     * 只刷一次是不够的：`AccessibilityGrant.restore` 只是把组件写进系统名单，系统还要过一会儿
-     * 才把服务 bind 起来。用户反馈「用 Shizuku 开启无障碍后软件识别不到，得退出重进才行」，
-     * 就是这里只刷了一次、而那一刻服务还没连上——退出重进会走 `onResume` → `refreshStatus`，
-     * 所以看起来「重进就好」。
-     */
-    private fun pollAccessibilityConnected(attempt: Int) {
-        if (isFinishing || isDestroyed) return
-        // 每 400ms 看一次，最多 25 次（≈10 秒）。
-        if (FreeformAccessibilityService.isConnected || attempt >= 25) {
-            refreshStatus()
-            return
-        }
-        mainHandler.postDelayed({ pollAccessibilityConnected(attempt + 1) }, 400L)
     }
 
     private fun toggleService() {
