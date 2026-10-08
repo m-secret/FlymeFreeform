@@ -11,14 +11,14 @@ import android.view.View
 import kotlin.math.hypot
 
 /**
- * 扇形菜单。**占满全屏、窗口可触摸**（`OverlayGestureService.showMenu` 里刻意不加
+ * 轮盘菜单。**占满全屏、窗口可触摸**（`OverlayGestureService.showMenu` 里刻意不加
  * `FLAG_NOT_TOUCHABLE`，理由见那处注释：带上它会被 ColorOS 记一个恒定 `alpha=0.8`，图标发白）。
  *
  * 呼出阶段的指针流仍然由角落触摸条独占——那条窗口是 modal 的，DOWN 落在它身上之后整条流都归它，
  * 这里只是被动接收 `update()`；松手进粘滞态后，点击才真正由本视图的 [onTouchEvent] 处理。
  *
  * 坐标系：极坐标原点放在**真正的屏幕角落**（只留几 dp 余量），而不是扣掉导航栏高度后的位置。
- * 导航栏内缩只用于触摸区（[CornerGeometry.bottomInset]），把菜单原点也一起内缩会让整个扇形
+ * 导航栏内缩只用于触摸区（[CornerGeometry.bottomInset]），把菜单原点也一起内缩会让整个轮盘
  * 明显往屏幕中间缩。
  *
  * 槽位顺序：**0 号槽位固定是「更多」，它落在弧的最低端**（最贴近屏幕底部的那一格），
@@ -26,8 +26,11 @@ import kotlin.math.hypot
  *
  * 观感（对着魅族官方的实测截图一格一格量出来的，见 `noroot/VERIFY.md`）：
  *
- * - **不整屏压暗**。官方就是原始图标直接浮在页面上；压一层暗幕会把图标也一起压灰——
- *   用户说的「图标遮罩」就是这个。
+ * - **衬底画在图标之前，图标自身永远不透明**。用户 2026-10-08 要求照魅族官方加一层「透明灰色的层」
+ *   提升图标对比度（见 [onDraw] 的 ①）：它是一块**半透明矩形垫在图标下面**，暗的是背景、不是图标。
+ *   ⚠️ 当年被否掉的「压暗」是**整层 alpha** 那种——它把图标也一起冲淡成「发白、像蒙了层遮罩」。
+ *   两者只差一个「画在图标前还是叠在整层上」，观感天差地别，**别把这条规矩反过来**。
+ *   不透明度归 0 时这一笔不画，退回「原始图标直接浮在页面上」。
  * - **入场也不整层淡入**（见 [playEnterAnimation]）。这层是**透明的悬浮层**，降整体 alpha 的观感
  *   同样是「图标被冲淡」，所以图标必须从第一帧起就是不透明的。
  *   ⚠️ 但用户报的「呼出来颜色是浅的、松手才正常」**真因不在这里**：那是**窗口级**的恒定
@@ -38,7 +41,7 @@ import kotlin.math.hypot
  *   用户 2026-10-08 的原话：「图标位置不动，只是左右晃动一定角度，15-30度」＋
  *   「动画要速度快，不要保持那么久，就很干脆利落」；转向最后定稿为「右下角顺时针晃角度然后回正，
  *   左下角相反」。⚠️ 口径**只用顺时针 / 逆时针**判，别再用「内侧 / 外侧」那套说法（会来回翻）。
- *   ⚠️ 这个动画**不是位移**。前后试过三版都被否掉：整盘水平平移（像扇形在滑动）、沿扇形弧线摆
+ *   ⚠️ 这个动画**不是位移**。前后试过三版都被否掉：整盘水平平移（像轮盘在滑动）、沿轮盘弧线摆
  *   （弧顶那几个图标看起来就是在左右横移）、把「从下晃到上」当成垂直平移。别再往位置偏移上改。
  *   幅度按 [swingDeg] 给（设置里可挑），时长 [SWING_ITEM_MS] 只有 180ms，相邻槽位错开启动时刻，
  *   于是各转各的、不整齐划一。刻意不走 alpha（理由同上）。
@@ -69,6 +72,24 @@ class RadialMenuView(context: Context) : View(context) {
      * 位图本身尺寸并不亏（≥ 绘制尺寸），糊的是**采样方式**。
      */
     private val iconPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+
+    /**
+     * 图标下面那层**灰色衬底**的画笔。颜色是纯黑，靠 [scrimAlpha] 控不透明度——
+     * 半透明黑叠在浅色页面上，观感就是用户说的「透明灰色层」。
+     *
+     * ⚠️ 它**只画在图标之前**（见 [onDraw]），绝不碰 `View.alpha` / 窗口 alpha。
+     * 这是它和当年被否掉的「整层压暗」的根本区别：那种做法会把图标自己也冲淡。
+     */
+    private val scrimPaint = Paint().apply { color = Color.BLACK }
+
+    /** 衬底的**目标**不透明度（0~255）。0 = 不垫。由设置 `SettingsStore.menuScrimPercent` 换算而来。 */
+    private var scrimAlphaTarget = 0
+
+    /** 衬底**当前**不透明度（0~255）。呼出时从 0 淡到 [scrimAlphaTarget]，见 [playScrimFade]。 */
+    private var scrimAlpha = 0
+
+    /** 衬底淡入动画。松手（[settle]）或重新呼出时要能掐掉。 */
+    private var scrimAnimator: android.animation.ValueAnimator? = null
 
     private val emptyTextPaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -101,10 +122,10 @@ class RadialMenuView(context: Context) : View(context) {
     /** 相邻两项之间的角度步进（度），由 [resolveGeometry] 按项数与半径算出。 */
     private var stepDeg = 0f
 
-    /** 扇形张角（度）。 */
+    /** 轮盘张角（度）。 */
     private var spanDeg = 0f
 
-    /** 扇形起始角（数学坐标系，y 向上，0° 为正右）。 */
+    /** 轮盘起始角（数学坐标系，y 向上，0° 为正右）。 */
     private var angleStartDeg = MenuGeometry.CENTER_ANGLE_DEG
 
     private val positions = ArrayList<Pair<Float, Float>>()
@@ -141,7 +162,7 @@ class RadialMenuView(context: Context) : View(context) {
     /** 选中态回弹动画。 */
     private var scaleAnimator: android.animation.ValueAnimator? = null
 
-    /** 扇形里是否带了「更多」这一格。 */
+    /** 轮盘里是否带了「更多」这一格。 */
     val hasMoreItem: Boolean get() = hasMore
 
     /** 当前是否停在「更多」那一格上。 */
@@ -172,12 +193,14 @@ class RadialMenuView(context: Context) : View(context) {
         iconSizeDp: Int,
         haptic: Boolean,
         swingDeg: Int,
+        scrimPercent: Int,
     ) {
         this.side = side
         this.apps = apps
         this.hasMore = hasMore
         this.hapticEnabled = haptic
         this.swingDeg = swingDeg
+        this.scrimAlphaTarget = (scrimPercent.coerceIn(0, 100) * 255 / 100)
         this.originX = cornerX
         this.originY = cornerY
         this.selectedIndex = -1
@@ -194,7 +217,55 @@ class RadialMenuView(context: Context) : View(context) {
         swingAnimator?.cancel()
         visibility = VISIBLE
         invalidate()
+        playScrimFade()
         playEnterAnimation()
+    }
+
+    /**
+     * 衬底淡入：**只插值衬底自己的不透明度**，图标从第一帧起就是全不透明的。
+     *
+     * 用户 2026-10-08 首版真机反馈：「太黑了，感觉屏幕就跟闪了一下」。
+     *
+     * 这是**两件事**，得分开治：
+     *  - 「太黑」= 黑的量给多了 ⇒ 改的是设置默认值（35% → 18%，见 `SettingsStore.menuScrimPercent`）。
+     *  - 「像闪了一下」= **出现的时机**：衬底原本在呼出的那一帧就整屏铺满，屏幕亮度一刀切，
+     *    这么**大面积的亮度突变**人眼会直接读成「闪」。所以给它一段淡入，让亮度是「渐暗」而不是「跳暗」。
+     *
+     * ⚠️ 这里**只插值衬底**（[scrimAlpha]），**绝不能改成整层 alpha 淡入**——整层会把图标一起
+     * 冲淡（见 [playEnterAnimation] 与类注释里那条规矩）。衬底画在图标**下面**，它自己淡入时
+     * 图标始终全不透明，这正是它和「整层淡入」的本质区别。
+     *
+     * 目标值为 0（不垫衬底）时不启动动画、也不画任何东西。
+     */
+    private fun playScrimFade() {
+        scrimAnimator?.cancel()
+        if (scrimAlphaTarget <= 0) {
+            scrimAlpha = 0
+            return
+        }
+        val target = scrimAlphaTarget
+        scrimAlpha = 0
+        val animator =
+            android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = SCRIM_FADE_MS
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { value ->
+                    scrimAlpha = (target * (value.animatedValue as Float)).toInt()
+                    invalidate()
+                }
+                addListener(
+                    object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            // 被掐断（松手 [settle] / 重新呼出）时也要落到目标值：停在半路会让
+                            // 衬底永远比设置浅一截，而用户唯一的复位手段是松手。
+                            scrimAlpha = target
+                            invalidate()
+                        }
+                    },
+                )
+            }
+        scrimAnimator = animator
+        animator.start()
     }
 
     /**
@@ -202,7 +273,7 @@ class RadialMenuView(context: Context) : View(context) {
      *
      * **刻意不做整体淡入。** 早先这里是 `alpha = 0f` + 淡到 1（160ms），本意是「别太生硬」——
      * 但轮盘是一层**透明的悬浮层**，降整体 alpha 的观感就是「图标颜色被冲淡」。
-     * 图标本来就该是不透明的（官方同样是原始图标直接浮在页面上，见类注释里的「不整屏压暗」）。
+     * 图标本来就该是不透明的（灰衬底也只在图标**下面**，见 [onDraw] 的 ①）。
      * 柔化只交给放大动画。
      *
      * 另外叠一层**入场转动**（见 [enterSwingAngleDeg]）：每个图标**位置不动**，绕自己的圆心
@@ -210,7 +281,7 @@ class RadialMenuView(context: Context) : View(context) {
      * 首末帧都是正姿态。
      *
      * ⚠️ 关键是**这不是位移**。早先试过两版位移都被否掉了：「所有图标一起水平平移」（看起来是整块
-     * 扇形在滑动）和「沿扇形弧线前后摆」（靠近弧顶的图标看起来就是在左右横移），
+     * 轮盘在滑动）和「沿轮盘弧线前后摆」（靠近弧顶的图标看起来就是在左右横移），
      * 还有一版把用户说的「从下晃到上」照着字面做成了垂直平移。用户 2026-10-08 的原话是
      * 「图标位置不动，只是左右晃动一定角度」——**原地自转**才对；转向口径后来定稿成
      * 「右下角顺时针转个角度然后回正、左下角相反」。
@@ -284,7 +355,7 @@ class RadialMenuView(context: Context) : View(context) {
      * - **位置一动不动**：图标**绕自己的圆心**自转，圆心坐标不变——用户 2026-10-08 先说的是
      *   「图标位置不动，只是左右晃动一定角度」，后来定稿口径改成「右下角顺时针转个角度然后回正、
      *   左下角相反」。两句话说的是同一个动画（转出去 → 回正），不是两种做法。
-     *   ⚠️ 前后试过两版都被否掉了：整盘水平平移、沿扇形弧线摆（弧顶那几个图标看着就是在左右横移），
+     *   ⚠️ 前后试过两版都被否掉了：整盘水平平移、沿轮盘弧线摆（弧顶那几个图标看着就是在左右横移），
      *   以及把「从下晃到上」当成垂直平移。**这个动画不是位移，是自转**，别再往位置偏移上改。
      * - **转向按角定**：右下角先**顺时针**、左下角先**逆时针**，转出 [swingDeg] 那么大再回正
      *   （见 [swingDirectionSign]）。
@@ -358,6 +429,9 @@ class RadialMenuView(context: Context) : View(context) {
         // （那才是真的「只有松手才正常」）。
         swingAnimator?.cancel()
         swingElapsedMs = Float.MAX_VALUE
+        // 衬底也一样：淡到一半就松手时直接落到目标值，别让「呼出时浅、松手后深」这种差异留着。
+        scrimAnimator?.cancel()
+        scrimAlpha = scrimAlphaTarget
         // 兜底：入场已经不碰 alpha 了（见 [playEnterAnimation]），这里再钉一次不透明，
         // 免得日后有人又把「整层透明」这类状态引回来，让粘滞态也跟着发白。
         alpha = 1f
@@ -367,6 +441,56 @@ class RadialMenuView(context: Context) : View(context) {
         // update() 会因为「选中项没变」直接返回，连震带高亮一起静默。
         selectedIndex = -1
         invalidate()
+    }
+
+    /**
+     * **整体淡出**（衬底 + 图标一起渐隐），结束后回调 [onEnd]（服务那边收到就真正摘窗口）。
+     *
+     * ## 为什么是「整体」，而不是「只淡衬底」
+     *
+     * 2026-10-08 先做的是**只淡衬底**、图标保持清晰，本意是「别把图标冲淡」。真机上用户给的
+     * 反馈是「**退出轮盘感觉卡了一下**」—— 问题正出在这个不对称：背景在 200ms 里慢慢变亮，
+     * 图标却一直满血，最后窗口一摘**硬切**消失，看着就是「卡了一下」。
+     *
+     * 而且那条路每帧都要 `invalidate()` **重绘整个全屏 View**（含所有图标位图）；
+     * 整层 alpha 在硬件加速下只是改 RenderNode 的属性，**根本不触发重绘**。
+     * 又重、又不好看，所以退场只剩这一条路。
+     *
+     * ## 淡到 0 之后才摘窗口
+     *
+     * 摘窗口那一刻画面本来就空了，没有任何视觉突变 —— 这也是 [onEnd] 由动画结束时回调的原因。
+     *
+     * ## ⚠️ 入场依旧绝不做整层淡入
+     *
+     * 入场那一下仍然是「图标从第一帧起就不透明 + 衬底单独淡入」（见 [playScrimFade]）：
+     * **淡入**时降整层 alpha 会把图标冲淡成「发白」，那是用户当年报过的问题。
+     * **淡出**不同 —— 它是「渐隐到没有」，观感正常。这一进一出的不对称是**故意的**。
+     *
+     * ## 和「更多」面板的交叉
+     *
+     * 交给面板时（`OverlayGestureService.handOffMenuToDrawer`）走的也是这个方法：面板遮罩
+     * 从 0 淡到 60%，轮盘这层同时从 1 淡到 0，两层交叉出**单调变暗**的曲线，中间不留空档。
+     */
+    fun fadeOut(onEnd: () -> Unit) {
+        scrimAnimator?.cancel()
+        val animator =
+            android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+                duration = SCRIM_FADE_MS
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { value ->
+                    alpha = value.animatedValue as Float
+                }
+                addListener(
+                    object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            alpha = 0f
+                            onEnd()
+                        }
+                    },
+                )
+            }
+        scrimAnimator = animator
+        animator.start()
     }
 
     /** 选中态缩放回弹：选中弹到 SELECTED_SCALE，滑走弹回 1。 */
@@ -424,6 +548,9 @@ class RadialMenuView(context: Context) : View(context) {
         positions.clear()
         swingAnimator?.cancel()
         swingElapsedMs = Float.MAX_VALUE
+        scrimAnimator?.cancel()
+        scrimAlphaTarget = 0
+        scrimAlpha = 0
         stepDeg = 0f
         spanDeg = 0f
         invalidate()
@@ -465,7 +592,7 @@ class RadialMenuView(context: Context) : View(context) {
     /**
      * 按手指相对角落的极角选中最近的一项；离角落太近或太远都视为未选中。
      *
-     * 太远也要排除：手指滑出扇形范围、但角度仍落在张角内时，若不加距离上限，
+     * 太远也要排除：手指滑出轮盘范围、但角度仍落在张角内时，若不加距离上限，
      * 会「选中」一个手指根本没碰到的远处图标——用户松手后就是「没点 app 却打开了」。
      */
     private fun selectionFor(x: Float, y: Float): Int {
@@ -497,8 +624,29 @@ class RadialMenuView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        // 刻意**不**整屏压暗：官方的呼出就是原始图标浮在页面上，压暗会把图标一起压灰，
-        // 用户说的「图标遮罩」就是这个。可见性靠图标自身的投影与放大的选中态保证。
+        // ---- ① 灰色衬底（可选）----
+        //
+        // 用户 2026-10-08 对着魅族官方要的：「轮盘呼出会有个透明灰色的层，可以让图标对比度更明显」。
+        //
+        // ★★ 关键是**它必须画在图标之前**，而且**只能是这样**：
+        //  - 画在图标之前 ⇒ 图标后画、自身不透明 ⇒ **图标颜色一点不受影响**，暗下去的只有背景。
+        //    背景一暗，浅色 / 彩色图标就都跳出来了 = 用户要的「对比度更明显」。
+        //  - 反面教材是**整层 alpha**（`View.alpha` 或窗口 alpha）：那会把图标自己也一起冲淡，
+        //    观感是「图标发白、像蒙了层遮罩」——用户当年报的正是这个，所以别往 alpha 上改。
+        //    （另有一个**系统**给的恒定 `alpha=0.8`，那是 ColorOS 记在带 `FLAG_NOT_TOUCHABLE`
+        //    的悬浮窗上的，真因与取证见 `OverlayGestureService.showMenu` 的标志说明。）
+        //
+        // 幅度 = `SettingsStore.menuScrimPercent`（0 = 不垫）。**不透明度归 0 时这一笔完全省掉**，
+        // 一个像素都不画，也就退回「原始图标直接浮在页面上」的老观感。
+        //
+        // 这里用的是 [scrimAlpha]（**当前值**）而不是 [scrimAlphaTarget]：呼出那一瞬间它会从 0
+        // 淡上来（见 [playScrimFade]），免得整屏亮度一刀切、被读成「屏幕闪了一下」。
+        // ⚠️ 淡入**只作用在这块矩形上**，图标是紧接着画的、始终全不透明——这是它和「整层 alpha
+        // 淡入」的本质区别，别改成给 View 设 alpha。
+        if (scrimAlpha > 0) {
+            scrimPaint.alpha = scrimAlpha
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrimPaint)
+        }
         if (itemCount == 0) {
             val text = "没有可用的应用"
             canvas.drawText(text, width / 2f, height / 2f, emptyTextShadowPaint)
@@ -551,7 +699,7 @@ class RadialMenuView(context: Context) : View(context) {
 
     private companion object {
         /**
-         * 扇形横向/纵向半径的上限（dp）。真正的值由设置项「扇形宽度/高度」给出。
+         * 轮盘横向/纵向半径的上限（dp）。真正的值由设置项「轮盘宽度/高度」给出。
          */
         const val MAX_RADIUS_DP = 460
 
@@ -582,6 +730,14 @@ class RadialMenuView(context: Context) : View(context) {
 
         /** 晃动形状：甩出去那一段的占比（之后是回正段）。见 [swingShape]。 */
         const val SWING_OUT_PORTION = 0.35f
+
+        /**
+         * 衬底淡入时长（ms）。
+         *
+         * **200ms**：比图标入场（[BOUNCE_ANIM_MS] 180ms）稍长一点——背景先「铺开」、图标再落位，
+         * 观感是幕布落下，而不是用户首版说的「屏幕闪了一下」。再长会显得拖沓。
+         */
+        const val SCRIM_FADE_MS = 200L
 
         /**
          * 没拿到设置时的默认最大摆角（度）。

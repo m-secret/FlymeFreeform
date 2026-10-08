@@ -15,39 +15,19 @@ import android.net.Uri
  */
 object ToolActions {
 
-    private const val WECHAT_PACKAGE = "com.tencent.mm"
-    private const val ALIPAY_PACKAGE = "com.eg.android.AlipayGphone"
+    // 包名以 [SystemTools] 为准：工具清单要按它过滤「对方没装就不列出来」
+    // （见 [SystemTools.Spec.requiredPackage]），两边必须是同一个字符串。
+    private const val WECHAT_PACKAGE = SystemTools.PACKAGE_WECHAT
+    private const val ALIPAY_PACKAGE = SystemTools.PACKAGE_ALIPAY
 
     /**
      * 工具拉起别的应用时也走小窗。
      *
-     * 「录音 / 便签 / 扫码 / 付款码」本质上就是打开另一个应用，如果开成全屏，整个屏幕被盖住，
+     * 「扫码 / 付款码」本质上就是打开另一个应用，如果开成全屏，整个屏幕被盖住，
      * 从小窗场景里点一个工具就跳出去，体验是断的。这里复用和普通应用完全相同的 ColorOS
      * 自由窗参数（[ColorOsFreeform]），两条路都失败才退回全屏。
      */
     private val launcher = FreeformLauncher()
-
-    /**
-     * 录音机与便签的候选包名。
-     *
-     * ColorOS / OPPO、原生 Android、个别第三方 ROM 各叫各的，按顺序取第一个装了的。
-     */
-    private val RECORDER_PACKAGES =
-        listOf(
-            "com.coloros.soundrecorder",
-            "com.oplus.soundrecorder",
-            "com.android.soundrecorder",
-            "com.android.soundrecorder2",
-        )
-
-    private val NOTES_PACKAGES =
-        listOf(
-            "com.coloros.notepad",
-            "com.oplus.notepad",
-            "com.coloros.notes",
-            "com.coloros.note",
-            "com.android.notes",
-        )
 
     /**
      * 支付宝的深链。
@@ -110,10 +90,6 @@ object ToolActions {
                 val error = Flashlight.toggle(context)
                 error ?: if (Flashlight.isOn) "手电筒已打开" else "手电筒已关闭"
             }
-
-            SystemTools.TOOL_RECORDER -> launchFirstInstalled(context, RECORDER_PACKAGES, "录音机")
-
-            SystemTools.TOOL_NOTES -> launchFirstInstalled(context, NOTES_PACKAGES, "便签")
 
             SystemTools.TOOL_WECHAT_SCAN ->
                 openFirstWorking(
@@ -189,12 +165,6 @@ object ToolActions {
     private fun isInstalled(context: Context, packageName: String): Boolean =
         runCatching { context.packageManager.getApplicationInfo(packageName, 0) }.isSuccess
 
-    /** 按顺序取第一个「装了」的包并打开它。 */
-    private fun launchFirstInstalled(context: Context, packages: List<String>, name: String): String {
-        val target = packages.firstOrNull { isInstalled(context, it) } ?: return "没有找到$name 应用"
-        return openPackage(context, target, "$name 应用") ?: "打不开$name 应用"
-    }
-
     /**
      * 按顺序试一串「直达」候选，第一个真正起来的就算成功；全都不行才退回打开应用首页。
      *
@@ -216,7 +186,7 @@ object ToolActions {
             val verdict = launcher.launchIntent(context, intent)
             if (verdict.isSuccess) {
                 DebugLog.info("TOOL_DEEPLINK", "$appName 用「$label」直达成功")
-                // 和扇形启动一样：小窗动画期间要先让无障碍密集重探，遮罩才不会挂晚。
+                // 和轮盘启动一样：小窗动画期间要先让无障碍密集重探，遮罩才不会挂晚。
                 FreeformAccessibilityService.watchForFreeformWindow()
                 return successMessage
             }

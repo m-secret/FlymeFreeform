@@ -17,6 +17,7 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.AbsListView
 import android.widget.BaseAdapter
@@ -32,7 +33,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * 「更多」面板：扇形菜单里选「更多」后弹出。
+ * 「更多」面板：轮盘菜单里选「更多」后弹出。
  *
  * 这是原模块「复用原生侧边栏全部面板」的替代品——那一项需要往 `com.coloros.smartsidebar`
  * 的 Service 里注入 Binder，无 root 下无解，只能自己画一个。
@@ -40,8 +41,8 @@ import kotlin.math.roundToInt
  * ## 版面（自上而下）
  *
  * 1. 标题 + 「管理」；
- * 2. 「已选」条：**扇形里固定的应用与工具**（最多 [SettingsStore.MAX_PINS] 个）。
- *    从左往右 = 扇形里自上而下，新加入的排在**最右端**。
+ * 2. 「已选」条：**轮盘里固定的应用与工具**（最多 [SettingsStore.MAX_PINS] 个）。
+ *    从左往右 = 轮盘里自上而下，新加入的排在**最右端**。
  *    它必须在**标签栏上方**（里面应用和工具都有，两页共用），
  *    所以它不可能"待在列表里跟着滚"；取而代之的是滚内容时它被**跟手推出去**
  *    （见 [applySelectorScroll]）——位置关系不变，又不长期占地方；
@@ -54,7 +55,7 @@ import kotlin.math.roundToInt
  *    居中模式（竖屏、或横屏选「居中」）挂在**卡片下面**一横排；横屏选了左 / 右之后改排成
  *    一竖列站在卡片**外侧**（见 [sideMode]、设置项 `SettingsStore.landscapePanelSide`）。
  *
- * 「已选」与「底栏」是两回事：前者决定**扇形里有什么、怎么排**；后者是卡片外最顺手的
+ * 「已选」与「底栏」是两回事：前者决定**轮盘里有什么、怎么排**；后者是卡片外最顺手的
  * 一条快捷入口，只影响这个面板，点一下直接打开。
  *
  * 操作卡是画在面板自己窗口里的普通 View（不是 Dialog），因此不需要 Activity 或 window token。
@@ -71,7 +72,7 @@ class AppDrawerPanel(
     apps: List<AppEntry>,
     /** 内置系统工具。和应用分在两个标签页里展示，但共用同一套固定 / 勾选逻辑。 */
     private var tools: List<AppEntry>,
-    /** 扇形里固定的组件（有序，最多 [SettingsStore.MAX_PINS] 个）。 */
+    /** 轮盘里固定的组件（有序，最多 [SettingsStore.MAX_PINS] 个）。 */
     pinned: List<ComponentName>,
     /** 底栏里的组件（有序，最多 [SettingsStore.MAX_DOCK] 个）。 */
     dock: List<ComponentName>,
@@ -86,9 +87,9 @@ class AppDrawerPanel(
     /** 「最近使用」的应用（有序，最近用的在最前，最多 [SettingsStore.MAX_RECENT] 个）。 */
     recent: List<ComponentName>,
     private val onSelected: (AppEntry) -> Unit,
-    /** 切换「扇形固定」。返回 null 表示成功，否则返回给用户看的失败原因。 */
+    /** 切换「轮盘固定」。返回 null 表示成功，否则返回给用户看的失败原因。 */
     private val onTogglePin: (AppEntry) -> String?,
-    /** 已选条拖拽结束后回传新顺序（首位对应扇形里最低的那一格）。 */
+    /** 已选条拖拽结束后回传新顺序（首位对应轮盘里最低的那一格）。 */
     private val onReorderPins: (List<ComponentName>) -> Unit,
     /** 切换「底栏」。返回 null 表示成功，否则返回失败原因。 */
     private val onToggleDock: (AppEntry) -> String?,
@@ -196,7 +197,7 @@ class AppDrawerPanel(
      */
     private var recentOrder: List<ComponentName> = recent
 
-    /** 「已选」：扇形里的固定项，**有序**——这个顺序就是扇形里的排列顺序。 */
+    /** 「已选」：轮盘里的固定项，**有序**——这个顺序就是轮盘里的排列顺序。 */
     private var pinnedOrder: MutableList<ComponentName> = pinned.toMutableList()
 
     /** 「底栏」里的项，**有序**。 */
@@ -224,9 +225,22 @@ class AppDrawerPanel(
     private var actionLayers: List<View> = emptyList()
 
     /**
+     * **首帧布局落定、入场动画即将开始**时回调一次。
+     *
+     * 服务侧拿它做「轮盘交棒」（`OverlayGestureService.handOffMenuToDrawer`）：点「更多」时
+     * 轮盘**故意不撤**（面板构造是主线程同步的，冷启动几百毫秒，先撤掉的话这段空档屏幕全亮
+     * = 用户说的「闪一下」），一直撑到这一刻才整层淡出 —— 正好和本面板遮罩的淡入
+     * （0 → 60%）交叉，亮度单调变暗，中间不留空档。
+     *
+     * 用「首帧」而不是「addView 返回」：addView 只是把窗口交给 WMS，那时面板 `alpha` 还是 0
+     * （见 [startEnterAnimation]），从这里开始淡出才真的和淡入对齐。
+     */
+    var onEnterStart: (() -> Unit)? = null
+
+    /**
      * 是否处于「管理模式」。
      *
-     * 管理模式里，点任意图标即**直接切换**它在扇形里的去留：没固定过的加入，已固定的移出。
+     * 管理模式里，点任意图标即**直接切换**它在轮盘里的去留：没固定过的加入，已固定的移出。
      * 一个动作同时覆盖「加」和「删」，不需要再分「批量加入 / 逐个移除」两套交互。
      */
     private var manageMode = false
@@ -893,6 +907,8 @@ class AppDrawerPanel(
                         "PERF_FIRST_FRAME since_build=" +
                             (android.os.SystemClock.elapsedRealtime() - perfPanelStart) + "ms",
                     )
+                    // 先通知服务侧（轮盘在这里开始整层淡出，和本面板的淡入交叉），再起自己的动画。
+                    onEnterStart?.invoke()
                     startEnterAnimation()
                 }
             },
@@ -931,6 +947,33 @@ class AppDrawerPanel(
             .scaleY(1f)
             .setDuration(PANEL_ENTER_DURATION_MS)
             .setInterpolator(DecelerateInterpolator(1.5f))
+            .start()
+    }
+
+    /**
+     * 整体淡出（遮罩 + 卡片一起渐隐），结束后回调 [onEnd]（服务那边收到就真正摘窗口）。
+     *
+     * 用户 2026-10-08：「退出面板也没动画，很生硬」—— 原来面板是被 `removeViewImmediate`
+     * 一刀摘掉的，60% 的遮罩**瞬间消失**，又是一次大面积亮度突变（和轮盘退场是同一个病）。
+     *
+     * ## ⚠️ 淡出可以用整层 alpha，淡入不行
+     *
+     * 这里 `animate().alpha(0f)` 是安全的：淡出是「渐隐到没有」，观感正常。
+     * 只有**淡入**时不能降整层 alpha —— 那会把遮罩和卡片一起冲淡，看着像「屏幕在调亮度」
+     * 而不是「弹出一个面板」（见 [startEnterAnimation] 与 `RadialMenuView` 类注释里那条规矩）。
+     *
+     * 时长取 [PANEL_EXIT_DURATION_MS]，**必须短于** `OverlayGestureService.DRAWER_LAUNCH_DELAY_MS`：
+     * 选中应用那条路要等面板**真的退场**（窗口被摘掉）才拉起小窗，否则 ColorOS 会把那次启动
+     * 判成「非小窗场景」而退回全屏。
+     */
+    fun fadeOut(onEnd: () -> Unit) {
+        animate()
+            .alpha(0f)
+            .setDuration(PANEL_EXIT_DURATION_MS)
+            // ★ **线性**，不是加速曲线。见 [PANEL_EXIT_DURATION_MS] 的说明：
+            // 加速曲线「慢起快终」，开头那几十毫秒几乎看不出在动，用户感知就是「太慢」。
+            .setInterpolator(LinearInterpolator())
+            .withEndAction(onEnd)
             .start()
     }
 
@@ -2245,7 +2288,7 @@ class AppDrawerPanel(
      *
      * 用 [PinnedStripView] 的**网格模式**（和「已选」条同一个可拖拽实现）：长按拖动即排序，
      * 结果写回 `SettingsStore.toolOrder`；长按后**不拖、直接松手**则弹原来的管理菜单
-     * （加入扇形 / 加入底栏）。一条手势同时承载「排序」和「进管理」两个意图，
+     * （加入轮盘 / 加入底栏）。一条手势同时承载「排序」和「进管理」两个意图，
      * 不必为排序另开入口，也不会弄丢原来那套长按菜单。
      *
      * 它嵌在 [toolsBody] 这个 ScrollView 里，所以开 `nestedScroll`：进入拖拽前一律放行，
@@ -2274,7 +2317,7 @@ class AppDrawerPanel(
                 onTap = { entry ->
                     when {
                         actionLayers.isNotEmpty() -> Unit
-                        // 管理模式里角标就是开关：绿「＋」加入扇形、红「－」移出。
+                        // 管理模式里角标就是开关：绿「＋」加入轮盘、红「－」移出。
                         manageMode -> togglePinFromGrid(entry)
                         else -> onSelected(entry)
                     }
@@ -2313,7 +2356,7 @@ class AppDrawerPanel(
         )
         toolsGrid.addView(
             TextView(context).apply {
-                text = "长按拖动可排序；长按后松手（不拖动）可加入扇形或底栏。"
+                text = "长按拖动可排序；长按后松手（不拖动）可加入轮盘或底栏。"
                 sizeByScreen(0.022f)
                 setTextColor(TEXT_WEAK)
                 setPadding(dp(16), dp(10), dp(16), 0)
@@ -2341,7 +2384,7 @@ class AppDrawerPanel(
         onReorderTools(next)
     }
 
-    // ---- 「已选」区（扇形固定项） ----
+    // ---- 「已选」区（轮盘固定项） ----
 
     /**
      * 造「已选」这块**浮层**：标题 + 可拖拽排序的横向图标条 + 一行提示。
@@ -2433,7 +2476,7 @@ class AppDrawerPanel(
                 onTap = { entry ->
                     when {
                         actionLayers.isNotEmpty() -> Unit
-                        // 管理模式里这条上的红「－」就是删除：点一下从扇形移出。
+                        // 管理模式里这条上的红「－」就是删除：点一下从轮盘移出。
                         manageMode -> removePinFromStrip(entry)
                         else -> onSelected(entry)
                     }
@@ -2475,8 +2518,8 @@ class AppDrawerPanel(
     /**
      * 把固定项刷到「已选」条上。
      *
-     * **显示顺序与扇形顺序相反**：`pinnedOrder` 是扇形里自下而上的顺序（第 0 个最靠近「更多」），
-     * 而这条从左往右读应该对应扇形**自上而下**，所以提交时倒过来。
+     * **显示顺序与轮盘顺序相反**：`pinnedOrder` 是轮盘里自下而上的顺序（第 0 个最靠近「更多」），
+     * 而这条从左往右读应该对应轮盘**自上而下**，所以提交时倒过来。
      * 于是新加入的（插到 `pinnedOrder` 最前）就落在这一条的**最右端**。
      */
     private fun syncSelector() {
@@ -2684,11 +2727,11 @@ class AppDrawerPanel(
         val text =
             when {
                 manageMode ->
-                    "绿 ＋ 加入扇形、红 － 移出；点「已选」或下方底栏上的图标也能直接移出"
+                    "绿 ＋ 加入轮盘、红 － 移出；点「已选」或下方底栏上的图标也能直接移出"
                 pinnedOrder.isEmpty() ->
-                    "这里是扇形里显示的项——长按下面的应用或工具，或点右上角「管理」来增删"
+                    "这里是轮盘里显示的项——长按下面的应用或工具，或点右上角「管理」来增删"
                 else ->
-                    "从左往右 = 扇形里自上而下 · 新加入的排在最右 · 长按图标可拖动排序"
+                    "从左往右 = 轮盘里自上而下 · 新加入的排在最右 · 长按图标可拖动排序"
             }
         selectorHint.setTextColor(TEXT_WEAK)
         selectorHint.text = text
@@ -2697,7 +2740,7 @@ class AppDrawerPanel(
     /**
      * 「已选」条拖拽结束后回写新顺序。
      *
-     * 条上回传的是**显示顺序**（从左到右），而存储用的是扇形顺序（自下而上），两者相反，
+     * 条上回传的是**显示顺序**（从左到右），而存储用的是轮盘顺序（自下而上），两者相反，
      * 所以先翻回来再按「保留有效项、把漏掉的接在末尾」写回。
      */
     private fun commitReorder(visualOrder: List<ComponentName>) {
@@ -2726,8 +2769,8 @@ class AppDrawerPanel(
      * - **横屏贴边模式**：卡片**外侧**的一竖列。横屏本来就扁，横铺一行会吃掉卡片的高度；
      *   整块面板已经贴到屏幕边上了，竖着一列正好顺边站着。
      *
-     * 与顶部「已选」的分工：底栏不参与扇形，只影响这个面板，点一下直接把那个应用/工具打开；
-     * 「已选」才决定扇形里有什么、怎么排。
+     * 与顶部「已选」的分工：底栏不参与轮盘，只影响这个面板，点一下直接把那个应用/工具打开；
+     * 「已选」才决定轮盘里有什么、怎么排。
      *
      * 三点讲究：
      * - 底色透明（不给它画白色胶囊），它才像「卡片外顺手的一条」而不是第二张卡片；
@@ -3019,7 +3062,7 @@ class AppDrawerPanel(
                 text =
                     buildString {
                         SystemTools.specOf(entry.component)?.let { append(it.description).append('\n') }
-                        append("扇形：")
+                        append("轮盘：")
                         append(
                             if (pinned) {
                                 "第 ${pinnedOrder.indexOfFirst { it == entry.component } + 1} 格" +
@@ -3039,7 +3082,7 @@ class AppDrawerPanel(
 
         sheet.addView(
             sheetButton(
-                text = if (pinned) "移出扇形" else "加入扇形",
+                text = if (pinned) "移出轮盘" else "加入轮盘",
                 highlighted = true,
             ) {
                 val error = onTogglePin(entry)
@@ -3116,12 +3159,12 @@ class AppDrawerPanel(
             setOnClickListener { onClick() }
         }
 
-    // ---- 管理模式（直接增删扇形固定项） ----
+    // ---- 管理模式（直接增删轮盘固定项） ----
 
     /**
      * 进出管理模式。
      *
-     * 管理模式只做一件事：让图标上的「＋ / ✓」变成可点的开关。点一下加入扇形，再点一下移出，
+     * 管理模式只做一件事：让图标上的「＋ / ✓」变成可点的开关。点一下加入轮盘，再点一下移出，
      * 因此「删」和「加」是同一个动作的两面，不再需要单独的删除入口。
      * 按钮文案用「返回」而不是「完成」——它只是退出这个模式，并不提交什么。
      */
@@ -3142,7 +3185,7 @@ class AppDrawerPanel(
         Haptics.confirm(context)
     }
 
-    /** 管理模式里点「已选」条上的图标：移出扇形。 */
+    /** 管理模式里点「已选」条上的图标：移出轮盘。 */
     private fun removePinFromStrip(entry: AppEntry) {
         if (!isPinned(entry.component)) return
         val error = onTogglePin(entry)
@@ -3175,7 +3218,7 @@ class AppDrawerPanel(
     }
 
     /**
-     * 管理模式下点了一个图标：切换它在扇形里的固定状态。
+     * 管理模式下点了一个图标：切换它在轮盘里的固定状态。
      *
      * 复用上层 [onTogglePin]，上限与失败原因都由那边给出——面板只负责把它显示在提示行上。
      */
@@ -3192,7 +3235,7 @@ class AppDrawerPanel(
             if (pinned) {
                 pinnedOrder.filterNot { it == entry.component }.toMutableList()
             } else {
-                // 新加入的插到最前 = 扇形里最靠近「更多」的那一格，在「已选」条上落在最右端。
+                // 新加入的插到最前 = 轮盘里最靠近「更多」的那一格，在「已选」条上落在最右端。
                 (listOf(entry.component) + pinnedOrder).toMutableList()
             }
         syncSelector()
@@ -3454,7 +3497,7 @@ class AppDrawerPanel(
         val pinned = isPinned(entry.component)
         badge.visibility = if (pinned) View.VISIBLE else View.GONE
         if (manageMode) {
-            // 管理模式：未固定的画**绿底白 ＋**（点它加入扇形），已固定的画**红底白 －**（点它移出）。
+            // 管理模式：未固定的画**绿底白 ＋**（点它加入轮盘），已固定的画**红底白 －**（点它移出）。
             // 加与删各有各的样子，看一眼就知道点下去会发生什么。
             plus.visibility = View.VISIBLE
             plus.plus = !pinned
@@ -3791,6 +3834,27 @@ class AppDrawerPanel(
         /** 打开动画：时长与卡片起始缩放。 */
         private const val PANEL_ENTER_DURATION_MS = 200L
         private const val PANEL_ENTER_SCALE_FROM = 0.92f
+
+        /**
+         * 关闭动画时长（ms）。
+         *
+         * **120ms**：首版给了 180（对齐入场 [PANEL_ENTER_DURATION_MS]），用户真机反馈
+         * 「**更多关闭的感觉太慢了**」（2026-10-08）。关比开更需要「立刻响应」——
+         * 开是「等它出来」，关是「让它赶紧走」，所以压到 120。
+         *
+         * 曲线也一起改了：`fadeOut` 用的是 **`LinearInterpolator`** 而不是 `AccelerateInterpolator`。
+         * 加速曲线是「慢起快终」，开头那几十毫秒几乎看不出在动 —— 那才是「慢」的主要来源，
+         * 光缩时长治不干净。
+         *
+         * ⚠️ **必须短于 `OverlayGestureService.DRAWER_LAUNCH_DELAY_MS`**：选中应用那条路要等
+         * 面板**真的退场**（窗口被摘掉）才拉起小窗，否则 ColorOS 会把那次启动判成
+         * 「非小窗场景」而退回全屏。服务侧那个延迟就是「本值 + 余量」算出来的，
+         * 所以改这里**不会**破坏启动时序。
+         *
+         * public 是**故意的**：只留这一处定义，免得和服务侧那个常量各写一份、哪天改漏一个
+         * （`MENU_SCRIM_FADE_MS` / `SCRIM_FADE_MS` 那对就是这么来的）。
+         */
+        const val PANEL_EXIT_DURATION_MS = 120L
 
         /** 右侧索引条宽度（字母列那一竖条的宽）。 */
         const val INDEX_WIDTH_DP = 20

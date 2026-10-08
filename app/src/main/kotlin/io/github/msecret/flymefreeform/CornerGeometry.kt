@@ -242,7 +242,7 @@ object CornerGeometry {
         dp(context, store.cornerRangeHeightDp)
 
     /**
-     * 扇形极坐标原点距屏幕角的距离（px）：**屏幕短边 × 百分比**。
+     * 轮盘极坐标原点距屏幕角的距离（px）：**屏幕短边 × 百分比**。
      *
      * 用百分比而不是 dp，是为了在不同屏幕尺寸上「离边多远」的观感一致。
      */

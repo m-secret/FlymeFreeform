@@ -27,10 +27,10 @@ import android.os.VibratorManager
  */
 object Haptics {
 
-    /** 划过扇形图标时的轻触感。 */
+    /** 划过轮盘图标时的轻触感。 */
     fun tick(context: Context) = play(context, intensity = INTENSITY_TICK, short = true)
 
-    /** 长按弹出、加入/移出扇形、拖拽换位等「确认」类反馈。 */
+    /** 长按弹出、加入/移出轮盘、拖拽换位等「确认」类反馈。 */
     fun confirm(context: Context) = play(context, intensity = INTENSITY_CONFIRM, short = false)
 
     private fun play(context: Context, intensity: Float, short: Boolean) {

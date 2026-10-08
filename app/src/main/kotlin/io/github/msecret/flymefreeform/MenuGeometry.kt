@@ -4,14 +4,14 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 /**
- * 扇形几何的共享计算。
+ * 轮盘几何的共享计算。
  *
  * [RadialMenuView]（真实绘制）与 [MenuPreviewView]（设置页预览）**共用同一套计算**，
  * 保证预览里图标的位置与大小和真机呼出时完全一致——预览即所见。
  */
 object MenuGeometry {
 
-    /** 扇形以角落对角线方向为中心。 */
+    /** 轮盘以角落对角线方向为中心。 */
     const val CENTER_ANGLE_DEG = 45f
 
     /**

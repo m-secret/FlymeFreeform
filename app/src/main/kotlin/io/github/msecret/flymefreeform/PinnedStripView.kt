@@ -20,7 +20,7 @@ import android.widget.TextView
 import kotlin.math.abs
 
 /**
- * 扇形固定项的排列条，对应魅族「More apps」面板顶部的 Selected 区。
+ * 轮盘固定项的排列条，对应魅族「More apps」面板顶部的 Selected 区。
  *
  * 为什么单独写一个而不是用 `ItemTouchHelper`：那套依赖 RecyclerView，而本模块没有任何
  * AndroidX 依赖（面板是 Service 里的普通 View）。这里把「长按拾起 → 跟手平移 → 越位换位」
@@ -50,12 +50,12 @@ class PinnedStripView(
     private val preferredIconPx: Int,
     /** 单击某个已固定的应用：直接用它启动小窗。 */
     private val onTap: (AppEntry) -> Unit,
-    /** 拖拽结束且顺序确实变了：回传新顺序（组件名，首位对应扇形里最低的那一格）。 */
+    /** 拖拽结束且顺序确实变了：回传新顺序（组件名，首位对应轮盘里最低的那一格）。 */
     private val onReorder: (List<ComponentName>) -> Unit,
     /**
      * 紧凑排列：槽位不再等分整条宽度，而是「刚好一个图标宽」，整排居中。
      *
-     * 「已选」条要的是等分槽位——它对应扇形上均匀分布的格子，铺满整条才看得出顺序。
+     * 「已选」条要的是等分槽位——它对应轮盘上均匀分布的格子，铺满整条才看得出顺序。
      * 卡片下方那条底栏只要几个图标挨着，等分会让它们散得很开，所以那里开这个开关。
      */
     private val packed: Boolean = false,
@@ -216,6 +216,16 @@ class PinnedStripView(
     private var draggedPointerX = 0f
     private var draggedPointerY = 0f
 
+    /**
+     * 长按起拖那一刻手指的位置。
+     *
+     * 跟手平移算的是**位移**（当前手指 − 这个起点），不是「把图标中心拽到手指底下」——
+     * 后者会在「拎起来」的一瞬间把图标朝手指方向弹一段，弹多远取决于你按在图标中心还是
+     * 边缘（用户报的「工具页顺序的工具按住了图标会上移」）。
+     */
+    private var dragGrabX = 0f
+    private var dragGrabY = 0f
+
     /** 单行模式下一个槽位的宽度（等分布局下所有槽位等宽）。 */
     private var slotWidth = 0
 
@@ -227,6 +237,16 @@ class PinnedStripView(
     private var gridTop = 0
     private var colWidth = 0
     private var rowHeight = 0
+
+    /**
+     * 网格模式下相邻两行的**行距**（含行间距 [gridRowGapPx]），命中判定按它把纵坐标换成行号。
+     *
+     * ⚠️ 不能拿 [rowHeight] 当行距用：行与行之间还夹着一段 [gridRowGapPx]，用「行高」当步长
+     * 的话偏差会**随行号累加**（第 r 行差 r × 行距）。后果是点第一行图标的下沿会被算成第二行
+     * 的格子——长按拾起的是**下面那一个**图标，它再被拽到手指底下，看起来就是「按住了图标
+     * 会上移」（用户 2026-10-08 报的正是这个）。
+     */
+    private var rowStride = 0
 
     private var iconSizePx = 0
 
@@ -264,7 +284,7 @@ class PinnedStripView(
     // ---- 内容 ----
 
     /**
-     * 重设已选列表。顺序即扇形里的顺序（首位挨着「更多」那一格）。
+     * 重设已选列表。顺序即轮盘里的顺序（首位挨着「更多」那一格）。
      *
      * 每次调用都会重建子 View——图标是已经缓存好的 Bitmap，重建这点开销远小于维护
      * 一套局部更新逻辑的成本，也彻底避免了「拖动到一半内容被换掉」的脏状态。
@@ -508,11 +528,16 @@ class PinnedStripView(
         return rowTop + slot.root.top
     }
 
-    /** 网格落点 → 槽位下标；落在网格外时按边界夹住。 */
+    /**
+     * 网格落点 → 槽位下标；落在网格外时按边界夹住。
+     *
+     * 纵向按 [rowStride]（行高 + 行间距）换算，**不是** [rowHeight]：用行高会把落点一行行
+     * 往上"挤"，越靠下偏得越多（第 r 行差 r × 行距），点第一行图标的下沿会被认成第二行。
+     */
     private fun gridIndexAt(x: Float, y: Float): Int {
-        if (colWidth <= 0 || rowHeight <= 0 || rowContainers.isEmpty()) return -1
+        if (colWidth <= 0 || rowStride <= 0 || rowContainers.isEmpty()) return -1
         val col = ((x - gridLeft) / colWidth).toInt().coerceIn(0, columns - 1)
-        val row = ((y - gridTop) / rowHeight).toInt().coerceIn(0, rowContainers.lastIndex)
+        val row = ((y - gridTop) / rowStride).toInt().coerceIn(0, rowContainers.lastIndex)
         return row * columns + col
     }
 
@@ -723,6 +748,9 @@ class PinnedStripView(
         draggedIndex = index
         draggedPointerX = lastX
         draggedPointerY = lastY
+        // 记下按住的那一点：之后的平移全部相对它算，起拖时位移为 0，图标纹丝不动。
+        dragGrabX = lastX
+        dragGrabY = lastY
         val root = slots[index].root
         root.animate().cancel()
         root.scaleX = DRAG_SCALE
@@ -739,17 +767,19 @@ class PinnedStripView(
     }
 
     /**
-     * 被拖项的中心始终跟着手指（网格与竖排模式下横竖都要跟）。
+     * 被拖项跟着手指平移。
      *
-     * 自然中心必须按**真实布局坐标**取（[slotOriginLeft] / [slotOriginTop] 已含条的内边距
-     * 与行容器偏移）——否则「拎起来」的那一下会先跳一段，因为手指位置是绝对坐标。
+     * 算的是**位移**（当前手指 − 起拖时按住的那一点），所以手指按住图标的哪一点、那一点就
+     * 一直钉在手指底下，跟手最准，起拖那一刻也不动。
+     *
+     * ⚠️ 别再改成「让图标**中心**对齐手指」那种绝对坐标写法（`pointer − 自然中心`）：按住
+     * 图标偏上/偏下的位置时，图标会在"拎起来"的瞬间先朝手指弹一段，看起来就是「按住了
+     * 图标会上移」（用户 2026-10-08 报过）。
      */
     private fun applyDraggedTranslation() {
         val root = slots.getOrNull(draggedIndex)?.root ?: return
-        val naturalCenterX = slotOriginLeft(draggedIndex) + root.width / 2f
-        val naturalCenterY = slotOriginTop(draggedIndex) + root.height / 2f
-        root.translationX = draggedPointerX - naturalCenterX
-        root.translationY = draggedPointerY - naturalCenterY
+        root.translationX = draggedPointerX - dragGrabX
+        root.translationY = draggedPointerY - dragGrabY
     }
 
     /** 把被拖项挪到虚拟位次 [target]。只动 [order]，真实 child 顺序不变。 */
@@ -764,12 +794,12 @@ class PinnedStripView(
     /**
      * 其余条目按「虚拟位次 − 自然位次」平移。
      *
-     * 自然位次就是它的下标——因为拖拽期间从未重排 children，这个值恒等于初始顺序。
-     * 网格模式下目标位置是二维的（第几行第几列），竖排模式下是一维的纵向，所以位移要按
-     * 排布方向分开算。
+     * 自然位次就是它的下标——因为拖拽期间从未重排 children，这个值恒等于初始顺序；所以
+     * **第 position 格的自然位置 = 第 position 个槽位的真实位置**，网格分支直接取它做目标，
+     * 不必自己拿行高、列宽重新推算（那次推算漏了行间距，见那边的注释）。
      *
-     * 位移量取的是**差值**，[slotOriginLeft] / [slotOriginTop] 里那一段公共偏移会自然约掉，
-     * 所以这里用原点函数和用旧的 `slotLeft` / `slotTop` 结果一致。
+     * 竖排/单行的目标位置按等距步长（[slotHeight] / `slotWidth`）算：这两种排布本来就没有
+     * 「行间距」这回事，槽位是等距的。
      */
     private fun refreshSiblings(animate: Boolean) {
         slots.forEachIndexed { index, slot ->
@@ -787,10 +817,15 @@ class PinnedStripView(
                 }
 
                 columns > 0 -> {
-                    val col = position % columns
-                    val row = position / columns
-                    targetLeft = gridLeft + col * colWidth.toFloat()
-                    targetTop = gridTop + row * rowHeight.toFloat()
+                    // 目标位置 = **「自然位次 = position」的那一格自己**的位置。
+                    //
+                    // ⚠️ 别再写成 `gridTop + row * rowHeight`：那套等距公式把行间距
+                    // [gridRowGapPx] 漏掉了，第 r 行的目标位置会比它的真实位置高 r × 行距，
+                    // 于是一起拖的时候下面几行的图标**整体往上跳一截**（用户 2026-10-08 报的
+                    // 「工具页顺序的工具按住了图标会上移」）。槽位的真实坐标（[slotOriginLeft]
+                    // / [slotOriginTop]）里已经含了条的内边距与行间距，直接用不会错。
+                    targetLeft = slotOriginLeft(position).toFloat()
+                    targetTop = slotOriginTop(position).toFloat()
                 }
 
                 else -> {
@@ -860,6 +895,17 @@ class PinnedStripView(
                 val usable = (width - paddingLeft - paddingRight).coerceAtLeast(1)
                 colWidth = usable / columns
                 rowHeight = rowContainers.firstOrNull()?.height ?: 0
+                // 行距直接量「第二行顶边 − 第一行顶边」：这段差值里已经含了行间距，也不必再
+                // 去猜 child.top 里有没有算上条自己的 padding。只有一行时退回「行高 + 行间距」
+                // （这时候命中判定永远落在第 0 行，取什么都不影响结果）。
+                val firstRow = rowContainers.getOrNull(0)
+                val secondRow = rowContainers.getOrNull(1)
+                rowStride =
+                    if (firstRow != null && secondRow != null) {
+                        secondRow.top - firstRow.top
+                    } else {
+                        rowHeight + gridRowGapPx
+                    }
             } else if (vertical) {
                 // 竖排：一格的高度就是斜向命中和换位的单位（槽位高矮一致，取第一个即可）。
                 slotHeight = slots.first().root.height

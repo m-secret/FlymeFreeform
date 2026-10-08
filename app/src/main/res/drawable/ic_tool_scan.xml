@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「扫一扫」工具的图形：取景框 + 二维码。
+
+  路径来源：Lucide `scan-qr-code`（ISC License，见 NOTICE.md）
+    https://cdn.jsdelivr.net/npm/lucide-static/icons/scan-qr-code.svg
+  ★ 是**描边（stroke）**而不是填充：Lucide 是线性图标库，path 只描述中心线。
+    别把这些 path 改成 fillColor 填实 —— 那是另一种观感（实心块，2026-10-08 前几版就是这么做的，
+    用户否掉：「不像一个现代软件功能该有的样子」）。circle/rect 已由脚本折成等价的 path。
+
+  外面这层 <group> 把中心线缩放到「外接圆半径 = 10.0 - 线宽/2」，再摆到画布正中：
+    scale = 0.7668     平移 (+2.798,+2.798) → 中心线外接圆中心落在 (12,12)
+    strokeWidth = 2.2170   ← 反算过的值，为的是**六个图标在真机上线宽一模一样**
+                              （线宽也吃 scale，直接写 1.7 会变成一粗一细）
+
+  圆底是内切圆（半径 12），内容含描边的最外沿恰好 10.0，四周留 1.8 呼吸，永不戳出圆边。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <group
+        android:pivotX="0"
+        android:pivotY="0"
+        android:scaleX="0.7668"
+        android:scaleY="0.7668"
+        android:translateX="2.7982"
+        android:translateY="2.7982">
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M17 12v4a1 1 0 0 1-1 1h-4" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M17 3h2a2 2 0 0 1 2 2v2" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M17 8V7" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M21 17v2a2 2 0 0 1-2 2h-2" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M3 7V5a2 2 0 0 1 2-2h2" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M7 17h.01" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M7 21H5a2 2 0 0 1-2-2v-2" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="2.2170"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M8.0,7.0h3.0a1.0,1.0 0 0 1 1.0,1.0v3.0a1.0,1.0 0 0 1 -1.0,1.0h-3.0a1.0,1.0 0 0 1 -1.0,-1.0v-3.0a1.0,1.0 0 0 1 1.0,-1.0Z" />
+</group>
+</vector>

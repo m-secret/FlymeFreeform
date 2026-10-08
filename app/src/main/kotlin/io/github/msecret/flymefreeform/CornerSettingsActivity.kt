@@ -17,16 +17,16 @@ import android.widget.TextView
  * 「主动呼出」二级设置页（Material 3 版面）。
  *
  * 从主设置页拆出来：主页面被授权、手势、窗外关闭、应用管理、日志等塞得太长，
- * 这里只放与「主动呼出 / 扇形设置」相关的设置项。
+ * 这里只放与「主动呼出 / 轮盘设置」相关的设置项。
  *
  * ## 版面
  *
- * 触摸区（开关与尺寸）→ 扇形设置 → 角落点击。每一组是一张 [CardGroup]，
+ * 触摸区（开关与尺寸）→ 轮盘设置 → 角落点击。每一组是一张 [CardGroup]，
  * 组内行之间只有一条内缩分隔线，组与组之间留实缝——不会出现相邻圆角相切造成的凹陷。
  *
- * ⚠️ 页面有**三个**恢复默认按钮，语义严格分开（用户 2026-10-08 先报「点触摸区的恢复，把扇形设置
- * 也一起恢复了」，随后要求「扇形设置也加入恢复默认」）：紧贴「触摸区」那一组的只管那三条
- * （[resetTouchDefaults]）、紧贴「扇形设置」那一组的只管那五个值（[resetMenuDefaults]）、
+ * ⚠️ 页面有**三个**恢复默认按钮，语义严格分开（用户 2026-10-08 先报「点触摸区的恢复，把轮盘设置
+ * 也一起恢复了」，随后要求「轮盘设置也加入恢复默认」）：紧贴「触摸区」那一组的只管那三条
+ * （[resetTouchDefaults]）、紧贴「轮盘设置」那一组的只管那五个值（[resetMenuDefaults]）、
  * 全部恢复在**页面最底部**（[resetToDefaults]）。三者别合并、也别换位置。
  *
  * 「图标来源」那一组 2026-10-08 搬到了主界面「功能」tab 卡片上（见 `MainActivity` 的
@@ -109,7 +109,7 @@ class CornerSettingsActivity : Activity() {
     }
 
     /**
-     * 拖滑块时的实时同步：把草稿推给预览（触摸条绿块 + 扇形弧），让它跟手。
+     * 拖滑块时的实时同步：把草稿推给预览（触摸条绿块 + 轮盘弧），让它跟手。
      *
      * 只在预览开着时才发——没开预览时屏幕上没有任何东西可更新，白跑一趟跨进程。
      * 抬手走的仍是 [refreshPreview]（那时值已落库，按整份设置重画）。
@@ -132,7 +132,7 @@ class CornerSettingsActivity : Activity() {
      * 「触摸区」那一组恢复默认（宽度 / 高度 / 边缘预留）。
      *
      * ⚠️ **别把它和 [resetMenuDefaults] / [resetToDefaults] 合并**：页面里每个按钮都紧贴它自己那一组，
-     * 用户 2026-10-08 点「触摸区」下面那个按钮时的预期是「只把上面这三条拨回去」，结果连扇形设置的
+     * 用户 2026-10-08 点「触摸区」下面那个按钮时的预期是「只把上面这三条拨回去」，结果连轮盘设置的
      * 宽度 / 高度 / 离角距离 / 图标大小 / 呼出晃动也一起被重置了——他报的就是这条。
      * 现在**每组各管各的**，全量恢复单独放在**页面最底部**。
      */
@@ -141,7 +141,7 @@ class CornerSettingsActivity : Activity() {
         afterReset()
     }
 
-    /** 「扇形设置」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。 */
+    /** 「轮盘设置」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。 */
     private fun resetMenuDefaults() {
         resetMenuValues()
         afterReset()
@@ -161,13 +161,14 @@ class CornerSettingsActivity : Activity() {
         store.edgeInsetDp = SettingsStore.DEFAULT_EDGE_INSET_DP
     }
 
-    /** 扇形设置五个值写回默认。呼出晃动也算这一组的（默认 30°）。 */
+    /** 轮盘设置六个值写回默认。呼出晃动（30°）与图标衬底（35%）也算这一组的。 */
     private fun resetMenuValues() {
         store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
         store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
         store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
         store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
         store.menuSwingDeg = SettingsStore.DEFAULT_MENU_SWING_DEG
+        store.menuScrimPercent = SettingsStore.DEFAULT_MENU_SCRIM_PERCENT
     }
 
     /**
@@ -218,7 +219,6 @@ class CornerSettingsActivity : Activity() {
                     value = store.cornerRangeDp,
                     min = SettingsStore.MIN_RANGE_DP,
                     max = SettingsStore.MAX_RANGE_DP,
-                    detail = "角落方块横向的长度",
                     onLive = {
                         liveRangeW = it
                         renderTouchDiagram()
@@ -234,7 +234,6 @@ class CornerSettingsActivity : Activity() {
                     value = store.cornerRangeHeightDp,
                     min = SettingsStore.MIN_RANGE_DP,
                     max = SettingsStore.MAX_RANGE_DP,
-                    detail = "角落方块纵向的长度",
                     onLive = {
                         liveRangeH = it
                         renderTouchDiagram()
@@ -250,7 +249,7 @@ class CornerSettingsActivity : Activity() {
                     value = store.edgeInsetDp,
                     min = 0,
                     max = SettingsStore.MAX_EDGE_INSET_DP,
-                    detail = "方块最外侧这一条让给系统「侧滑返回」，不改变方块大小",
+                    detail = "最外侧这一条让给系统「侧滑返回」，不改变触摸区大小",
                     onLive = {
                         liveBand = it
                         renderTouchDiagram()
@@ -268,14 +267,9 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "**上面三条一起决定角落的行为**，拖滑块时它们会实时反映到示意图 / 屏幕预览上：\n" +
-                    "**绿** = 本应用接管触摸的部分；**橙** = 让给系统「侧滑返回」的一条边带。\n" +
-                    "「左右边缘预留」管的是后面这件事：屏幕最外侧那一条窄带留给系统，侧滑返回照常可用，" +
-                    "只有带子以内才由本应用接管。它**不改变触摸区的尺寸和位置**，所以在真机上光看是" +
-                    "看不出变化的——这条带子只决定「这一段边缘谁来接这次触摸」。\n" +
-                    "想看到真机上的实际效果，打开上面的「显示触摸区预览」，屏幕左下角 / 右下角就会" +
-                    "画出**同样的绿橙两色**（那时卡片末尾这张示意图会自动收起来，免得两张图叠在一起）；" +
-                    "那时从最边缘斜着往上滑，落在橙色里是系统返回、落在绿色里才唤出轮盘。",
+                "**绿** = 本应用接管触摸的部分，**橙** = 让给系统「侧滑返回」的边带" +
+                    "（由「左右边缘预留」决定，不改变触摸区大小）。打开上面的「显示触摸区预览」，" +
+                    "屏幕上就会画出同样的两色，照着核即可。",
             ),
         )
 
@@ -284,13 +278,13 @@ class CornerSettingsActivity : Activity() {
         // 它紧贴「触摸区」这一组，用户对它的预期就是「把这一组拨回去」，见 [resetTouchDefaults]。
         root.addView(Ui.outlinedButton(this, "触摸区恢复默认") { resetTouchDefaults() })
 
-        // ---- 扇形设置 ----
-        root.addView(Ui.sectionTitle(this, "扇形设置"))
+        // ---- 轮盘设置 ----
+        root.addView(Ui.sectionTitle(this, "轮盘设置"))
         root.addView(
             CardGroup(this)
                 .row(
                     seekRow(
-                        label = "扇形宽度",
+                        label = "轮盘宽度",
                         value = store.menuWidthDp,
                         min = SettingsStore.MIN_MENU_DIM_DP,
                         max = SettingsStore.MAX_MENU_DIM_DP,
@@ -305,7 +299,7 @@ class CornerSettingsActivity : Activity() {
                 )
                 .row(
                     seekRow(
-                        label = "扇形高度",
+                        label = "轮盘高度",
                         value = store.menuHeightDp,
                         min = SettingsStore.MIN_MENU_DIM_DP,
                         max = SettingsStore.MAX_MENU_DIM_DP,
@@ -320,7 +314,7 @@ class CornerSettingsActivity : Activity() {
                 )
                 .row(
                     seekRow(
-                        label = "扇形离屏幕边距离",
+                        label = "轮盘离屏幕边距离",
                         value = store.menuCornerInsetPercent,
                         min = SettingsStore.MIN_MENU_CORNER_INSET_PERCENT,
                         max = SettingsStore.MAX_MENU_CORNER_INSET_PERCENT,
@@ -355,7 +349,7 @@ class CornerSettingsActivity : Activity() {
                         value = store.menuSwingDeg,
                         min = SettingsStore.MIN_MENU_SWING_DEG,
                         max = SettingsStore.MAX_MENU_SWING_DEG,
-                        detail = "图标呼出时转一下再回正的角度：右下角顺时针、左下角相反。0 = 不转",
+                        detail = "呼出时转一下再回正的角度（右下角顺时针、左下角相反）。0 = 不转",
                         unit = "°",
                     ) { value ->
                         // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
@@ -365,11 +359,25 @@ class CornerSettingsActivity : Activity() {
                     },
                 )
                 .row(
+                    seekRow(
+                        label = "图标衬底",
+                        value = store.menuScrimPercent,
+                        min = SettingsStore.MIN_MENU_SCRIM_PERCENT,
+                        max = SettingsStore.MAX_MENU_SCRIM_PERCENT,
+                        detail = "呼出时在图标下垫一层灰，浅色页面上更清楚。0 = 不垫",
+                        unit = "%",
+                    ) { value ->
+                        // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
+                        // 下次呼出就生效，不用重建服务。预览里也不画这层——那块窗口是全屏的，
+                        // 画了会盖住设置页本身（见 showMenuPreview 的标志说明）。
+                        store.menuScrimPercent = value
+                    },
+                )
+                .row(
                     Ui.switchRow(
                         this,
                         "划过图标时震动",
                         store.menuHapticEnabled,
-                        detail = "沿弧线划过每个图标时给一次触感反馈",
                     ) { checked ->
                         store.menuHapticEnabled = checked
                     },
@@ -379,10 +387,10 @@ class CornerSettingsActivity : Activity() {
                         this,
                         "隐藏「更多」入口",
                         store.hideMoreEntry,
-                        detail = "扇形里不再放「更多」那一格，也就进不去面板了",
+                        detail = "轮盘里不再放「更多」那一格，也就进不去面板了",
                     ) { checked ->
                         store.hideMoreEntry = checked
-                        // 扇形是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
+                        // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
                         // 所以下一次呼出就生效，不需要重建服务。
                         DebugLog.info("MENU_MORE_HIDDEN", "隐藏「更多」入口=$checked")
                         // 预览开着就地重画：那一格的有无要立刻反映出来（否则用户得重开预览才看到）。
@@ -393,21 +401,15 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "「宽度」管横向伸展、「高度」管纵向伸展，两者一起构成椭圆弧；" +
-                    "「离屏幕边距离」决定整条弧离角落多远。\n" +
-                    "图标大小与扇形几何**完全解耦**：拖它只改图标本身，轮盘形状、位置、张角都不动，" +
-                    "所以调得比弧上的格子大时会相互重叠，按观感自己取。\n" +
-                    "「呼出晃动」是图标**呼出那一瞬间**绕自身圆心转一下再回正的角度" +
-                    "（右下角顺时针、左下角逆时针；0 = 不转）。" +
-                    "它只是入场动画，跟上面几个值互不影响；想复核效果直接呼出轮盘看就行，" +
-                    "下面那张预览图里画的是圆点，转多少度都看不出来。",
+                "「宽度 / 高度」一起构成椭圆弧，「离屏幕边距离」决定弧离角落多远。" +
+                    "「图标大小」与轮盘几何**完全解耦**：只改图标本身，调得比弧上的格子大会相互重叠。",
             ),
         )
 
         root.addView(Ui.spacer(this))
-        // 只管「扇形设置」这一组（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。
+        // 只管「轮盘设置」这一组（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动 / 图标衬底）。
         // 与上面那个「触摸区恢复默认」**对称**：每个按钮只碰它紧挨着的那一组，全量恢复在页面最底部。
-        root.addView(Ui.outlinedButton(this, "扇形设置恢复默认") { resetMenuDefaults() })
+        root.addView(Ui.outlinedButton(this, "轮盘设置恢复默认") { resetMenuDefaults() })
 
         // ---- 角落点击 ----
         root.addView(Ui.sectionTitle(this, "角落点击"))
@@ -427,7 +429,7 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "触摸区会挡住角落，导致屏幕左右下角点不动。打开后普通点击会穿透到下层，长按也能正常触发。" +
+                "触摸区会挡住角落，导致屏幕左右下角点不动。打开后普通点击会穿透到下层。" +
                     if (a11yReady) " 无障碍服务已连接，功能可用。" else " 无障碍服务未连接，点击穿透暂不可用。",
             ),
         )

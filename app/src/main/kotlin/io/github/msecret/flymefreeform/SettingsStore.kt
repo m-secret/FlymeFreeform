@@ -27,23 +27,29 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 清掉固定列表里**已经不再是工具**的那两个伪组件。
+     * 清掉固定列表里**已经下线的工具**。
      *
-     * 「关闭小窗」「转迷你小窗」曾经被做成扇形里的工具格子，现在改成设置里的「滑小横条时做什么」。
-     * 老配置里固定过它们的用户会看到一格点了没反应的东西（[ToolActions.run] 只会回一句
-     * 「这个工具还没有实现」），所以在启动时顺手摘掉。
+     * 每次下线一个工具都要在这里登记，否则老配置里固定过它的用户会看到一格点了没反应的东西
+     * （[ToolActions.run] 只会回一句「这个工具还没有实现」）。到目前为止下线过：
+     * 「关闭小窗」「转迷你小窗」（改成了设置里的「滑小横条时做什么」）、
+     * 「录音」「便签」（它们本来就只是拉起另一个应用，而用户在「更多」面板里能直接固定
+     * 那些应用本身 —— 同一个东西两个入口）。
      *
      * 幂等，不需要 one-shot 标记：列表里没有就什么都不做。
      */
     private fun dropRetiredTools() {
         val retired =
-            listOf(SystemTools.TOOL_CLOSE_WINDOW, SystemTools.TOOL_MINI_WINDOW)
-                .map { SystemTools.componentFor(it) }
+            listOf(
+                SystemTools.TOOL_CLOSE_WINDOW,
+                SystemTools.TOOL_MINI_WINDOW,
+                SystemTools.TOOL_RECORDER,
+                SystemTools.TOOL_NOTES,
+            ).map { SystemTools.componentFor(it) }
         val pins = pinnedComponents
         val keptPins = pins.filterNot { retired.contains(it) }
         if (keptPins.size != pins.size) {
             pinnedComponents = keptPins
-            DebugLog.info("PIN_RETIRED_TOOL_DROPPED", "扇形里摘掉已下线工具：${pins.size} -> ${keptPins.size}")
+            DebugLog.info("PIN_RETIRED_TOOL_DROPPED", "轮盘里摘掉已下线工具：${pins.size} -> ${keptPins.size}")
         }
         val dock = dockComponents
         val keptDock = dock.filterNot { retired.contains(it) }
@@ -136,7 +142,7 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 扇形宽高的新默认：300 → 170，只跑一次。
+     * 轮盘宽高的新默认：300 → 170，只跑一次。
      *
      * 300dp 的弧在小窗尺度下铺得太开，170dp 更贴近官方那种紧凑的观感。
      * 同样只重置「还是旧默认值」的那些。
@@ -212,7 +218,7 @@ class SettingsStore(context: Context) {
         preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_TAP, true).apply()
     }
 
-    /** 扇形离屏距离默认从 50% 改成 10%：等于旧默认 50 的视为没改过，重置为 10。 */
+    /** 轮盘离屏距离默认从 50% 改成 10%：等于旧默认 50 的视为没改过，重置为 10。 */
     private fun migrateInsetDefaultTo10IfNeeded() {
         if (preferences.getBoolean(KEY_INSET_MIGRATED_TO_10, false)) return
         if (preferences.getInt(KEY_MENU_CORNER_INSET_PERCENT, -1) == LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT) {
@@ -224,10 +230,10 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 把触摸区旧默认（96dp 正方形）与扇形离屏距离（旧 dp）迁到新基准，只跑一次。
+     * 把触摸区旧默认（96dp 正方形）与轮盘离屏距离（旧 dp）迁到新基准，只跑一次。
      *
      * - 触摸区：旧默认是 96。等于 96 的视为「没改过」，重置成新默认（宽 40 / 高 70）。
-     * - 扇形离屏距离：旧的是 dp，新的是屏幕短边百分比，语义不同，直接删旧 key 用新默认 50%。
+     * - 轮盘离屏距离：旧的是 dp，新的是屏幕短边百分比，语义不同，直接删旧 key 用新默认 50%。
      */
     private fun migrateTouchAndInsetIfNeeded() {
         if (preferences.getBoolean(KEY_TOUCH_MIGRATED, false)) return
@@ -282,9 +288,9 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 把旧的「扇形半径百分比」迁移到新的「宽度/高度（dp）」，只跑一次。
+     * 把旧的「轮盘半径百分比」迁移到新的「宽度/高度（dp）」，只跑一次。
      *
-     * 0.3.7 起扇形改成椭圆（横向/纵向半径分别可调），旧的 `menu_radius_percent` 不再使用。
+     * 0.3.7 起轮盘改成椭圆（横向/纵向半径分别可调），旧的 `menu_radius_percent` 不再使用。
      * 老用户的值换算成 dp 写进 width/height，新用户直接用默认。
      */
     private fun migrateRadiusIfNeeded() {
@@ -552,9 +558,9 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_OUTSIDE_TAP_FORCE, value).apply()
 
     /**
-     * 扇形横向半径（宽度），单位 dp。
+     * 轮盘横向半径（宽度），单位 dp。
      *
-     * 与 [menuHeightDp] 一起构成椭圆弧——分别控制扇形横向、纵向伸展多少。
+     * 与 [menuHeightDp] 一起构成椭圆弧——分别控制轮盘横向、纵向伸展多少。
      */
     var menuWidthDp: Int
         get() = preferences.getInt(KEY_MENU_WIDTH_DP, DEFAULT_MENU_WIDTH_DP)
@@ -564,7 +570,7 @@ class SettingsStore(context: Context) {
                 .putInt(KEY_MENU_WIDTH_DP, value.coerceIn(MIN_MENU_DIM_DP, MAX_MENU_DIM_DP))
                 .apply()
 
-    /** 扇形纵向半径（高度），单位 dp。 */
+    /** 轮盘纵向半径（高度），单位 dp。 */
     var menuHeightDp: Int
         get() = preferences.getInt(KEY_MENU_HEIGHT_DP, DEFAULT_MENU_HEIGHT_DP)
             .coerceIn(MIN_MENU_DIM_DP, MAX_MENU_DIM_DP)
@@ -573,15 +579,15 @@ class SettingsStore(context: Context) {
                 .putInt(KEY_MENU_HEIGHT_DP, value.coerceIn(MIN_MENU_DIM_DP, MAX_MENU_DIM_DP))
                 .apply()
 
-    /** 手指划过扇形图标时触发系统触感反馈。 */
+    /** 手指划过轮盘图标时触发系统触感反馈。 */
     var menuHapticEnabled: Boolean
         get() = preferences.getBoolean(KEY_MENU_HAPTIC, true)
         set(value) = preferences.edit().putBoolean(KEY_MENU_HAPTIC, value).apply()
 
     /**
-     * 隐藏扇形里的「更多」入口。默认 **false**（保留，行为不变）。
+     * 隐藏轮盘里的「更多」入口。默认 **false**（保留，行为不变）。
      *
-     * 打开后扇形不再有「更多」那一格，而「更多」面板**只能**从那一格进（见 `OverlayGestureService`
+     * 打开后轮盘不再有「更多」那一格，而「更多」面板**只能**从那一格进（见 `OverlayGestureService`
      * 里 `showDrawer` 的两个调用点），所以关掉它 = 整个抽屉都进不去了 —— 这正是用户 2026-10-08
      * 要的效果：「隐藏了就无发通过轮盘进入」。
      */
@@ -590,9 +596,9 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_HIDE_MORE_ENTRY, value).apply()
 
     /**
-     * 扇形极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
+     * 轮盘极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
      *
-     * 决定整个扇形「离屏幕边多远」——调大则弧整体往屏幕中心收，调小则更贴角落。
+     * 决定整个轮盘「离屏幕边多远」——调大则弧整体往屏幕中心收，调小则更贴角落。
      * 用百分比而不是 dp，是为了在不同屏幕尺寸上观感一致。
      */
     var menuCornerInsetPercent: Int
@@ -637,6 +643,48 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putLong(KEY_LAST_AUTO_A11Y_GRANT, value).apply()
 
     /**
+     * 「自动检测更新」：进应用后**静默**查一次 GitHub release。默认**开**。
+     *
+     * 查到新版本**不弹窗**，只把状态点亮——「关于」页（`AboutActivity`）里「检查更新」那一行，
+     * 以及设置 tab 里的关于入口行（见 `UpdateCenter`）——自动跑的东西不该打断人。
+     *
+     * 默认 `true` 是这类功能的常规预期；关掉它只是不再**自动**联网，手动点「检查更新」
+     * 和「更新日志」照常能用（那两处不读这个开关）。
+     */
+    var autoCheckUpdate: Boolean
+        get() = preferences.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
+        set(value) = preferences.edit().putBoolean(KEY_AUTO_CHECK_UPDATE, value).apply()
+
+    /**
+     * 上一次**自动**查更新的时刻（wall clock，`System.currentTimeMillis()`），用来做冷却。
+     *
+     * 和 [lastAutoA11yGrantAt] 同一个理由不存 `elapsedRealtime`：那个跨重启会归零，
+     * 而这条记录的意义正是「跨重启也别反复联网」。
+     *
+     * ★ **在发请求之前就写**，不是成功之后：GitHub 匿名接口按出口 IP 限流（见
+     * [UpdateChecker.RateLimitException]），失败也照样占额度 —— 写成「成功才记」的话，
+     * 断网环境里每次冷启动都会白撞一次。
+     */
+    var lastUpdateCheckAt: Long
+        get() = preferences.getLong(KEY_LAST_UPDATE_CHECK_AT, 0L)
+        set(value) = preferences.edit().putLong(KEY_LAST_UPDATE_CHECK_AT, value).apply()
+
+    /**
+     * 「自动检测更新」的**频率**（小时），只在 [autoCheckUpdate] 打开时起作用。
+     *
+     * 默认 [DEFAULT_AUTO_UPDATE_INTERVAL_HOURS]（每天）。可选的几档见
+     * [AUTO_UPDATE_INTERVAL_CHOICES]，`0` = **每次启动都查**（用户主动要的那种）。
+     *
+     * ★ 这个值是「自动行为的最小间隔」，**不是「功能冷却」**：用户主动点「检查更新」、
+     * 或刚把开关拨开那一下，都走 `force` 绕过它（见 `UpdateCenter.autoCheck`）。
+     * 频率定得越密，GitHub 匿名接口（按出口 IP 限流 60 次/小时）被烧光的风险越高 ——
+     * 所以默认仍是每天一档。
+     */
+    var autoUpdateIntervalHours: Int
+        get() = preferences.getInt(KEY_AUTO_UPDATE_INTERVAL_HOURS, DEFAULT_AUTO_UPDATE_INTERVAL_HOURS)
+        set(value) = preferences.edit().putInt(KEY_AUTO_UPDATE_INTERVAL_HOURS, value).apply()
+
+    /**
      * 「后台隐藏」：开启后本应用不出现在系统「最近任务」（Recents）里。
      *
      * 默认关闭。生效方式是**用户主动离开应用时把整个 task 结束并移除**（见 [AppContext]，
@@ -671,6 +719,18 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putString(KEY_ICON_PACK, value).apply()
 
     /**
+     * **工具图标**的样式，取值见 `SystemTools.ToolIconStyle` 的 `id`。
+     *
+     * 与上面那两个「应用图标的来源」是**两回事**：识屏 / 截屏 / 手电筒这些小工具没有真实 APK
+     * 图标，图标是 app 自己画的矢量图，**不吃图标包也不吃系统图标集** —— 所以单独给一个选择
+     * （用户 2026-10-08：「把这七个都做成图标包，可以给工具单独用」）。
+     * 默认 [SystemTools.ToolIconStyle.DEFAULT]（裸线条）。
+     */
+    var toolIconStyle: String
+        get() = preferences.getString(KEY_TOOL_ICON_STYLE, null) ?: SystemTools.ToolIconStyle.DEFAULT.id
+        set(value) = preferences.edit().putString(KEY_TOOL_ICON_STYLE, value).apply()
+
+    /**
      * 要不要跟随 ColorOS 的**系统图标集**（主题里那套图标）。默认**开**。
      *
      * 资源在 `/data/theme/icons`（世界可读，普通应用就能读，见 [SystemIconSet]）——
@@ -682,7 +742,7 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_USE_SYSTEM_ICON_SET, value).apply()
 
     /**
-     * 扇形图标直径，单位 dp。
+     * 轮盘图标直径，单位 dp。
      *
      * 默认 34dp。早先按官方的观感取到 46dp，真机上偏大——图标是跟着半径铺在一条大弧上的，
      * 直径一大整条弧就显得笨重。做成滑块让用户按自己的屏幕定。
@@ -703,7 +763,7 @@ class SettingsStore(context: Context) {
      * 位置始终不动，只有姿态在转。
      *
      * 用户 2026-10-08 要求做成可调，用来挑一个顺眼的幅度（默认 **30°**）；同一天又要求从「设置 → 调试」
-     * 里那个临时档位表挪进**正式设置**（「主动呼出 → 扇形设置」，见 `CornerSettingsActivity`），
+     * 里那个临时档位表挪进**正式设置**（「主动呼出 → 轮盘设置」，见 `CornerSettingsActivity`），
      * 并且上限放到 60°。
      */
     var menuSwingDeg: Int
@@ -712,6 +772,34 @@ class SettingsStore(context: Context) {
         set(value) =
             preferences.edit()
                 .putInt(KEY_MENU_SWING_DEG, value.coerceIn(MIN_MENU_SWING_DEG, MAX_MENU_SWING_DEG))
+                .apply()
+
+    /**
+     * 轮盘呼出时，图标下面那层**灰色衬底**的不透明度（0~100，百分比）。**0 = 不垫衬底**。
+     *
+     * 用户 2026-10-08 对着魅族官方提的：「轮盘呼出会有个透明灰色的层，可以让图标对比度更明显」。
+     *
+     * ## ★ 它和当年被否掉的「整层压暗」是两件事，别混
+     *
+     * 当年否掉的是**整层 alpha**（`View.alpha` / 窗口 alpha 那种）——那会把**图标自己**也一起冲淡，
+     * 观感是「图标发白、像蒙了层遮罩」。这里是**画在图标之前的一块半透明矩形**：图标是后画的、
+     * 自身不透明，所以颜色一点不受影响，变的只有**图标背后的背景**。
+     * 背景一暗，浅色图标 / 彩色图标就都跳出来了——这正是用户要的「对比度更明显」。
+     * 见 `RadialMenuView.onDraw` 里那段绘制说明。
+     *
+     * 默认 **18%**：2026-10-08 首版给的是 35%，用户真机第一反应「太黑了，感觉屏幕跟闪了一下」。
+     * 它是**衬底**，只需要把背景从「跟图标抢对比度」压到「退后一步」，不需要压成暗幕。
+     * 想要更明显自己往上拖，但**别拿它当主题色用**。
+     */
+    var menuScrimPercent: Int
+        get() = preferences.getInt(KEY_MENU_SCRIM_PERCENT, DEFAULT_MENU_SCRIM_PERCENT)
+            .coerceIn(MIN_MENU_SCRIM_PERCENT, MAX_MENU_SCRIM_PERCENT)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_MENU_SCRIM_PERCENT,
+                    value.coerceIn(MIN_MENU_SCRIM_PERCENT, MAX_MENU_SCRIM_PERCENT),
+                )
                 .apply()
 
     /** 更多面板默认页：apps / tools。 */
@@ -752,8 +840,8 @@ class SettingsStore(context: Context) {
      *
      * ## 它只管工具页这一处
      *
-     * 工具在三个地方出现：工具页网格、扇形（连同「已选」条）、底栏。**三处的顺序互不相干，
-     * 各拖各的**：这里改的是工具页网格；扇形与「已选」看 [pinnedComponents]；底栏看
+     * 工具在三个地方出现：工具页网格、轮盘（连同「已选」条）、底栏。**三处的顺序互不相干，
+     * 各拖各的**：这里改的是工具页网格；轮盘与「已选」看 [pinnedComponents]；底栏看
      * [dockComponents]。用户明确要的就是这种「各管各的」，**不要**把三处联动起来。
      *
      * 所以改这里时不要顺手去重排另外两个列表——那正是被否掉的做法。
@@ -776,7 +864,7 @@ class SettingsStore(context: Context) {
             preferences.edit().putString(KEY_TOOL_ORDER, ordered.joinToString("\n")).apply()
         }
 
-    /** 用换行分隔的字符串保存，保证固定顺序在扇形里稳定。 */
+    /** 用换行分隔的字符串保存，保证固定顺序在轮盘里稳定。 */
     var pinnedComponents: List<ComponentName>
         get() =
             preferences.getString(KEY_PINS, null)
@@ -797,7 +885,7 @@ class SettingsStore(context: Context) {
     /**
      * 「底栏」里的项，**有序**，最多 [MAX_DOCK] 个。
      *
-     * 和 [pinnedComponents] 是两回事：那个决定**扇形里有什么**，这个只是「更多」面板底部
+     * 和 [pinnedComponents] 是两回事：那个决定**轮盘里有什么**，这个只是「更多」面板底部
      * 那一行快捷位，点一下直接打开。两者可以放同样的东西，但互不影响。
      */
     var dockComponents: List<ComponentName>
@@ -876,10 +964,10 @@ class SettingsStore(context: Context) {
     }
 
     /**
-     * 加入 / 移出一个扇形固定项。
+     * 加入 / 移出一个轮盘固定项。
      *
-     * **新加入的插到最前**，也就是扇形里最靠近「更多」的那一格——「更多」在弧的最低端，
-     * 所以新项落在扇形**最下面**，和用户在「已选」条里看到的一致（该条从左到右 = 扇形里自上而下，
+     * **新加入的插到最前**，也就是轮盘里最靠近「更多」的那一格——「更多」在弧的最低端，
+     * 所以新项落在轮盘**最下面**，和用户在「已选」条里看到的一致（该条从左到右 = 轮盘里自上而下，
      * 最右那一格就是新加进来的）。
      */
     fun togglePin(component: ComponentName) {
@@ -896,8 +984,13 @@ class SettingsStore(context: Context) {
     /**
      * 把 [component] 在固定列表里挪 [delta] 位（-1 上移、+1 下移）。
      *
-     * 列表顺序就是扇形里的排列顺序：首位对应「更多」上面那一格，依次往外排。
+     * 列表顺序就是轮盘里的排列顺序：首位对应「更多」上面那一格，依次往外排。
      * 越界时静默停住边界，不循环——循环会让「点两下回到原点」这种操作看起来像没生效。
+     *
+     * ⚠️ **当前没有 UI 调用它**（2026-10-08）：管理页原来行尾那两颗 `↑` `↓` 已经拆掉，
+     * 顺序统一由「已固定」条的**长按拖动**走 [reorderPins]。留着这个一位微调的口子，
+     * 是因为它和 [togglePin] / [reorderPins] 是同一组语义完整的 API，删了反而要在别处重写；
+     * 真要用它，记得连 UI 一起加回来，别再让两个入口同时改顺序。
      */
     fun movePin(component: ComponentName, delta: Int) {
         val current = pinnedComponents
@@ -960,7 +1053,40 @@ class SettingsStore(context: Context) {
         // （原因见文件上方「通知：没有开关了，那条常驻通知一直发」那段），不要重新引入。
         // 存量设备的 prefs 里可能还留着这两项，不影响任何逻辑。
         private const val KEY_LAST_AUTO_A11Y_GRANT = "last_auto_a11y_grant_at"
+        private const val KEY_AUTO_CHECK_UPDATE = "auto_check_update"
+        private const val KEY_LAST_UPDATE_CHECK_AT = "last_update_check_at"
+        private const val KEY_AUTO_UPDATE_INTERVAL_HOURS = "auto_update_interval_hours"
         private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
+
+        /**
+         * 自动查更新的**默认**间隔（24 小时），见 [autoUpdateIntervalHours]。
+         *
+         * 为什么不短一点：后端是 GitHub 的**匿名** API，**按出口 IP 限流 60 次/小时**
+         * （`UpdateChecker` 是全应用唯一的联网点）。本应用又是装一次就长期挂后台的工具，
+         * 「每次启动都查」在用户反复开关应用时能直接把额度烧光 —— 那之后连手动「检查更新」
+         * 都会返回「GitHub 暂时限制访问」。一天一次足够：发布节奏本来就是天级的。
+         *
+         * ★ 用户主动做的事**不受间隔限制**（手动点「检查更新」、刚打开开关那一下都走
+         * `force`），它是「自动行为的最小频率」，不是「功能冷却」。
+         */
+        const val DEFAULT_AUTO_UPDATE_INTERVAL_HOURS = 24
+
+        /**
+         * 「检查频率」的可选档位（小时 → 界面上的名字），界面上按这个顺序列出来。
+         *
+         * ★ `0` = **每次启动都查**，冷却退化成「没有冷却」—— 这是把最激进的一档摆明给用户，
+         * 但**默认不选它**：GitHub 的额度是按出口 IP 算的，反复冷启动应用能很快把它用干，
+         * 之后连手动检查都会回「GitHub 暂时限制访问」。
+         */
+        val AUTO_UPDATE_INTERVAL_CHOICES: List<Pair<Int, String>> =
+            listOf(
+                0 to "每次启动",
+                6 to "每 6 小时",
+                12 to "每 12 小时",
+                24 to "每天",
+                72 to "每 3 天",
+                168 to "每周",
+            )
         private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
         const val CLICK_MODE_SINGLE = "single"
@@ -1140,7 +1266,7 @@ class SettingsStore(context: Context) {
         /** 「轻点关闭」下线的一次性迁移标记。 */
         private const val KEY_CLOSE_MODE_MIGRATED_OFF_TAP = "close_mode_migrated_off_tap"
 
-        /** 扇形离屏距离的旧默认（50%），迁移时用来识别「没改过」。 */
+        /** 轮盘离屏距离的旧默认（50%），迁移时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT = 50
         private const val KEY_INSET_MIGRATED_TO_10 = "menu_corner_inset_migrated_to_10"
 
@@ -1167,10 +1293,11 @@ class SettingsStore(context: Context) {
         private const val KEY_MENU_RADIUS_PERCENT = "menu_radius_percent"
         private const val KEY_MENU_HAPTIC = "menu_haptic"
 
-        /** 见 [hideMoreEntry]：扇形里不再有「更多」入口。 */
+        /** 见 [hideMoreEntry]：轮盘里不再有「更多」入口。 */
         private const val KEY_HIDE_MORE_ENTRY = "hide_more_entry"
         private const val KEY_MENU_ICON_DP = "menu_icon_dp"
         private const val KEY_MENU_SWING_DEG = "menu_swing_deg"
+        private const val KEY_MENU_SCRIM_PERCENT = "menu_scrim_percent"
         private const val KEY_MENU_WIDTH_DP = "menu_width_dp"
         private const val KEY_MENU_HEIGHT_DP = "menu_height_dp"
         private const val KEY_MENU_CORNER_INSET_PERCENT = "menu_corner_inset_percent"
@@ -1179,12 +1306,15 @@ class SettingsStore(context: Context) {
         private const val KEY_ICON_PACK = "icon_pack_package"
         private const val KEY_USE_SYSTEM_ICON_SET = "use_system_icon_set"
 
-        /** 扇形离角落距离的调节区间。 */
+        /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
+        private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
+
+        /** 轮盘离角落距离的调节区间。 */
         const val MIN_MENU_CORNER_INSET_PERCENT = 0
         const val MAX_MENU_CORNER_INSET_PERCENT = 100
         const val DEFAULT_MENU_CORNER_INSET_PERCENT = 10
 
-        /** 扇形图标直径的调节区间。上限放到 88dp，大屏上想要「图标更大」也能满足。 */
+        /** 轮盘图标直径的调节区间。上限放到 88dp，大屏上想要「图标更大」也能满足。 */
         const val MIN_MENU_ICON_DP = 24
         const val MAX_MENU_ICON_DP = 88
         const val DEFAULT_MENU_ICON_DP = 34
@@ -1200,18 +1330,83 @@ class SettingsStore(context: Context) {
         const val MAX_MENU_SWING_DEG = 60
         const val DEFAULT_MENU_SWING_DEG = 30
 
-        /** 扇形横向/纵向半径的调节区间（dp）。 */
+        /**
+         * 图标衬底（灰色层）的不透明度区间，百分比。**0 = 不垫**，与「呼出晃动 0 = 不晃」同口径。
+         *
+         * 上限 80：再往上背景就发闷了，浅色图标反而被自己的深底吃掉边缘。
+         * 默认 **18%**（首版 35% 被用户判「太黑」，见 [menuScrimPercent] 的说明）。
+         */
+        const val MIN_MENU_SCRIM_PERCENT = 0
+        const val MAX_MENU_SCRIM_PERCENT = 80
+        const val DEFAULT_MENU_SCRIM_PERCENT = 18
+
+        /** 轮盘横向/纵向半径的调节区间（dp）。 */
         const val MIN_MENU_DIM_DP = 80
         const val MAX_MENU_DIM_DP = 460
         const val DEFAULT_MENU_WIDTH_DP = 170
         const val DEFAULT_MENU_HEIGHT_DP = 170
 
-        /** 扇形宽高的旧默认（300），迁移到 170 时用来识别「没改过」。 */
+        /** 轮盘宽高的旧默认（300），迁移到 170 时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_MENU_DIM_DP = 300
         private const val KEY_MENU_DIM_MIGRATED_170 = "menu_dim_migrated_to_170"
 
         /** 旧版半径百分比的 key，迁移用。 */
         private const val KEY_DIM_MIGRATED = "menu_dim_migrated_to_width_height"
         private const val KEY_CLOSE_ANCHOR_MIGRATED_V2 = "close_anchor_migrated_v2"
+
+        /**
+         * 本版本**认识的全部设置键**。
+         *
+         * ## 唯一的用途：[SettingsBackup.apply] 恢复时**只写这里面的键**
+         *
+         * 为什么必须过滤：用户可能拿一份**更新版本**导出的备份，恢复到**旧版本**（降级）。
+         * 那份备份里带着旧版不认识的键，照单全收的话它们会留在 prefs 里 —— 当时无害（没人读），
+         * 但**等哪天再升回新版，它们会突然生效**，把新版该用的默认值顶掉。
+         * 用户 2026-10-08 报的正是这个：「省的后来升级上来了造成影响，新的还是用默认比较好」。
+         *
+         * ## ⚠️⚠️ 新增任何 `KEY_*` 都必须同步加进这里
+         *
+         * 漏加的后果是**那一项恢复不了**（会被当成「本版不认识」直接丢掉），而且很隐蔽 ——
+         * 用户要等到某次恢复之后发现「这项怎么没变」才会察觉。
+         * 为了让它更容易被发现，[SettingsBackup.apply] 会把跳过的项数报出来
+         * （`Applied.skipped`）：**正常恢复（备份不比本机新）时这个数应当是 0**，
+         * 不是 0 就说明白名单漏了东西。
+         *
+         * 一次性迁移标记（`*_MIGRATED_*`）**也要列进来**：它们记的是「这一步迁移已经做过」，
+         * 跟着一起还原才不会让老备份触发一次多余的迁移。
+         */
+        val knownKeys: Set<String> =
+            setOf(
+                // 总开关 / 触摸区
+                KEY_ENABLED, KEY_LEFT, KEY_RIGHT, KEY_RANGE_DP, KEY_RANGE_HEIGHT_DP,
+                KEY_EDGE_INSET_DP, KEY_BOTTOM_INSET_DP, KEY_CORNER_TAP_THROUGH, KEY_PINS,
+                // 关闭方式（窗外 / 窗内）
+                KEY_OUTSIDE_TAP, KEY_CAPTION_TAP_CLOSE, KEY_OUTSIDE_TAP_SIDES_ONLY,
+                KEY_OUTSIDE_TAP_MASK, KEY_OUTSIDE_TAP_PADDING_DP, KEY_OUTSIDE_TAP_DEBUG,
+                KEY_OUTSIDE_TAP_CLOSE_MODE, KEY_OUTSIDE_TAP_CLICK_MODE, KEY_OUTSIDE_TAP_FORCE,
+                KEY_CLOSE_BAR_X_PERCENT, KEY_CLOSE_BAR_Y_DP, KEY_CLOSE_ANCHOR_MARKER,
+                KEY_CLOSE_SWIPE_DISTANCE, KEY_CLOSE_SWIPE_DURATION, KEY_LEGACY_CLOSE_ANCHOR_X_DP,
+                KEY_CLOSE_ANCHOR_Y_DP,
+                // 「更多」面板
+                KEY_DRAWER_DEFAULT_TAB, KEY_LANDSCAPE_PANEL_SIDE, KEY_DOCK, KEY_RECENT,
+                KEY_TOOL_ORDER, KEY_HIDE_MORE_ENTRY,
+                // 轮盘几何与观感
+                KEY_MENU_RADIUS_PERCENT, KEY_MENU_HAPTIC, KEY_MENU_ICON_DP, KEY_MENU_SWING_DEG,
+                KEY_MENU_SCRIM_PERCENT, KEY_MENU_WIDTH_DP, KEY_MENU_HEIGHT_DP,
+                KEY_MENU_CORNER_INSET_PERCENT, KEY_LEGACY_MENU_CORNER_INSET_DP,
+                // 图标
+                KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
+                // 其它
+                KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
+                KEY_AUTO_UPDATE_INTERVAL_HOURS,
+                KEY_LAST_AUTO_A11Y_GRANT, KEY_DEBUG_LOG,
+                // 一次性迁移标记（见上面的说明，必须一起还原）
+                KEY_TOUCH_MIGRATED, KEY_RANGE_MIGRATED_40_70, KEY_INSET_MIGRATED_TO_10,
+                KEY_MENU_DIM_MIGRATED_170, KEY_DIM_MIGRATED, KEY_SWIPE_DURATION_MIGRATED,
+                KEY_OUTSIDE_TAP_PADDING_MIGRATED_3, KEY_CLOSE_ANCHOR_Y_MIGRATED_0,
+                KEY_CLOSE_ANCHOR_Y_MIGRATED_4, KEY_CLOSE_ANCHOR_MIGRATED_V2,
+                KEY_CLOSE_MODE_MIGRATED_SYSTEM, KEY_CLOSE_MODE_MIGRATED_OFF_BACK,
+                KEY_CLOSE_MODE_MIGRATED_OFF_TAP, KEY_LANDSCAPE_SIDE_MIGRATED_AUTO,
+            )
     }
 }

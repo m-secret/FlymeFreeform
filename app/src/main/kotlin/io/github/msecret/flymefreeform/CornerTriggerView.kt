@@ -19,7 +19,7 @@ import kotlin.math.hypot
  *
  * **副作用与补救**：悬浮窗一旦接到 DOWN 就独占这块区域，落到角落的普通点击也会
  * 被它吃掉，表现就是「屏幕左右下角的按钮点不到」。所以这里区分两种输入：
- * 斜向内上滑 -> 唤出扇形菜单；除此之外的按压 -> 通过 [Listener.onTapThrough]
+ * 斜向内上滑 -> 唤出轮盘菜单；除此之外的按压 -> 通过 [Listener.onTapThrough]
  * 交给无障碍服务按回原坐标，等效于点到了下层窗口。
  */
 class CornerTriggerView(
@@ -32,7 +32,7 @@ class CornerTriggerView(
         /** 手势在角落起手，尚未确认是斜向内上滑。 */
         fun onGestureStart(side: CornerSide)
 
-        /** 已确认斜向内上滑，展开扇形菜单。 */
+        /** 已确认斜向内上滑，展开轮盘菜单。 */
         fun onGestureActivate(side: CornerSide, cornerX: Float, cornerY: Float)
 
         /** 菜单已展开，跟随手指更新选中项。 */

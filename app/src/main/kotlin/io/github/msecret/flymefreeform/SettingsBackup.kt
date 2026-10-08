@@ -19,7 +19,7 @@ import java.util.Locale
  * ## 备份的是什么
  *
  * `SharedPreferences`（[SettingsStore] 的 `flymefreeform_noroot`）里的**全部键值**：
- * 功能开关、几何参数、扇形固定列表、「更多」底栏、最近使用、图标来源……一个不落。
+ * 功能开关、几何参数、轮盘固定列表、「更多」底栏、最近使用、图标来源……一个不落。
  * **权限不在里面**——悬浮窗 / Shizuku / 无障碍都是系统状态，任何应用都导不出来，
  * 换机后要在系统里重新授权（首页那三行会告诉你缺什么）。
  *
@@ -34,8 +34,11 @@ import java.util.Locale
  *
  * ## 恢复是「整份替换」，不是合并
  *
- * 先 `clear()` 再逐项写入 —— 语义是**把设置还原成导出那一刻的样子**。所以备份里没有的键
- * （比如备份来自旧版本、新版才加的设置项）会回到默认值，这正是想要的。
+ * 先 `clear()` 再逐项写入 —— 语义是**把设置还原成导出那一刻的样子**。跨版本两头都有兜底：
+ *
+ * - **备份里没有的键**（备份来自旧版本、新版才加的设置项）→ 回到默认值；
+ * - **备份里多出来的键**（备份来自**更新的版本**、本版不认识）→ **直接丢弃、不写进 prefs**，
+ *   理由见 [apply] 的说明（留着的话等以后升回新版会突然生效，顶掉该用的默认值）。
  *
  * ## 落盘位置与权限
  *
@@ -142,17 +145,44 @@ object SettingsBackup {
         return decode(JSONObject(bytes.toString(Charsets.UTF_8)))
     }
 
+    /** 一次恢复的结果：真正写入了几项、跳过了几项（跳过的都是**本版不认识的键**）。 */
+    data class Applied(val written: Int, val skipped: Int)
+
     /**
-     * 把一份已校验的备份**整份替换**进 prefs，返回写入项数。
+     * 把一份已校验的备份**整份替换**进 prefs。
+     *
+     * ## ★ 只写「本版本认识的键」（[SettingsStore.knownKeys]）
+     *
+     * 备份可能来自**更新的版本**（用户降级了）。那种备份里带着本版没有的设置键 —— 照单全收
+     * 的话它们会留在 prefs 里：当时无害（没人读），但**等哪天再升回新版，它们会突然生效**、
+     * 顶掉该用的默认值。用户 2026-10-08 报的正是这个：
+     * 「省的后来升级上来了造成影响，新的还是用默认比较好」。
+     *
+     * 所以这里**先过滤再写**：不认识的键直接丢弃，prefs 里干干净净，新版升上来时自然走默认值。
      *
      * 用 `commit()` 而不是 `apply()`：这是关键写入，要同步落盘、并且立刻能知道成败；
      * 恢复完界面马上要读新值，不能等异步落盘。
      */
-    fun apply(context: Context, parsed: Parsed): Int {
+    fun apply(context: Context, parsed: Parsed): Applied {
         val editor = prefsOf(context).edit().clear()
-        parsed.values.forEach { (key, value) -> putValue(editor, key, value) }
+        var written = 0
+        var skipped = 0
+        parsed.values.forEach { (key, value) ->
+            if (key !in SettingsStore.knownKeys) {
+                skipped++
+                return@forEach
+            }
+            putValue(editor, key, value)
+            written++
+        }
         if (!editor.commit()) error("写入设置失败")
-        return parsed.values.size
+        if (skipped > 0) {
+            // 正常恢复（备份不比本机新）时这里应当是 0。不是 0 有两种可能：
+            // ① 降级恢复，备份确实来自更新的版本（正常，这就是这个过滤存在的意义）；
+            // ② [SettingsStore.knownKeys] 漏登记了新加的键（要修）。
+            DebugLog.warn("BACKUP_SKIPPED_UNKNOWN", "跳过 $skipped 项本版不认识的设置")
+        }
+        return Applied(written, skipped)
     }
 
     // ---- 序列化 ----

@@ -5,6 +5,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.util.Xml
@@ -34,6 +38,25 @@ import org.xmlpull.v1.XmlPullParser
 object IconPackLoader {
 
     private const val ICON_SIZE_DP = 48f
+
+    /**
+     * 归一化时**兜底**用的目标占比 —— 自适应图标前景的 **72/108 = 0.667**。
+     *
+     * 正常路径上调用方会传**实测值**（拿这个应用自己的默认图标量出来的占比，见
+     * [contentFraction]），那才是用户要的「拉到和真正图标一样大」。只有在量不出来
+     * （默认图标读不到 / 全透明）时才退回这个理论值。
+     *
+     * 顺带它也在正圆裁剪的安全范围内（内切圆边长有 70.7%）。详见 [scaleTo]。
+     */
+    internal const val VISUAL_FRACTION = 2f / 3f
+
+    /**
+     * 量内容边界时的 alpha 阈值。
+     *
+     * 取 32 而不是 1：图标普遍带一点投影 / 光晕（alpha 个位数到十几），
+     * 按 1 算会把那圈虚影也算成内容 —— 边界凭空大一圈，图标反而被缩得更小。
+     */
+    private const val ALPHA_MIN = 32
 
     /**
      * 图标包 App 声明自己身份用的 action。
@@ -143,8 +166,24 @@ object IconPackLoader {
         return trimmed
     }
 
-    /** 按 drawable 名加载图标包里的图标，转成 Bitmap。 */
-    fun loadIcon(context: Context, iconPackPkg: String, drawableName: String): Bitmap? {
+    /**
+     * 按 drawable 名加载图标包里的图标，转成 Bitmap。
+     *
+     * [targetPx] 是位图的目标边长，由调用方按「所有绘制处的最大需求」算
+     * （见 `AppCatalog.iconTargetPx`）。**一定要传对**：这里早先写死 48dp（≈126px），
+     * 而面板网格要 192px —— 那个位图会被**放大 1.5 倍**画出来，看着比别的图标糊。
+     * 传 0 时退回 48dp，只是兜底，正常路径都该显式传。
+     *
+     * [targetFraction] 是**要缩放到多大**（内容占边长的比例）。调用方传「这个应用的默认图标
+     * 实测出来的占比」就能把图标包图标拉到和真正图标一样大，见 [contentFraction]。
+     */
+    fun loadIcon(
+        context: Context,
+        iconPackPkg: String,
+        drawableName: String,
+        targetPx: Int = 0,
+        targetFraction: Float = VISUAL_FRACTION,
+    ): Bitmap? {
         val pm = context.packageManager
         return runCatching {
             val resources = pm.getResourcesForApplication(iconPackPkg)
@@ -152,31 +191,170 @@ object IconPackLoader {
                 .let { if (it != 0) it else resources.getIdentifier(drawableName, "mipmap", iconPackPkg) }
             if (id == 0) return null
             val drawable = resources.getDrawable(id, null)
-            drawable.toBitmap(context)
+            scaleTo(drawable, resolveTarget(context, targetPx), targetFraction = targetFraction)
         }.getOrNull()
     }
 
-    private fun Drawable.toBitmap(context: Context): Bitmap {
-        val target = (ICON_SIZE_DP * context.resources.displayMetrics.density).toInt().coerceAtLeast(1)
-        return scaleTo(this, target)
+    /** 调用方没给目标尺寸时的兜底：48dp。 */
+    private fun resolveTarget(context: Context, targetPx: Int): Int =
+        if (targetPx > 0) {
+            targetPx
+        } else {
+            (ICON_SIZE_DP * context.resources.displayMetrics.density).toInt().coerceAtLeast(1)
+        }
+
+    /**
+     * 把任意 Drawable 画成 `target`×`target` 的位图。
+     *
+     * ## 视觉大小怎么对齐（用户 2026-10-08：「有些图标会很大，有些图标包会很小」）
+     *
+     * 图标的**视觉大小**和它的**绘制边界**不是一回事，各来源差得很远：
+     * 自适应图标是 108 的网格、前景只画在中间的 72（视觉 66.7%）；而图标包 / 系统图标集里的
+     * PNG 铺满自己的画布，留多少边距全看作者。一律铺满，出来就是「有的撑满、有的缩在中间」。
+     *
+     * ## ★ 判据是**来源**，不是 Drawable 的类型
+     *
+     * [alignVisual] 由**调用方按来源**决定：
+     *
+     * - **应用原图标（「默认」来源）→ `false`**：它跟着系统 / 桌面走，是**基准**，一律不动。
+     *   这不是"偷懒"，而是**类型判不出来**：真机上 ColorOS 的
+     *   `PackageManager.getApplicationIcon()` 返回的**并不是** `AdaptiveIconDrawable`，
+     *   所以 `drawable is AdaptiveIconDrawable` 那种判据永远为 false —— 结果是「默认」图标
+     *   也被拉去按整图边界归一化了。而各图标的整图内容占比本来就不一样（有的自带不透明背景、
+     *   有的留边），归一化的倍率自然各不相同 ⇒ 同类之间反而被缩得**参差不齐**
+     *   （用户当场报的「默认的图标都变得不一样大」，前两版都没修好就是因为这个）。
+     * - **图标包 / 系统图标集 → `true`**：它们是用户主动换的一套，要和基准**对齐**。
+     *
+     * ## 对齐到多少：[targetFraction]
+     *
+     * 默认 [VISUAL_FRACTION]（2/3，即自适应图标前景的 72/108）。但**更好的做法是传实测值**
+     * —— 见 [contentFraction]：`AppCatalog` 会拿**这个应用自己的默认图标**量出一个占比传进来，
+     * 那就是用户说的「**把图标包的大小强制拉到和真正图标一样大**」。
+     *
+     * ⚠️ 画的时候**必须带 `FILTER_BITMAP_FLAG`**：不带的话缩放走最近邻采样，图标会发糊。
+     * 真机上「图标很糊」的真因一直是采样方式，跟位图尺寸无关。
+     */
+    internal fun scaleTo(
+        drawable: Drawable,
+        target: Int,
+        alignVisual: Boolean = true,
+        targetFraction: Float = VISUAL_FRACTION,
+    ): Bitmap {
+        val raw =
+            when {
+                // BitmapDrawable 走 createScaledBitmap：它内部带过滤，比走一遍 draw 快。
+                drawable is BitmapDrawable && drawable.bitmap != null ->
+                    Bitmap.createScaledBitmap(drawable.bitmap, target, target, true)
+                else -> renderTo(drawable, target)
+            }
+        if (!alignVisual) return raw
+        // 自适应图标自带标准视觉（108 网格 / 前景 72），本来就是基准，不用也对不齐。
+        if (drawable is AdaptiveIconDrawable) return raw
+        return normalizeVisual(raw, target, targetFraction)
     }
 
-    /** 把任意 Drawable 画成 `target`×`target` 的位图（图标包与系统图标集共用）。 */
-    internal fun scaleTo(drawable: Drawable, target: Int): Bitmap {
-        if (drawable is BitmapDrawable && drawable.bitmap != null) {
-            val source = drawable.bitmap
-            if (source.width == target && source.height == target) return source
-            return Bitmap.createScaledBitmap(source, target, target, true)
-        }
-        val result = Bitmap.createBitmap(target, target, Bitmap.Config.ARGB_8888)
+    /**
+     * 把 drawable 铺满 `size`×`size` 的位图，**不做任何归一化**。
+     *
+     * `internal` 而不是 `private`：`AppCatalog` 要拿它把**默认图标**渲染出来量尺寸
+     * （见 [contentFraction]），好让图标包图标对齐到它。
+     */
+    internal fun renderTo(drawable: Drawable, size: Int): Bitmap {
+        val result = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
         drawable.setBounds(0, 0, canvas.width, canvas.height)
         drawable.draw(canvas)
         return result
     }
 
-    /** 解码出来可能不是正方形（系统图标集里就有），先居中裁方再缩放。 */
-    internal fun squareScale(bitmap: Bitmap, target: Int): Bitmap {
+    /**
+     * 量出 [bitmap] 里「有内容的那块」占整张的比例（较长边 ÷ 边长）。
+     *
+     * 量不出来时返回 null：整张全透明、尺寸非法、或者拿不到像素（`Config.HARDWARE`）。
+     *
+     * ★ 这是「强制拉到和真正图标一样大」的量尺：`AppCatalog` 先拿**这个应用自己的默认图标**
+     * 量一个占比，再把图标包 / 系统图标集的图标归一化到同一个占比。
+     */
+    internal fun contentFraction(bitmap: Bitmap): Float? {
+        val bounds = alphaBounds(bitmap) ?: return null
+        val size = maxOf(bitmap.width, bitmap.height)
+        if (size <= 0) return null
+        return maxOf(bounds.width(), bounds.height()).toFloat() / size
+    }
+
+    /**
+     * 视觉归一化：把 [raw] 里「有内容的那块」缩到 `target × fraction` 并居中。
+     *
+     * 只处理**非自适应**的图标（legacy 应用图标、图标包 / 系统图标集的 PNG）——
+     * 自适应图标是基准、不走这里，理由见 [scaleTo]。
+     *
+     * 量不出内容（整张全透明）时**原样返回**——那种图标本来就该是空的，
+     * 不该被放大成一片噪声。
+     */
+    private fun normalizeVisual(raw: Bitmap, target: Int, fraction: Float): Bitmap {
+        val content = alphaBounds(raw) ?: return raw
+        val contentSize = maxOf(content.width(), content.height())
+        if (contentSize <= 0) return raw
+        val scale = target * fraction / contentSize
+        val output = Bitmap.createBitmap(target, target, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        val width = raw.width * scale
+        val height = raw.height * scale
+        // 让**内容的中心**落在画布中心，而不是 raw 的中心——内容本来就可能偏在一边
+        // （图标作者画歪、或前景层自带不对称边距）。
+        val left = target / 2f - content.exactCenterX() * scale
+        val top = target / 2f - content.exactCenterY() * scale
+        canvas.drawBitmap(raw, null, RectF(left, top, left + width, top + height), paint)
+        return output
+    }
+
+    /**
+     * 扫出「有像素」的包围盒（alpha ≥ [ALPHA_MIN]）；整张全透明时返回 null。
+     *
+     * 阈值取 32 而不是 1：图标普遍带一点**投影 / 光晕**（alpha 个位数到十几），
+     * 按 1 算会把那圈虚影也算进内容里 —— 边界凭空大一圈，图标反而被缩得更小。
+     *
+     * 整段包在 `runCatching` 里：`getPixels` 遇到 `Config.HARDWARE` 的位图会抛
+     * （它拿不到像素）。那种情况就当「量不出内容」处理 —— 退化成不归一化，
+     * 总好过为一个图标崩掉整个目录加载。
+     */
+    private fun alphaBounds(bitmap: Bitmap): Rect? =
+        runCatching {
+            val width = bitmap.width
+            val height = bitmap.height
+            if (width <= 0 || height <= 0) return null
+            val row = IntArray(width)
+            var left = width
+            var top = height
+            var right = -1
+            var bottom = -1
+            for (y in 0 until height) {
+                bitmap.getPixels(row, 0, width, 0, y, width, 1)
+                for (x in 0 until width) {
+                    if (row[x] ushr 24 >= ALPHA_MIN) {
+                        if (x < left) left = x
+                        if (x > right) right = x
+                        if (y < top) top = y
+                        if (y > bottom) bottom = y
+                    }
+                }
+            }
+            if (right < left || bottom < top) return null
+            Rect(left, top, right + 1, bottom + 1)
+        }.getOrNull()
+
+    /**
+     * 解码出来可能不是正方形（系统图标集里就有），先居中裁方，再缩放并归一化。
+     *
+     * [targetFraction] 的含义见 [scaleTo] / [contentFraction]：传「这个应用的默认图标实测占比」
+     * 就能把系统图标集里那枚图标拉到和真正图标一样大。
+     */
+    internal fun squareScale(
+        bitmap: Bitmap,
+        target: Int,
+        targetFraction: Float = VISUAL_FRACTION,
+    ): Bitmap {
         val size = minOf(bitmap.width, bitmap.height)
         if (size <= 0) return bitmap
         val square =
@@ -184,7 +362,13 @@ object IconPackLoader {
             else runCatching {
                 Bitmap.createBitmap(bitmap, (bitmap.width - size) / 2, (bitmap.height - size) / 2, size, size)
             }.getOrDefault(bitmap)
-        if (target <= 0 || square.width == target) return square
-        return runCatching { Bitmap.createScaledBitmap(square, target, target, true) }.getOrDefault(square)
+        if (target <= 0) return square
+        val scaled =
+            if (square.width == target) {
+                square
+            } else {
+                runCatching { Bitmap.createScaledBitmap(square, target, target, true) }.getOrDefault(square)
+            }
+        return normalizeVisual(scaled, target, targetFraction)
     }
 }

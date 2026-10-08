@@ -39,5 +39,6 @@ This software is provided **“as is”**, without warranty of any kind, express
 ## Third-party components
 
 - [Shizuku](https://github.com/RikkaApps/Shizuku-API) (`dev.rikka.shizuku:api`, `dev.rikka.shizuku:provider`, Apache-2.0) — injects input events as shell, runs system commands, and reads the system log. Shizuku itself is a separate app by RikkaW that you install and authorize yourself; this project only depends on its API.
+- [Lucide](https://lucide.dev) (icon set, **ISC License**) — the glyphs of the built-in tools (screen text / screenshot / scan / pay code / flashlight / lock screen) are taken from this icon set. The paths in `res/drawable/ic_tool_*.xml` are used verbatim, only scaled and translated into a circular background (parameters are documented in each file). This is a **build-time asset**: nothing is loaded at runtime and no code dependency is introduced.
 
 Apart from Shizuku, this app **depends on no other third-party library at runtime**. The build toolchain (Android Gradle Plugin, Gradle, JDK) and the Kotlin standard library are used under their respective licenses and are not distributed with this app's binary.

@@ -339,7 +339,7 @@ object Ui {
      * 与其在每处手工拼 Spannable，不如在这里统一认一种最小的记号：遇到成对的 `**` 就把夹在
      * 中间的那段加粗，其余原样。落单的 `**` 只会被当普通字符留着，不至于影响阅读。
      */
-    private fun boldSpans(text: String): CharSequence {
+    internal fun boldSpans(text: String): CharSequence {
         if (!text.contains("**")) return text
         val builder = android.text.SpannableStringBuilder()
         var bold = false
@@ -486,6 +486,20 @@ object Ui {
         }
 
     /**
+     * 行尾那个 `›` 箭头，表示「这一行点得进去」。
+     *
+     * 只留这一处定义：[entryRow] / 「关于」卡里的自建行都在用它。以前是三份各自内联的
+     * 副本（字号、颜色、左内边距一旦有一处改了，同一张卡里就会有两个大小不一的箭头）。
+     */
+    fun chevron(context: Context): TextView =
+        TextView(context).apply {
+            text = "›"
+            m3(context, 18f)
+            setTextColor(COLOR_ON_SURFACE_VARIANT)
+            setPadding(dp(context, 8), 0, 0, 0)
+        }
+
+    /**
      * 开关行：左侧主文字（可带一行说明），右侧 [Switch]。
      *
      * 整行可点：手指落在文字上也应该切换开关，不然点起来要够那个小小的滑块。
@@ -586,7 +600,7 @@ object Ui {
      * 入口行：标题（+ 可选副标题）+ 右侧箭头。
      *
      * 标题与副标题两个 TextView 一起挂在返回 View 的 `tag` 上（[RowTexts]）——需要动态改文案的
-     * 入口取出来直接用。**会变的数字放副标题，别塞进标题**：标题长短随计数跳（「管理扇形应用
+     * 入口取出来直接用。**会变的数字放副标题，别塞进标题**：标题长短随计数跳（「管理应用
      * （已固定 3 / 6）」），整卡的文字左边缘就参差不齐了。
      */
     fun entryRow(
@@ -605,14 +619,7 @@ object Ui {
                 if (detailView != null) addView(detailView)
             }
         container.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        container.addView(
-            TextView(context).apply {
-                this.text = "›"
-                m3(context, 18f)
-                setTextColor(COLOR_ON_SURFACE_VARIANT)
-                setPadding(dp(context, 8), 0, 0, 0)
-            },
-        )
+        container.addView(chevron(context))
         container.tag = RowTexts(titleView, detailView)
         container.isClickable = true
         container.setOnClickListener { onClick() }
@@ -622,13 +629,29 @@ object Ui {
     /**
      * [entryRow] 挂在自己 `tag` 上的两个文本。
      *
-     * 为什么要一起交出去：有些入口的文案是**动态的**——「管理扇形应用 / 已固定 3 / 6」、
+     * 为什么要一起交出去：有些入口的文案是**动态的**——「管理应用 / 已固定 3 / 6」、
      * 「图标包 / 从 xx 读取」。调用方得在刷新时改它，而这些 View 没有 id 可 `findViewById`，
      * 只能顺着 tag 拿。
      *
      * [detail] 在创建时没给 `detail` 的那一行上是 `null`（那一行压根没有副标题）。
      */
     class RowTexts(val title: TextView, val detail: TextView?)
+
+    /**
+     * 把 [entryRow] 的产物切成**不可点**：去掉点击 + 整行压暗（[DISABLED_ALPHA]）。
+     *
+     * 用在「这一项在当前环境下没有意义」的行上——例如非 ColorOS 机型上的「小窗关闭方式」。
+     * 只压暗文字不够：那一行右侧还有个 `›` 箭头在暗示「点得进去」，所以整行一起压。
+     *
+     * 点击**必须去掉**（不只是 `isClickable = false`）：[CardGroup] 是靠 `clickable` 决定
+     * 要不要给这一行刷涟漪的（见 [choiceRow] 里同一条注释），留着 `OnClickListener` 会
+     * 出现「灰的还能点」。
+     */
+    fun setRowEnabled(row: View, enabled: Boolean) {
+        row.isClickable = enabled
+        row.alpha = if (enabled) 1f else DISABLED_ALPHA
+        if (!enabled) row.setOnClickListener(null)
+    }
 
     // ---- Buttons（M3 的几种按钮变体） ----
 
@@ -1375,7 +1398,7 @@ class TabbedPage(
  * `ViewGroup` 的分发顺序是「先给子 View，子 View 不吃才轮到自己的 `OnTouchListener`」——
  * 于是从一张卡片上起手横滑时，DOWN 被那一行吃掉，挂在 ScrollView 上的监听**根本收不到**；
  * 更糟的是那行会把手势当成「点了一下」，滑完顺手就打开了那个页面。
- * （实测踩到过：在「功能」格从「管理扇形应用」那行起手左滑，直接跳进了应用管理页。）
+ * （实测踩到过：在「功能」格从「管理应用」那行起手左滑，直接跳进了应用管理页。）
  *
  * 所以改在 [dispatchTouchEvent] 里拿**全部**事件（它比子 View 更早），并旦认定是横滑就：
  *

@@ -67,7 +67,7 @@ object AppContext {
      * ## 坑：`onUserLeaveHint()` 在跳自家子页面时**也会**回调（真机实测）
      *
      * AOSP 文档说它只在「用户主动离开」时回调，程序自己 `startActivity` 不算。**ColorOS 17 不
-     * 这样**：从主设置页点「运行日志 / 更多面板 / 主动呼出 / 小窗关闭方式 / 管理扇形应用」，
+     * 这样**：从主设置页点「运行日志 / 更多面板 / 主动呼出 / 小窗关闭方式 / 管理应用」，
      * 被压在下面的 MainActivity 照样收到 `onUserLeaveHint()`，于是 `finishAndRemoveTask()`
      * 把**刚打开的那一页连同整个 task** 一起清掉——用户看到的就是「点一下就闪退」。
      * （真机日志：`MainActivity t2508 f` → `onTaskVanished taskInfo:2508`，焦点直接回桌面。）

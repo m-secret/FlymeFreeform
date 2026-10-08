@@ -366,6 +366,9 @@ class FreeformAccessibilityService : AccessibilityService() {
     fun refresh() {
         val store = SettingsStore(this)
         val target = blocker ?: return
+        // ★ 非 ColorOS 上认不出小窗（识别靠 ColorOS 给小窗画的**伴生装饰窗**，见 [observeLayout]），
+        // 再往下走只会把一整屏遮罩铺到用户面前。判据见 [SystemSupport]。
+        if (!SystemSupport.freeformUsable(this)) return
         target.clickMode = store.outsideTapClickMode
         if (closing) {
             // 关闭流程分**两段**，两段都要从这里返回，但理由不同：

@@ -44,7 +44,7 @@ import java.util.concurrent.Executors
  *    它**不会跟着死**，会留在后台继续把小窗点掉，而且再也停不下来。所以记下它的 PID
  *    （命令里那句 `echo $$`，`exec` 之后 PID 不变），启动/停止前各清一次。
  * 3. **别误杀别人**。清残留刻意**只按自己记下的 PID**杀，不按命令行匹配：按
- *    `FlexibleTaskCaptionView` 去 `pkill` 会把 Pano 自己那条一模一样的 `logcat` 一起干掉。
+ *    `FlexibleTaskCaptionView` 去 `pkill` 会把系统自己那条一模一样的 `logcat` 一起干掉。
  *
  * ## 触发条件
  *
@@ -102,7 +102,7 @@ object CaptionTapClose {
     @Volatile
     private var listener: Process? = null
 
-    /** 屏幕是否亮着。灭屏时停掉监听（省电，也是 Pano 的做法），亮屏再恢复。 */
+    /** 屏幕是否亮着。灭屏时停掉监听（省电，系统原生也是这么做的），亮屏再恢复。 */
     @Volatile
     private var screenOn = true
 
@@ -119,8 +119,12 @@ object CaptionTapClose {
     }
 
     private fun applyState(context: Context) {
+        // ★ 非 ColorOS 上直接不干活：这条链路盯的是 ColorOS 小横条的日志
+        // （`FlexibleTaskCaptionView`），别的系统上永远不会有那一行 —— 白起一个常驻 logcat
+        // 进程，还占着 Shizuku。判据见 [SystemSupport]。
         desired =
-            SettingsStore(context).captionTapCloseEnabled &&
+            SystemSupport.freeformUsable(context) &&
+                SettingsStore(context).captionTapCloseEnabled &&
                 ShizukuShell.hasPermission &&
                 screenOn &&
                 OverlayGestureService.isRunning
@@ -156,7 +160,7 @@ object CaptionTapClose {
     /**
      * 逐行读 `logcat` 的输出，认出「单击小横条」就补一记上滑。
      *
-     * 状态机与 Pano 的 `WhiteBarTapClose` 一致：先收下按下点，再看紧跟着的那行有没有
+     * 状态机对齐系统原生实现：先收下按下点，再看紧跟着的那行有没有
      * `onSingleTapUp`。**上滑（拖动）不会打 `onSingleTapUp`**，所以这个判据天然只认单击，
      * 用户自己上滑关窗时我们不会多插一刀。
      */
@@ -211,7 +215,7 @@ object CaptionTapClose {
             return
         }
         // ★ 距离与时长**与「窗外关闭」共用同一组用户设置**（见 [FreeformCaption.swipeDistancePx]）。
-        // 早先照抄 Pano 写死 555px/260ms，结果系统把这一刀判成**拖动**（≥120ms 就会），
+        // 早先照抄系统原生写死 555px/260ms，结果系统把这一刀判成**拖动**（≥120ms 就会），
         // 小窗先缩一下再关 —— 用户报的「动画时间有点长」就是它。
         val distance = FreeformCaption.swipeDistancePx(context)
         val durationMs = FreeformCaption.swipeDurationMs(context)
@@ -223,7 +227,7 @@ object CaptionTapClose {
     /**
      * 干掉可能残留的上一条监听进程（见类注释第 2、3 条坑）。
      *
-     * **只按自己记下的 PID 杀**，不按命令行匹配 —— 后者会把 Pano 那条同样的 `logcat` 一起带走。
+     * **只按自己记下的 PID 杀**，不按命令行匹配 —— 后者会把系统那条同样的 `logcat` 一起带走。
      */
     private fun killStale(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

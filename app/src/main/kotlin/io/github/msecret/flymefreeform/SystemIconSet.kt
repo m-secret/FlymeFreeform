@@ -121,7 +121,13 @@ object SystemIconSet {
     ) : Closeable {
 
         /** 取某个包在系统图标集里的图标；该包没被主题覆盖时返回 null。 */
-        fun loadIcon(packageName: String, targetPx: Int): Bitmap? {
+        /**
+         * 取某个包在系统图标集里的图标。
+         *
+         * [targetFraction] 是「要缩放到多大」（内容占边长的比例）：调用方传**这个应用的默认图标
+         * 实测出来的占比**，就能把它拉到和真正图标一样大（见 `IconPackLoader.contentFraction`）。
+         */
+        fun loadIcon(packageName: String, targetPx: Int, targetFraction: Float): Bitmap? {
             val name = mapping[packageName] ?: return null
             for (dir in ICON_DIRS) {
                 val entry = zip.getEntry(dir + name) ?: continue
@@ -131,7 +137,7 @@ object SystemIconSet {
                     }.getOrNull() ?: continue
                 // 解码出来不一定正方（主题里就有非方图），裁方 + 缩放统一交给 IconPackLoader，
                 // 免得两处各写一遍、尺寸口径还不一致。
-                return IconPackLoader.squareScale(bitmap, targetPx)
+                return IconPackLoader.squareScale(bitmap, targetPx, targetFraction)
             }
             return null
         }

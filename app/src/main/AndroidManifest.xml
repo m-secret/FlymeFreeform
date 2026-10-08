@@ -7,7 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- 扇形菜单划过图标时的触感反馈。 -->
+    <!-- 轮盘菜单划过图标时的触感反馈。 -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Shizuku 授权通道。 -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
@@ -65,7 +65,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 扇形应用管理单独成页：应用列表太长，放设置主页会把后面的设置项顶到很远。 -->
+        <!-- 应用管理单独成页：应用列表太长，放设置主页会把后面的设置项顶到很远。 -->
         <activity
             android:name=".AppManagementActivity"
             android:exported="false"
@@ -91,6 +91,18 @@
             android:name=".DrawerSettingsActivity"
             android:exported="false"
             android:label="更多面板" />
+
+        <!-- 图标：来源选择 + 「默认 vs 当前来源」的对比预览。 -->
+        <activity
+            android:name=".IconSettingsActivity"
+            android:exported="false"
+            android:label="图标" />
+
+        <!-- 关于：版本 / 主页 + 更新与下载（自动更新、检查更新、更新日志、下载链接）。 -->
+        <activity
+            android:name=".AboutActivity"
+            android:exported="false"
+            android:label="关于" />
 
         <service
             android:name=".OverlayGestureService"

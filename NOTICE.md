@@ -39,5 +39,6 @@
 ## 第三方组件
 
 - [Shizuku](https://github.com/RikkaApps/Shizuku-API)（`dev.rikka.shizuku:api`、`dev.rikka.shizuku:provider`，Apache-2.0）—— 以 shell 身份注入输入事件、执行系统命令、读系统日志。Shizuku 本身是一个独立应用（作者 RikkaW），需由你自行安装并授权；本项目只依赖其 API。
+- [Lucide](https://lucide.dev)（图标集，**ISC License**）—— 内置工具（识屏 / 截屏 / 扫一扫 / 付款码 / 手电筒 / 一键锁屏）的**图形取自该图标集**，`res/drawable/ic_tool_*.xml` 里的路径原样使用，仅按等比缩放与平移摆进圆形底色中（缩放参数见各文件注释）。这是**构建期资源**，不随应用在运行时加载，也不引入任何代码依赖。
 
 除上面的 Shizuku 之外，本应用**运行时不依赖任何其它第三方库**。构建工具链（Android Gradle Plugin、Gradle、JDK）与 Kotlin 标准库按其各自许可使用，不随本应用的二进制分发。

@@ -1,7 +1,6 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.app.StatusBarManager
 import android.content.ComponentName
 import android.content.Intent
@@ -36,13 +35,16 @@ import java.util.concurrent.Executors
  *
  * | tab | 放什么 |
  * | --- | --- |
- * | **首页** | 一句话说明 + 权限三行 + 缺项提示 + `[启动主动呼出]` |
- * | **功能** | 功能参数页的入口（更多面板 / 主动呼出与扇形设置 / 小窗关闭方式 / 管理扇形应用 / 图标） |
- * | **设置** | 「常规」（后台隐藏）/「备份与恢复」/「调试」（运行日志）/「关于」（版本 / GitHub / 检查更新）四节 |
+ * | **首页** | 运行环境 + 权限三行 + 缺项提示 + `[启动主动呼出]` |
+ * | **功能** | 分三节：页面设置（主动呼出与轮盘设置 / 更多面板）、应用与图标（管理应用 / 图标）、小窗（小窗关闭方式） |
+ * | **设置** | 「常规」（后台隐藏）/「备份与恢复」/「调试」（运行日志）/「关于」（一行入口 → [AboutActivity]）四节 |
  *
- * 首页与功能格**不配区块标题**：一屏就这两三组东西，「基础权限」四个字占一行却没带来任何
- * 信息（标题本身就在底栏上写着）。空出来的地方换成留白——这一屏内容本来就少，挤在一起反而
- * 显得是没收尾。
+ * ## 区块标题：三格现在都有
+ *
+ * 首页原来**不配标题**，理由是「一屏就这两三组东西，『基础权限』四个字占一行却不带来信息」。
+ * 2026-10-08 用户要求补上（「首页也加上副标题吧，状态，权限」）——上头多了运行环境这块之后，
+ * 三块东西确实需要路标了。现在：首页「状态 / 权限」、功能格「页面设置 / 应用与图标 / 小窗」、
+ * 设置格「常规 / 备份与恢复 / 调试 / 关于」。**只有最后那颗主行动按钮不带标题**（它自己就是按钮）。
  *
  * 标题固定在顶部、**底栏贴在屏幕下方**（都放在滚动区之外，见 [TabbedPage]）——底栏跟着内容
  * 滚走的话，滑到半屏就不知道自己在哪一格、也切不回去。除了点底栏，**在内容区左右滑动也能切页**。
@@ -70,16 +72,13 @@ class MainActivity : Activity() {
     /**
      * 「功能」tab 卡片里的「图标」那一行。
      *
-     * 2026-10-08 从「主动呼出与扇形设置」页搬来：图标来源是全局观感，不属于「呼出」那套参数。
-     * 标题随当前来源变（[updateIconSourceLabel]），副标题固定列举**支持的三类来源**。
+     * 2026-10-08 从「主动呼出与轮盘设置」页搬来：图标来源是全局观感，不属于「呼出」那套参数。
+     * 标题随当前来源变（[updateIconSourceLabel]），**没有副标题**（见 [buildFeatureTab] 里那段）。
+     *
+     * 点它进 [IconSettingsActivity] —— 来源选择与「默认 vs 当前来源」的对比预览都在那一页
+     * （用户 2026-10-08：「这个做到二级菜单是不是更好」）。这一行只留**摘要**，不做选择。
      */
     private lateinit var iconSourceButton: LinearLayout
-
-    /** 检测到的第三方图标包包名。后台线程填，见 [detectIconPacksAsync]。 */
-    private val iconPacks = mutableListOf<String>()
-
-    /** 图标包包名 → 它的应用名（列表里给人看的是应用名，不是包名）。 */
-    private val iconPackLabels = mutableMapOf<String, String>()
 
     private lateinit var serviceButton: TextView
     private lateinit var overlayRow: PermissionRow
@@ -94,14 +93,29 @@ class MainActivity : Activity() {
      */
     private lateinit var permissionHintBox: LinearLayout
 
-    /** 「设置」tab 里「检查更新」那一行右侧的状态文字。标题是常量，只有它随状态变。 */
-    private lateinit var updateDetail: TextView
+    /**
+     * 「设置」tab → 「关于」下面的两条菜单（2026-10-08：关于整块搬进了二级页 [AboutActivity]）。
+     *
+     * 用户当天的原话是「我的意思是关于下有俩菜单，不是点进去才有俩 tab」——**层级摆在设置页
+     * 这一层**：`Flyme 小窗`（版本 / 主页）和`更新与下载`（自动更新 / 日志 / 下载）各进一页。
+     *
+     * 第二条的副标题要随「有没有新版本」变（见 [refreshAboutRows]），所以得留住引用。
+     */
+    private lateinit var aboutAppRow: LinearLayout
+    private lateinit var aboutUpdateRow: LinearLayout
 
-    /** 检查进行中：用来防重复点击。 */
-    private var checking = false
-
-    /** 已确认有新版本时记下 release 页地址——此时那一行的点击语义变成「前往下载」。 */
-    private var downloadUrl: String? = null
+    /**
+     * [UpdateCenter] 状态一变就把「更新与下载」入口行的副标题重写一遍。
+     *
+     * 这条链路正是「自动检测更新」存在的意义：不订阅的话，自动查到新版本也没人告诉用户，
+     * 那个开关就成了摆设。
+     */
+    private val updateBadgeListener: () -> Unit = {
+        if (!isFinishing && !isDestroyed) {
+            refreshAboutRows()
+            announceUpdateIfNeeded()
+        }
+    }
 
     /**
      * 备份 / 恢复走子线程：写文件 + MediaStore 的几次 IPC，别压在主线程上
@@ -160,8 +174,10 @@ class MainActivity : Activity() {
         refreshStatus()
         // Shizuku 服务可用时自动重连/恢复授权，减少系统重启、软件更新后手动再点。
         ShizukuShell.startAutoReconnect()
-        // 图标包检测要查所有已安装应用、读它们的资源，很慢；放后台线程，别卡住进页面。
-        detectIconPacksAsync()
+        // 顺手静默查一次更新（开关关着、或距上次不到设定频率就直接返回，见 [UpdateCenter]）。
+        // ★ **先挂监听再查**：查到新版本时关于入口那一行要立刻亮起来。
+        UpdateCenter.addListener(updateBadgeListener)
+        UpdateCenter.autoCheck(this)
     }
 
     override fun onStart() {
@@ -174,10 +190,14 @@ class MainActivity : Activity() {
         refreshStatus()
         // 用户可能刚从系统设置里开关了无障碍服务，这里同步一次遮罩状态。
         FreeformAccessibilityService.refreshIfRunning()
+        // 自动检查的结果可能在页面还没拿到焦点时就回来了（那种情况不弹，见 [announceUpdateIfNeeded]），
+        // 回到前台时补上。
+        announceUpdateIfNeeded()
     }
 
     override fun onDestroy() {
         FreeformAccessibilityService.removeConnectionListener(a11yConnectionListener)
+        UpdateCenter.removeListener(updateBadgeListener)
         worker.shutdown()
         super.onDestroy()
     }
@@ -200,16 +220,15 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "读不了这个备份：${error.message}", Toast.LENGTH_LONG).show()
                 return
             }
-        AlertDialog.Builder(this)
-            .setTitle("恢复设置")
-            .setMessage(
-                "将用这份备份覆盖当前全部设置（${parsed.count} 项）。\n" +
+        AppDialog.show(
+            activity = this,
+            title = "恢复设置",
+            message =
+                "将用这份备份**覆盖当前全部设置**（${parsed.count} 项）。\n" +
                     "备份来自 ${parsed.appVersion}，导出于 ${parsed.exportedAtText}。\n\n" +
                     "覆盖后无法撤销——建议先做一次备份。",
-            )
-            .setPositiveButton("覆盖恢复") { _, _ -> applyRestore(parsed) }
-            .setNegativeButton("取消", null)
-            .show()
+            positiveText = "覆盖恢复",
+        ) { applyRestore(parsed) }
     }
 
     // ---- 界面构建 ----
@@ -277,20 +296,22 @@ class MainActivity : Activity() {
         refreshStatus()
     }
 
-    /** 「首页」tab：说明 + 权限状态 + 主行动。 */
+    /**
+     * 「首页」tab：运行环境 + 权限状态 + 主行动。
+     *
+     * ⚠️ 顶上原来还有一段自我介绍（「免 root 的角落呼出 + 小窗工具集…」）。2026-10-08 用户要求
+     * 清掉应用内多余的描述文字，它第一个被删：**用户已经装进来了，不需要再被推销一遍**，
+     * 后半句「原生侧边栏面板、收迷你浮窗没有等价实现」更是在解释**没做**的东西。
+     */
     private fun buildCallTab() {
-        callTab.addView(
-            Ui.hint(
-                this,
-                "免 root 的角落呼出 + 小窗工具集。以小窗启动沿用 ColorOS 自有协议；" +
-                    "原生侧边栏面板、收迷你浮窗在无 root 下没有等价实现。",
-            ),
-        )
+        // 首页的两块各配一行区块标题（2026-10-08 用户：「首页也加上副标题吧，状态，权限」）。
+        //
+        // 这一格原来**不配任何标题**（见类注释里那段），理由是「一屏就这两三组东西，标题反而占行」。
+        // 现在上头多了运行环境、下头还有一颗大按钮，再不给路标，三块东西就糊成一坨了。
+        callTab.addView(Ui.sectionTitle(this, "状态"))
+        callTab.addView(CardGroup(this).row(runtimeRow()))
 
-        // 这一格没有区块标题：三行权限的标题里已经各自写了「是什么 / 用在哪」，
-        // 顶上一行「基础权限」纯属重复。留白补上原来那个标题占的高度。
-        callTab.addView(Ui.spacer(this, TAB_TOP_GAP_DP))
-
+        callTab.addView(Ui.sectionTitle(this, "权限"))
         overlayRow =
             permissionRow(
                 name = "悬浮窗权限",
@@ -339,8 +360,8 @@ class MainActivity : Activity() {
         callTab.addView(
             Ui.hint(
                 this,
-                "**无障碍每次开机会被 ColorOS 关掉**（它的反诈策略，针对非官方渠道安装的应用），" +
-                    "本应用会自动补回。补回后约 30 秒系统会弹一次「检测到…获取无障碍权限」，忽略即可。",
+                "**无障碍每次开机会被 ColorOS 关掉**（反诈策略），本应用会自动补回；" +
+                    "约 30 秒后系统会弹一次权限提示，忽略即可。",
             ),
         )
         permissionHintBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -354,161 +375,136 @@ class MainActivity : Activity() {
         callTab.addView(serviceButton)
     }
 
-    /** 「功能」tab：四个功能参数页的入口。 */
+    /**
+     * 「功能」tab：功能参数页的入口，**按大类分节**。
+     *
+     * 早先这一格是一张卡平铺五行、不配区块标题。用户 2026-10-08 指出「主动呼出 / 轮盘应用本来
+     * 就是一个大类下的」，要求照「设置」tab 那样加小节标题，于是改成同一套写法
+     * （[Ui.sectionTitle] + 一张 [CardGroup]）。
+     *
+     * ## 分节按「管的东西」切（2026-10-08 晚，第二版）
+     *
+     * 第一版是「呼出轮盘 / 面板与图标 / 小窗」，用户当天就指出两处不对：
+     *
+     * - **「图标」挂在「面板」下面是错的**——图标来源是**全局**的：轮盘、更多面板、底栏共用
+     *   同一套，放进「面板与图标」会让人以为它只管面板；
+     * - **「管理应用」跟「呼出」没关系**——它管的是「轮盘里放哪些应用」＝**内容**，而
+     *   「主动呼出与轮盘设置」管的是「怎么呼出、轮盘多大」＝**外观与行为**，一个标题盖不住两样。
+     *
+     * 现在按用户给的分法：
+     *
+     * - **页面设置**——怎么呼出、轮盘多大、面板什么行为（都是「这个页面怎么表现」）；
+     * - **应用与图标**——放哪些应用、这些应用长什么样（都是「内容与素材」）；
+     * - **小窗**——小窗怎么关。
+     */
     private fun buildFeatureTab() {
-        // 同样不要区块标题：格子本身就叫「功能」，再来一行「功能」是废话。
         featureTab.addView(Ui.spacer(this, TAB_TOP_GAP_DP))
-        // 计数放**副标题**，和同一张卡里的「更多面板 / 默认页 · 工具顺序」一个样式；
-        // 塞进标题的话标题长短会随计数跳（早先就是「管理扇形应用（已固定 4 / 6）」）。
-        // 初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
+        // 计数放**副标题**，和「更多面板 / 默认页 · 横屏位置」一个样式；塞进标题的话标题长短会随
+        // 计数跳（早先就是「管理应用（已固定 4 / 6）」）。初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
         appManageButton =
-            Ui.entryRow(this, "管理扇形应用", "已固定 0 / ${SettingsStore.MAX_PINS}") {
+            Ui.entryRow(this, "管理应用", "已固定 0 / ${SettingsStore.MAX_PINS}") {
                 openPage(Intent(this, AppManagementActivity::class.java))
             }
-        // 图标来源：标题写**当前**用的是哪套，副标题列举**支持的三类**（用户 2026-10-08 要求
-        // 「加上 subtitle 列举支持的功能」）。点开弹列表单选，见 [pickIconSource]。
-        // 检测要查所有已安装应用、读它们的资源，很慢，所以先给占位文案、后台补上。
+        // 图标来源：标题写**当前**用的是哪一类。点它进 [IconSettingsActivity]（选择 + 对比
+        // 预览都在那一页）；标题的初始值随便给，紧接着的 `refreshStatus()` 会刷成真实值。
+        //
+        // ⚠️ 原来还挂着一行副标题（`ICON_SOURCE_DETAIL` =「跟随系统图标集 / 默认 / 第三方图标包」），
+        // 2026-10-08 用户要求清掉应用内多余的描述文字时删了：那三类来源进子页就全看得到，
+        // 放在入口行上只是把子页的目录抄一遍。
         iconSourceButton =
-            Ui.entryRow(this, "图标：正在检测…", detail = ICON_SOURCE_DETAIL) { pickIconSource() }
+            Ui.entryRow(this, "图标：默认") {
+                openPage(Intent(this, IconSettingsActivity::class.java))
+            }
+
+        // ---- 页面设置：怎么呼出、面板什么行为 ----
+        featureTab.addView(Ui.sectionTitle(this, "页面设置"))
         featureTab.addView(
             CardGroup(this)
                 .row(
-                    Ui.entryRow(this, "更多面板", "默认页 / 工具顺序") {
-                        openPage(Intent(this, DrawerSettingsActivity::class.java))
-                    },
-                )
-                .row(
-                    Ui.entryRow(this, "主动呼出与扇形设置") {
+                    Ui.entryRow(this, "主动呼出与轮盘设置") {
                         openPage(Intent(this, CornerSettingsActivity::class.java))
                     },
                 )
+                // 副标题早先是「默认页 / 工具顺序」——工具顺序 2026-10-08 已经挪到「管理应用」
+                // 那一页里去拖了，这一页现在管的是默认页与横屏贴哪边。
                 .row(
-                    Ui.entryRow(this, "小窗关闭方式", "窗外点击 / 窗内小横条") {
-                        openPage(Intent(this, OutsideTapSettingsActivity::class.java))
+                    Ui.entryRow(this, "更多面板", "默认页 / 横屏位置") {
+                        openPage(Intent(this, DrawerSettingsActivity::class.java))
                     },
-                )
+                ),
+        )
+
+        // ---- 应用与图标：内容与素材 ----
+        featureTab.addView(Ui.sectionTitle(this, "应用与图标"))
+        featureTab.addView(
+            CardGroup(this)
                 .row(appManageButton)
                 .row(iconSourceButton),
         )
-    }
 
-    // ---- 图标来源（「功能」tab 卡片里那一行） ----
-
-    /**
-     * 扫描已安装的第三方图标包。
-     *
-     * 判据是「**声明了图标包 action**」，不是「有没有 appfilter 资源」——后者会把
-     * `com.oplus.safecenter`（OPPO 安全中心，恰好有个同名 xml 资源）误报成图标包，用户选了它
-     * 却一个图标都不换（详见 [IconPackLoader]）。两条 action 各自 `queryIntentActivities` 之后
-     * 按包名去重。
-     */
-    private fun detectIconPacksAsync() {
-        Thread {
-            val found = IconPackLoader.findIconPacks(this)
-            val labels =
-                found.associateWith { pkg ->
-                    runCatching {
-                        packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0))
-                            .toString()
-                    }.getOrDefault(pkg)
-                }
-            mainHandler.post {
-                // 检测可能比用户退出这一页还慢，回主线程前先确认页面还在。
-                if (isFinishing || isDestroyed) return@post
-                iconPacks.clear()
-                iconPacks.addAll(found)
-                iconPackLabels.clear()
-                iconPackLabels.putAll(labels)
-                updateIconSourceLabel()
+        // ---- 小窗 ----
+        featureTab.addView(Ui.sectionTitle(this, "小窗"))
+        // 小窗这一整条链路（启动协议、识别、关闭动作）都依赖 ColorOS 的小窗框架，
+        // 别的系统上**不会报错、只会点了没反应**。所以先问一句（[SystemSupport]）：
+        // 不支持就把这一行压暗、去掉点击，并在下面写明为什么，别让用户点进去一个个试。
+        val freeformUsable = SystemSupport.freeformUsable(this)
+        val closeModeRow =
+            Ui.entryRow(
+                this,
+                "小窗关闭方式",
+                if (freeformUsable) "窗外点击 / 窗内小横条" else "当前系统不支持",
+            ) {
+                openPage(Intent(this, OutsideTapSettingsActivity::class.java))
             }
-        }.start()
-    }
-
-    /** 列表里「跟随系统图标集」这一项的内部值（不是包名，用一个不会被包名撞上的标记）。 */
-    private val systemIconSetValue = ":system:"
-
-    /** 列表里「默认」这一项的内部值（应用自带图标 + 本项目圆形遮罩）。 */
-    private val noneIconSetValue = ":none:"
-
-    /** 当前生效的来源，取值与列表项一一对应（见 [pickIconSource]）。 */
-    private fun currentIconSource(): String {
-        val pkg = store.iconPackPackage
-        return when {
-            pkg.isNotBlank() -> pkg
-            store.useSystemIconSet -> systemIconSetValue
-            else -> noneIconSetValue
+        Ui.setRowEnabled(closeModeRow, freeformUsable)
+        featureTab.addView(CardGroup(this).row(closeModeRow))
+        if (!freeformUsable) {
+            featureTab.addView(
+                Ui.hint(
+                    this,
+                    "**小窗功能在当前系统不可用**：启动 / 识别 / 关闭小窗都依赖 ColorOS 的小窗框架。" +
+                        "主动呼出、轮盘、更多面板不受影响。",
+                ),
+            )
         }
+
     }
 
     /**
-     * 选图标来源——**列表选择**，不再一个包一个包地循环点。
+     * 把当前来源写进那一行的**标题**（这一行没有副标题，见 [buildFeatureTab]）。
      *
-     * 装了多个图标包时「点一下换下一个」根本没法用（用户 2026-10-08 反馈），所以改成弹列表单选。
-     * 列表项 = 跟随系统图标集 / 默认 / 每个检测到的图标包（显示应用名，不是包名）。
+     * 图标包这一支**点名到具体是哪个包**（用户 2026-10-08：「图标：第三方图标包，能把第三方这个
+     * 换成真实的名字吗」）。
      *
-     * 中间那项叫「默认」而不是「系统默认图标」（2026-10-08 用户改的名）：它走的是应用自带图标
-     * 再套本项目的圆形遮罩，跟「系统那套图标集」不是一回事，叫「系统默认」反而误导。
-     */
-    private fun pickIconSource() {
-        val labels = mutableListOf<String>()
-        val values = mutableListOf<String>()
-        labels += "跟随系统图标集"
-        values += systemIconSetValue
-        labels += "默认"
-        values += noneIconSetValue
-        iconPacks.forEach { pkg ->
-            labels += (iconPackLabels[pkg] ?: pkg) + "（图标包）"
-            values += pkg
-        }
-        val checked = values.indexOf(currentIconSource()).coerceAtLeast(0)
-        AlertDialog.Builder(this)
-            .setTitle("图标")
-            .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, which ->
-                applyIconSource(values[which])
-                dialog.dismiss()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    private fun applyIconSource(value: String) {
-        when (value) {
-            systemIconSetValue -> {
-                store.iconPackPackage = ""
-                store.useSystemIconSet = true
-            }
-            noneIconSetValue -> {
-                store.iconPackPackage = ""
-                store.useSystemIconSet = false
-            }
-            else -> {
-                store.iconPackPackage = value
-                // 图标包**不吞掉**没覆盖的应用：那些应用落到**系统图标集**（桌面上那套），
-                // 这是用户 2026-10-08 明确要的「fallback 到默认」。所以这里要把图标集打开。
-                store.useSystemIconSet = true
-            }
-        }
-        // 面板/轮盘的图标是缓存好的，换来源后必须让服务重读一遍目录。
-        OverlayGestureService.reload(this)
-        updateIconSourceLabel()
-    }
-
-    /**
-     * 把当前来源写进那一行的**标题**；副标题是固定文案（[ICON_SOURCE_DETAIL]），不在这里改。
-     *
-     * 检测还没回来时 [iconPackLabels] 是空的，这里会退化成显示包名——比显示空白强，
-     * 而且检测完会再调一次把它换成应用名。
+     * ⚠️ 以前这里写的是「只报类别、不点名」——理由是「那要扫描所有已安装应用，太贵」。那个理由
+     * 其实不成立：**只查当前选中的那一个包**就够了（[iconPackLabel]），一次
+     * `getApplicationLabel` 而已，主线程完全吃得消。要扫全部的是「让用户挑一个」那个场景
+     * （`IconPackLoader.findIconPacks`），和这里无关。
      */
     private fun updateIconSourceLabel() {
         val texts = iconSourceButton.tag as? Ui.RowTexts ?: return
-        val pkg = store.iconPackPackage
+        val pack = store.iconPackPackage
         texts.title.text =
             when {
-                pkg.isNotBlank() -> "图标：${iconPackLabels[pkg] ?: pkg}"
+                pack.isNotBlank() -> "图标：${iconPackLabel(pack)}"
                 store.useSystemIconSet -> "图标：跟随系统图标集"
                 else -> "图标：默认"
             }
     }
+
+    /**
+     * 一个图标包**给人看**的名字（应用名，不是包名）。
+     *
+     * ⚠️ 只用于**已经选中的那一个**包。要拿「全部图标包的名字」得扫所有已安装应用
+     * （见 `IconPackLoader.findIconPacks`），那是几百毫秒的活，**别放主页面**。
+     *
+     * 查不到（包被卸载 / 被禁用，但设置里还留着）就退回「第三方图标包」——
+     * 这时候显示一串包名对用户更没有意义。
+     */
+    private fun iconPackLabel(pkg: String): String =
+        runCatching {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+        }.getOrDefault("第三方图标包")
 
     /** 「设置」tab：常规杂项 + 调试 + 关于。 */
     private fun buildSettingsTab() {
@@ -521,7 +517,6 @@ class MainActivity : Activity() {
                     this,
                     "后台隐藏",
                     store.hideFromRecents,
-                    detail = "在最近任务隐藏",
                 ) { checked ->
                     store.hideFromRecents = checked
                 },
@@ -543,8 +538,8 @@ class MainActivity : Activity() {
         settingsTab.addView(
             Ui.hint(
                 this,
-                "备份含**全部设置**与扇形 / 底栏的固定项，**不含权限**——悬浮窗、Shizuku、无障碍是" +
-                    "系统状态，换机后要重新授权。换机时：旧机备份 → 把 json 传到新机 → 新机恢复。",
+                "备份含**全部设置**与轮盘 / 底栏固定项，**不含权限**——悬浮窗、Shizuku、无障碍" +
+                    "换机后要重新授权。",
             ),
         )
 
@@ -558,29 +553,99 @@ class MainActivity : Activity() {
                 },
             ),
         )
+        // 「关于」整块 2026-10-08 搬进了二级页（[AboutActivity]）：**Flyme 小窗**（版本 / 主页）
+        // 和**更新与下载**（自动更新 / 手动更新 / 更新日志 / 下载）两个 tab。
+        // 设置 tab 只留一个入口 —— 设置页要的是「找得到」，不是把人留在这儿读版本号。
+        //
+        // 副标题平时报版本，**有新版时改成「发现新版本 x」并染成主色**（见 [refreshAboutRow]）：
+        // 那是全应用唯一会主动告诉用户「有新版本」的地方（自动检查不弹窗）。
         settingsTab.addView(Ui.sectionTitle(this, "关于"))
-        settingsTab.addView(
-            CardGroup(this)
-                .row(versionRow())
-                .row(
-                    Ui.entryRow(this, "GitHub", UpdateChecker.GITHUB_URL) {
-                        openExternal(UpdateChecker.GITHUB_URL)
-                    },
-                )
-                .row(updateRow()),
-        )
+        aboutAppRow =
+            Ui.entryRow(this, "Flyme 小窗", "版本 ${installedVersionText()} · GitHub 项目主页") {
+                openPage(AboutActivity.intent(this, AboutActivity.SECTION_APP))
+            }
+        aboutUpdateRow =
+            Ui.entryRow(this, "更新与下载", aboutUpdateDetail()) {
+                openPage(AboutActivity.intent(this, AboutActivity.SECTION_UPDATE))
+            }
+        settingsTab.addView(CardGroup(this).row(aboutAppRow).row(aboutUpdateRow))
+    }
+
+    /** `1.1.0（110）`。 */
+    private fun installedVersionText(): String =
+        "${UpdateChecker.installedVersionName(this)}（${UpdateChecker.installedVersionCode(this)}）"
+
+    /** 「更新与下载」入口行的默认副标题：**里面有什么**（版本号在它上面那一行）。 */
+    private fun aboutUpdateDetail(): String = "自动更新 / 更新日志 / 下载"
+
+    /**
+     * 刷新「更新与下载」入口行的副标题。
+     *
+     * 两种状态：平时列里面有什么（次级灰），[UpdateCenter] 里有新版本时换成「发现新版本 x」
+     * （主色）—— 不这么做的话，自动检查的结果就只存在于那一页里，而用户没理由天天点进去。
+     */
+    private fun refreshAboutRows() {
+        val texts = aboutUpdateRow.tag as? Ui.RowTexts ?: return
+        val latest = UpdateCenter.state.latestVersion
+        if (latest == null) {
+            texts.detail?.text = aboutUpdateDetail()
+            texts.detail?.setTextColor(Ui.COLOR_ON_SURFACE_VARIANT)
+        } else {
+            texts.detail?.text = "发现新版本 $latest · 点进来看"
+            texts.detail?.setTextColor(Ui.COLOR_PRIMARY)
+        }
+    }
+
+    /**
+     * 自动检查发现新版本后**弹一次**提示框（用户 2026-10-08：「自动更新有新版本弹窗」）。
+     *
+     * 详细理由写在 `AboutActivity.announceUpdateIfNeeded`（同一份逻辑，两页都可能在前台，
+     * 所以两边都要有）。要点两条：
+     *
+     * 1. 待办挂在 [UpdateCenter] 的状态里，**谁在前台谁消费** —— 后台那一页弹了用户也看不见，
+     *    系统根本不会显示；
+     * 2. 消费顺序是「先清待办、再弹窗」，因为清待办会再触发一次本方法。
+     */
+    private fun announceUpdateIfNeeded() {
+        if (isFinishing || isDestroyed) return
+        val state = UpdateCenter.state
+        val version = state.latestVersion ?: return
+        if (!state.pendingAnnounce) return
+        if (!hasWindowFocus()) return
+        UpdateCenter.acknowledgeAnnounce()
+        UpdatePrompt.show(this, version, UpdateChecker.installedVersionName(this))
     }
 
     // ---- 备份与恢复 ----
 
     /**
-     * 备份：把全部设置导出成 json 落进系统「下载」目录。
+     * 备份第一步：**先问一次**，确认了才真导出。
+     *
+     * 用户 2026-10-08：「备份设置点进去直接就执行了，加个二次确认比较好」。
+     * 和「恢复设置」那边对齐——那个也是选完文件先弹一个「覆盖恢复」确认框
+     * （见 [onActivityResult]）。区别是备份**不改任何东西**、只是往「下载」写一个文件，
+     * 所以文案重点讲清「会往哪写、写什么」，不学恢复那边吓唬人。
+     */
+    private fun doBackup() {
+        if (backingUp) return
+        AppDialog.show(
+            activity = this,
+            title = "备份设置",
+            message =
+                "把**全部设置**导出成一个 json 文件，保存到系统「下载」目录。\n\n" +
+                    "不会改动当前设置，也不含权限（悬浮窗 / Shizuku / 无障碍）。",
+            positiveText = "备份",
+        ) { runBackup() }
+    }
+
+    /**
+     * 备份第二步：真正导出。
      *
      * 具体怎么写、为什么走 MediaStore、为什么是 JSON，都在 [SettingsBackup] 的类注释里。
      * 这里只管交互：导出完成后弹一个小对话框问要不要**分享**——换机场景里「直接发到新手机」
      * 比「自己去找文件、再想办法传」顺手得多（分享复用同一个文件，不额外产生副本）。
      */
-    private fun doBackup() {
+    private fun runBackup() {
         if (backingUp) return
         backingUp = true
         worker.execute {
@@ -593,12 +658,13 @@ class MainActivity : Activity() {
                     return@post
                 }
                 DebugLog.info("SETTINGS_BACKUP", "已导出 ${result.count} 项到 ${result.name}")
-                AlertDialog.Builder(this)
-                    .setTitle("备份完成")
-                    .setMessage("${result.count} 项设置已保存到「下载」：\n${result.name}")
-                    .setPositiveButton("分享") { _, _ -> SettingsBackup.share(this, result.uri) }
-                    .setNegativeButton("好", null)
-                    .show()
+                AppDialog.show(
+                    activity = this,
+                    title = "备份完成",
+                    message = "${result.count} 项设置已保存到「下载」：\n${result.name}",
+                    positiveText = "分享",
+                    negativeText = "好",
+                ) { SettingsBackup.share(this, result.uri) }
             }
         }
     }
@@ -636,19 +702,33 @@ class MainActivity : Activity() {
     /** 恢复第二步：写回 prefs，把运行态对齐，并重建界面。 */
     private fun applyRestore(parsed: SettingsBackup.Parsed) {
         val outcome = runCatching { SettingsBackup.apply(this, parsed) }
-        val count =
+        val applied =
             outcome.getOrElse { error ->
                 DebugLog.warn("SETTINGS_RESTORE_FAILED", null, error)
                 Toast.makeText(this, "恢复失败：${error.message}", Toast.LENGTH_LONG).show()
                 return
             }
-        DebugLog.info("SETTINGS_RESTORED", "恢复了 $count 项设置")
+        DebugLog.info(
+            "SETTINGS_RESTORED",
+            "恢复了 ${applied.written} 项设置" +
+                if (applied.skipped > 0) "，跳过 ${applied.skipped} 项本版不认识的" else "",
+        )
         // 界面上的开关、状态文字、固定项计数全是按旧值建的，整块重建最省事也最不容易漏。
         rebuildTabs()
         // ★ 光写进 prefs 只是让「读设置的地方」看到新值；几处**运行态**是各自持有的，
         // 必须挨个通知一遍，否则就会出现「设置页显示变了、功能还是旧的」。
         syncRuntimeAfterRestore()
-        Toast.makeText(this, "已恢复 $count 项设置", Toast.LENGTH_SHORT).show()
+        // 跳过的项要**说出来**：正常恢复（备份不比本机新）时不该有跳过项，
+        // 一旦出现就说明这份备份来自更新的版本 —— 那几项会被丢下、让新版走默认值。
+        Toast.makeText(
+            this,
+            if (applied.skipped > 0) {
+                "已恢复 ${applied.written} 项；跳过 ${applied.skipped} 项本版没有的设置"
+            } else {
+                "已恢复 ${applied.written} 项设置"
+            },
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 
     /**
@@ -658,7 +738,7 @@ class MainActivity : Activity() {
      *
      * [rebuildTabs] 只管界面；真正干活的那几个东西是**各自持有**设置的，得挨个叫醒：
      *
-     * 1. **主动呼出服务**（[OverlayGestureService]）—— 触摸条、轮盘几何、扇形固定项都在它手里，
+     * 1. **主动呼出服务**（[OverlayGestureService]）—— 触摸条、轮盘几何、轮盘固定项都在它手里，
      *    而且大部分是**启动时**读进字段 / View 的。见 [restartServiceForRestoredSettings]。
      * 2. **无障碍侧**（[FreeformAccessibilityService]）—— 「点小窗外关闭」的遮罩、「识屏」都挂在
      *    它身上，它按设置重铺。平时这条同步挂在 [onResume]（用户从系统设置回来时触发），
@@ -731,99 +811,43 @@ class MainActivity : Activity() {
     // ---- 呼出晃动角度 ----
     //
     // 设置项 2026-10-08 已从这里的「调试」节挪进正式设置：
-    // 「功能」tab → 主动呼出与扇形设置 → 扇形设置 → 「呼出晃动」（滑块，0~60°）。
+    // 「功能」tab → 主动呼出与轮盘设置 → 轮盘设置 → 「呼出晃动」（滑块，0~60°）。
     // 数据仍是同一个 [SettingsStore.menuSwingDeg]，这里不再留任何入口。
 
-    /** 「应用名 + 版本号（versionCode）」两行，只读。 */
-    private fun versionRow(): View {
-        val texts =
-            LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(Ui.rowTitle(this@MainActivity, getString(R.string.app_name)))
-                addView(
-                    Ui.rowDetail(
-                        this@MainActivity,
-                        "版本 ${UpdateChecker.installedVersionName(this@MainActivity)}" +
-                            "（${UpdateChecker.installedVersionCode(this@MainActivity)}）",
-                    ),
-                )
-            }
-        return Ui.row(this).apply {
-            addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
-    }
-
     /**
-     * 「检查更新」那一行：标题固定，右侧状态文字随检查结果变。
+     * **首页**顶部的「运行环境」状态行：当前是什么系统、小窗能不能用。
      *
-     * 点击语义是**两态**的：还没查到新版本时点它是「去检查」；已经查到新版本时点它是
-     * 「前往下载」——查到之后再让你检查一遍没有意义。
+     * 2026-10-08 从「设置 → 关于」搬来（用户：「coloros 16、小窗可用 放在首页的状态」）。
+     * 它不是「关于」里那种翻一次就走的静态信息，而是**判断「点了没反应」的第一现场**：
+     * 本应用只在 ColorOS 上验证过，别的系统上小窗会静默失效（见 [SystemSupport]）。
+     *
+     * 右侧给的是**状态文字**，不是无障碍那几行那种「去授权」药丸 —— 这一条没有可去的地方，
+     * 只回答「能不能用」。不可用时用错误色，因为那意味着这一页的大半功能都是灰的。
      */
-    private fun updateRow(): View {
+    private fun runtimeRow(): View {
+        val usable = SystemSupport.freeformUsable(this)
         val texts =
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(Ui.rowTitle(this@MainActivity, "检查更新"))
-                updateDetail = Ui.rowDetail(this@MainActivity, "点一下看看有没有新版本")
-                addView(updateDetail)
+                addView(Ui.rowTitle(this@MainActivity, "运行环境"))
+                addView(Ui.rowDetail(this@MainActivity, SystemSupport.romLabel(this@MainActivity)))
+            }
+        val state =
+            TextView(this).apply {
+                text = if (usable) "小窗可用" else "小窗不可用"
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                setTextColor(if (usable) Ui.COLOR_ACCENT else Ui.COLOR_DANGER)
+                gravity = Gravity.CENTER
+                // 左边留一点，免得系统名太长时顶到状态文字上（和权限行一个做法）。
+                setPadding(scaledSp(12f).toInt(), 0, 0, 0)
             }
         return Ui.row(this).apply {
             addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(
-                TextView(this@MainActivity).apply {
-                    text = "›"
-                    setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(this@MainActivity, 18f))
-                    setTextColor(Ui.COLOR_ON_SURFACE_VARIANT)
-                    gravity = Gravity.CENTER
-                    setPadding(Ui.dp(this@MainActivity, 8), 0, 0, 0)
-                },
-            )
-            isClickable = true
-            setOnClickListener {
-                val target = downloadUrl
-                if (target != null) openExternal(target) else checkForUpdate()
-            }
+            addView(state)
         }
     }
 
-    // ---- 检查更新 ----
-
-    private fun checkForUpdate() {
-        if (checking) return
-        checking = true
-        setUpdateDetail("正在检查…", Ui.COLOR_ON_SURFACE_VARIANT)
-        UpdateChecker.check { outcome ->
-            // 页面可能在请求飞在半路时就被关掉了，这时别再碰 View。
-            if (isFinishing || isDestroyed) return@check
-            checking = false
-            val local = UpdateChecker.installedVersionName(this)
-            outcome
-                .onSuccess { latest ->
-                    if (UpdateChecker.isNewer(latest.version, local)) {
-                        downloadUrl = latest.url
-                        setUpdateDetail("发现新版本 ${latest.version} · 点此前往下载", Ui.COLOR_PRIMARY)
-                    } else {
-                        // 本地比远端还新也走这里（比如自己编的包），说法统一成「已是最新」。
-                        setUpdateDetail("已是最新版本 $local", Ui.COLOR_ACCENT)
-                    }
-                }
-                .onFailure { error ->
-                    setUpdateDetail(
-                        if (error is UpdateChecker.NoReleaseException) {
-                            "还没有发布过版本"
-                        } else {
-                            "检查失败，请检查网络后重试"
-                        },
-                        Ui.COLOR_DANGER,
-                    )
-                }
-        }
-    }
-
-    private fun setUpdateDetail(text: String, color: Int) {
-        updateDetail.text = text
-        updateDetail.setTextColor(color)
-    }
 
     // ---- 权限状态行 ----
 
@@ -944,7 +968,7 @@ class MainActivity : Activity() {
         renderPermissionHints(overlayGranted, a11yConnected, a11yEnabled, shizukuGranted)
 
         serviceButton.text = if (OverlayGestureService.isRunning) "停止主动呼出" else "启动主动呼出"
-        // 悬浮窗权限是「主动呼出」的**唯一硬前提**：触摸条和扇形面板都是悬浮窗，没有它什么都铺不出来。
+        // 悬浮窗权限是「主动呼出」的**唯一硬前提**：触摸条和轮盘面板都是悬浮窗，没有它什么都铺不出来。
         // 没授权就**置灰、点不动**（用户要求），而不是点下去才弹一句提示。
         // 已经跑起来时永远允许点（那是「停止」），哪怕权限中途被撤。
         Ui.setButtonEnabled(serviceButton, OverlayGestureService.isRunning || overlayGranted)
@@ -952,6 +976,8 @@ class MainActivity : Activity() {
             "已固定 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}"
         // 图标来源可能在别处（以后加别的入口）被改，回页面时对一次。
         updateIconSourceLabel()
+        // 「更新与下载」入口的副标题要跟着「有没有新版本」变（自动检查在 [UpdateCenter] 里跑）。
+        refreshAboutRows()
     }
 
     /**
@@ -981,8 +1007,7 @@ class MainActivity : Activity() {
             permissionHintBox.addView(
                 Ui.hint(
                     this,
-                    "**缺无障碍服务**：扇形里的「点小窗外关闭」「识屏」「截屏」点了没反应，其余工具不受影响。" +
-                        "为什么会被关、那个系统弹框是什么，见上面那条说明。",
+                    "**缺无障碍服务**：轮盘里的「点小窗外关闭」「识屏」「截屏」点了没反应，其余工具不受影响。",
                 ),
             )
         }
@@ -1126,15 +1151,16 @@ class MainActivity : Activity() {
         const val SERVICE_RESTART_GAP_MS = 400L
 
         /**
-         * 「图标」那一行的副标题：**固定列举支持的三类来源**（用户 2026-10-08 要求
-         * 「其他加上 subtitle 列举支持的功能」）。当前用的是哪一类写在标题里，见
-         * [updateIconSourceLabel]。
+         * 「图标」那一行**没有副标题**。
          *
-         * 中间那一类就叫「默认」：它取应用自带图标、再套本项目的圆形遮罩，所以它不是
-         * 「系统默认图标」（那会让人以为取的是系统那套图标集）——用户 2026-10-08 拍板改的名。
+         * 原来这里挂着 `ICON_SOURCE_DETAIL`（「跟随系统图标集 / 默认 / 第三方图标包」），
+         * 2026-10-08 用户要求清掉应用内多余的描述文字时删了——那三类来源进 [IconSettingsActivity]
+         * 就全看得到，挂在入口行上只是把子页的目录抄一遍。当前用的是哪一类写在**标题**里
+         * （[updateIconSourceLabel]），这才是这一行真正要传达的信息。
+         *
+         * 顺带记一下命名的来历：中间那一类叫「默认」（取应用自带图标、再套本项目的圆形遮罩），
+         * 不叫「系统默认图标」——后者会让人以为取的是系统那套图标集。用户 2026-10-08 拍板。
          */
-        const val ICON_SOURCE_DETAIL = "跟随系统图标集 / 默认 / 第三方图标包"
-
         const val TAB_CALL = 0
         const val TAB_FEATURE = 1
         const val TAB_SETTINGS = 2

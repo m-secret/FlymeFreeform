@@ -44,7 +44,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_OFF -> {
-                    hideDrawer()
+                    // 屏都黑了，淡出没有意义。
+                    hideDrawer(fade = false)
                     // 「窗内关闭」的常驻监听跟着屏幕走：灭屏停、亮屏恢复（省电）。
                     CaptionTapClose.setScreenOn(this@OverlayGestureService, false)
                 }
@@ -90,7 +91,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         if (landscape == lastLandscape) return
         lastLandscape = landscape
-        // 触摸区几何、扇形预览坐标全按「当时的屏幕」算的，方向一变就得重算。
+        // 触摸区几何、轮盘预览坐标全按「当时的屏幕」算的，方向一变就得重算。
         // [applySettings] 里已经含一次 [updateTriggerLayout]，这里再显式补一次：它幂等，
         // 而且「方向刚变」和「尺寸真的刷新」之间系统可能隔几帧，多摆一次不亏。
         applySettings()
@@ -98,7 +99,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         if (previewActive) showMenuPreview()
         scheduleTriggerSettle()
         val hadPanel = drawerPanels.isNotEmpty()
-        if (hadPanel) hideDrawer()
+        // 方向都变了，面板的几何（卡片宽高、贴哪一边）已经全不对，直接撤。
+        if (hadPanel) hideDrawer(fade = false)
         DebugLog.info(
             "SCREEN_ORIENTATION_CHANGED",
             "横屏=$landscape" + if (hadPanel) "，已收起「更多」面板" else "",
@@ -159,6 +161,27 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             }
         }
     private var menuView: RadialMenuView? = null
+
+    /**
+     * **正在淡出、还没真正摘掉**的轮盘窗口。
+     *
+     * 退出轮盘时衬底要淡出（见 [removeMenu]），这 200ms 里窗口还在屏上、但 [menuView] 已经置空，
+     * 所以它收不到任何交互。这份引用只为两件事存在：① 动画回调里确认「要摘的确实是它」；
+     * ② 兜底任务 / 下一次呼出时把它就地收掉。
+     */
+    private var fadingMenuView: RadialMenuView? = null
+
+    /**
+     * 衬底淡出的**兜底**：动画回调万一没来（被掐断、View 提前 detach……），窗口也必须摘掉，
+     * 否则它会一直挂在全屏最上层吃掉所有触摸——那是比「闪一下」严重得多的事故。
+     */
+    private val fadingMenuRemoval =
+        Runnable {
+            val view = fadingMenuView ?: return@Runnable
+            fadingMenuView = null
+            removeMenuViewNow(view)
+        }
+
     /** 当前最上面那个「更多」面板（没有就是 null）。真正的账在 [drawerPanels] 里。 */
     private val drawerView: AppDrawerPanel? get() = drawerPanels.lastOrNull()
 
@@ -173,6 +196,28 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 所以 [hideDrawer] 一次把所有面板都撤掉，而不是只撤「最后建的那个」。
      */
     private val drawerPanels = ArrayList<AppDrawerPanel>()
+
+    /**
+     * **正在淡出、还没真正摘掉**的面板。见 [hideDrawer]。
+     *
+     * 用集合而不是单个引用，是因为 [hideDrawer] 一次要撤**所有**面板（见 [drawerPanels] 的说明）。
+     * 正常情况下里面最多一个。
+     */
+    private val fadingDrawerPanels = mutableSetOf<AppDrawerPanel>()
+
+    /**
+     * 面板淡出的**兜底**：动画回调万一没来，窗口也必须摘掉 —— 否则一整块全屏面板会一直盖在
+     * 屏幕上、把触摸全吃掉。和 `fadingMenuRemoval` 是同一个套路。
+     */
+    private val fadingDrawerRemoval =
+        Runnable {
+            if (fadingDrawerPanels.isEmpty()) return@Runnable
+            val stale = fadingDrawerPanels.toList()
+            fadingDrawerPanels.clear()
+            stale.forEach { removeDrawerNow(it) }
+            afterDrawerRemoved()
+        }
+
     private var screenTextPanel: ScreenTextPanel? = null
     private var menuPreviewView: MenuPreviewView? = null
 
@@ -197,18 +242,18 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /**
      * 工具 + 已安装应用。
      *
-     * 扇形固定项与面板反查统一以它为准——工具用伪组件编码（见 [SystemTools]），
+     * 轮盘固定项与面板反查统一以它为准——工具用伪组件编码（见 [SystemTools]），
      * 所以这就是一份普通列表，固定 / 排序 / 拖拽都不需要为工具写分支。
      */
     private var allApps: List<AppEntry> = emptyList()
 
-    /** 扇形里直接显示的应用，只包含用户显式固定的那些。 */
+    /** 轮盘里直接显示的应用，只包含用户显式固定的那些。 */
     private var radialApps: List<AppEntry> = emptyList()
 
     /**
-     * 扇形里是否还有「更多」那一格。
+     * 轮盘里是否还有「更多」那一格。
      *
-     * ★ 这是**唯一判据**：真实扇形（[showMenu]）与设置页预览（[showMenuPreview] /
+     * ★ 这是**唯一判据**：真实轮盘（[showMenu]）与设置页预览（[showMenuPreview] /
      * [refreshMenuPreview]）都必须照它算槽位数。以前预览写死 `radialApps.size + 1`，
      * 于是用户关掉「隐藏『更多』入口」的开关后，预览里还多画一个占位圆，和真机对不上。
      */
@@ -296,7 +341,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 refreshApps()
                 return START_STICKY
             }
-            // 只重算扇形固定项，不重新枚举全部已安装应用——后者要跑一遍 LauncherApps，
+            // 只重算轮盘固定项，不重新枚举全部已安装应用——后者要跑一遍 LauncherApps，
             // 在「更多」面板里连续增删时会明显卡一下。
             ACTION_REFRESH_PINS -> {
                 startAsForeground()
@@ -336,7 +381,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 设置页**正在拖动滑块时**的临时参数（不落库）。
      *
      * 为什么需要它：滑块的即时反馈走的是 `onLive`，拖动过程中 `SettingsStore` 里的值**还没变**
-     * （要等抬手 `onCommit` 才写），而预览（触摸条绿块 + 扇形弧）一直读 store，于是拖动时纹丝不动、
+     * （要等抬手 `onCommit` 才写），而预览（触摸条绿块 + 轮盘弧）一直读 store，于是拖动时纹丝不动、
      * 一松手才跳到新值——用户要看的偏偏是拖动过程。
      *
      * 它只被 [ACTION_PREVIEW_SYNC] 写、只被预览读；抬手后走一次完整重载就会被清掉（见
@@ -466,7 +511,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         )
     }
 
-    /** 显示扇形范围预览（椭圆弧 + 图标圆心点），供设置页调宽度/高度/离角距离时可视化。 */
+    /** 显示轮盘范围预览（椭圆弧 + 图标圆心点），供设置页调宽度/高度/离角距离时可视化。 */
     private fun showMenuPreview() {
         removeMenuPreview()
         val screen = realScreenBounds()
@@ -527,10 +572,12 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         handler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(screenOffReceiver) }
         runCatching { getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(displayListener) }
-        hideDrawer()
+        // 进程都要没了，等不起那点淡出时间。
+        hideDrawer(fade = false)
         hideScreenTextPanel()
         removeToolMessage()
-        removeMenu()
+        // 进程都要没了，等不起那 200ms 淡出。
+        removeMenu(MenuExit.NONE)
         removeMenuPreview()
         removeTriggers()
         worker.shutdownNow()
@@ -635,8 +682,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         CaptionTapClose.sync(this)
         if (!store.enabled) {
             DebugLog.info("SETTINGS_DISABLED", "移除所有悬浮窗")
-            hideDrawer()
-            removeMenu()
+            // 功能整个关掉了，没必要慢慢淡——直接收干净。
+            hideDrawer(fade = false)
+            // 功能整个关掉了，遮罩没必要慢慢淡——直接收干净。
+            removeMenu(MenuExit.NONE)
             removeTriggers()
             return
         }
@@ -802,7 +851,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     private fun showMenu(side: CornerSide) {
-        removeMenu()
+        // 重新呼出前的清理：新窗口马上要盖上来，旧的那层不能留（淡出会把两层叠在一起）。
+        removeMenu(MenuExit.NONE)
         if (allApps.isEmpty()) {
             DebugLog.warn("MENU_EMPTY", "应用列表尚未就绪")
             return
@@ -810,7 +860,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 极坐标原点取**真实屏幕角落**。
         //
         // 这里不能用 `resources.displayMetrics`：Service 里的这个值常常已经扣掉了导航栏高度，
-        // 拿它当屏幕底边会让整个扇形整体上移一截，观感就是「图标太靠内」。
+        // 拿它当屏幕底边会让整个轮盘整体上移一截，观感就是「图标太靠内」。
         val screen = realScreenBounds()
         val cornerInset = CornerGeometry.menuCornerInset(store, minOf(screen.width(), screen.height()))
         val cornerX =
@@ -875,7 +925,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 side = side,
                 apps = radialApps,
                 // 用户可以在设置里关掉「更多」入口（见 SettingsStore.hideMoreEntry）：
-                // 关了之后扇形就没有那一格，于是**没法从轮盘进抽屉**——这正是那个开关的用途。
+                // 关了之后轮盘就没有那一格，于是**没法从轮盘进抽屉**——这正是那个开关的用途。
                 hasMore = menuHasMore,
                 cornerX = cornerX,
                 cornerY = cornerY,
@@ -883,8 +933,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 heightDp = store.menuHeightDp,
                 iconSizeDp = store.menuIconDp,
                 haptic = store.menuHapticEnabled,
-                // 呼出时图标上下摆动的幅度（度，0 = 不摆）。见 RadialMenuView.enterSwingOffsetY。
+                // 呼出时图标**绕自身圆心**转一下再回正的角度（度，0 = 不转）。见 RadialMenuView.enterSwingAngleDeg。
                 swingDeg = store.menuSwingDeg,
+                // 图标下面那层灰色衬底的不透明度（%，0 = 不垫）。**画在图标之前**，只暗背景不暗图标，
+                // 见 RadialMenuView.onDraw 的 ①。它是每次呼出时现读的，改完下次呼出即生效。
+                scrimPercent = store.menuScrimPercent,
             )
             menuView = view
             activeSide = side
@@ -898,7 +951,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 真实的全屏边界。
      *
      * `resources.displayMetrics` 在 Service 里未必等于整块屏幕（常见是被扣掉导航栏），
-     * 用它算「屏幕角落」会把扇形顶到偏内的位置。
+     * 用它算「屏幕角落」会把轮盘顶到偏内的位置。
      */
     private fun realScreenBounds(): Rect {
         val manager = getSystemService(WindowManager::class.java)
@@ -908,11 +961,88 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         return Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
     }
 
-    private fun removeMenu() {
+    /**
+     * 轮盘退场的方式。见 [removeMenu]。
+     *
+     * 只有两档。曾经有过第三档「**只淡衬底**、图标硬切」，真机反馈是
+     * 「退出轮盘感觉卡了一下」，已废弃 —— 理由见 `RadialMenuView.fadeOut` 的注释。
+     */
+    private enum class MenuExit {
+        /** **整体淡出**（衬底 + 图标一起渐隐），淡到 0 才摘窗口。用户交互结束走这条。 */
+        FADE,
+
+        /** 不淡，直接摘。环境类清理走这条。 */
+        NONE,
+    }
+
+    /**
+     * 摘掉轮盘窗口。
+     *
+     * @param exit 退场方式（见 [MenuExit]）。默认 [MenuExit.FADE]。
+     *   - **[MenuExit.FADE]（用户交互结束）**：点图标 / 点空白 / 手势取消 / 交棒给面板。
+     *     用户 2026-10-08：「退出的动画也加一个，现在没选应用退出也闪一下」——
+     *     窗口原来是被 `removeViewImmediate` 一刀摘掉的，遮罩**瞬间消失**就是一次大面积亮度突变。
+     *   - **[MenuExit.NONE]（环境类清理）**：服务销毁 / 关掉「主动呼出」/ 巡检发现窗口已不在 /
+     *     [showMenu] 开头那次清理。这些场景要么进程马上就没了，要么新窗口立刻要盖上来，
+     *     等 200ms 只会让两个全屏窗口叠在一起。
+     *
+     * ⚠️ 淡出这 200ms 里窗口**还挂在屏上**，所以 [menuView] 必须先置空（它才是「还有没有活轮盘」
+     * 的判据），否则期间来一次 [onGestureUpdate] / 触摸就会打到这个正在消失的窗口上。
+     */
+    private fun removeMenu(exit: MenuExit = MenuExit.FADE) {
+        // 上一轮还在淡出的窗口先就地收掉：不能等它，否则会和接下来这个（新轮盘 / 面板）叠在一起。
+        fadingMenuView?.let { stale ->
+            fadingMenuView = null
+            handler.removeCallbacks(fadingMenuRemoval)
+            removeMenuViewNow(stale)
+        }
         val view = menuView ?: return
         menuView = null
         activeSide = null
+        if (exit == MenuExit.NONE) {
+            removeMenuViewNow(view)
+            return
+        }
+        fadingMenuView = view
+        view.fadeOut {
+            // 只有「这次淡出还没被别的路径抢先收掉」时才由这里摘——见上面那段就地收掉的分支。
+            if (fadingMenuView === view) {
+                fadingMenuView = null
+                handler.removeCallbacks(fadingMenuRemoval)
+                removeMenuViewNow(view)
+            }
+        }
+        handler.removeCallbacks(fadingMenuRemoval)
+        handler.postDelayed(fadingMenuRemoval, MENU_SCRIM_FADE_MS + MENU_SCRIM_FADE_SLACK_MS)
+    }
+
+    /**
+     * 点「更多」之后，把轮盘**交棒**给刚铺上的面板。
+     *
+     * ★★ 点「更多」那两处**故意不直接 [removeMenu]**：面板要等构造完才出现，而构造是
+     * **主线程同步**的（`AppDrawerPanel` 整棵卡片树，冷启动还要算类加载，实测几百毫秒）。
+     * 轮盘要是先撤了，这段空档屏幕是**全亮**的 —— 用户 2026-10-08 报的
+     * 「呼出更多面板也是感觉闪了一下」就是这个，和入场 / 出场那两个「闪」不是同一回事。
+     *
+     * 现在轮盘一直撑到面板**首帧**（[AppDrawerPanel.onEnterStart]），在这里触发淡出，
+     * 与面板遮罩的淡入（0 → 60%）交叉：亮度从轮盘的 18% 单调升到面板的 60%，中间不留空档。
+     *
+     * 退场方式就是默认的 [MenuExit.FADE]（整体淡出）—— 和普通退出用的是同一条路，
+     * 因为「整体淡出」正好也是这里需要的：图标跟着衬底一起退，才不会在面板底下留一圈残影。
+     */
+    private fun handOffMenuToDrawer() = removeMenu()
+
+    /**
+     * 真正把窗口摘掉。
+     *
+     * **先摘窗口、再 [RadialMenuView.reset]**：`reset()` 会掐掉正在跑的衬底动画，而掐断会触发
+     * 那条动画的 `onAnimationEnd` → 回调又回到 [removeMenu] 的收尾里。先把窗口摘了，
+     * 那一串就算跑也碰不到任何还挂在屏上的东西（而且收尾那边用 `fadingMenuView === view` 判过，
+     * 不会重复摘）。顺序反过来则会先 `reset` 一次、再摘一次，白跑。
+     */
+    private fun removeMenuViewNow(view: RadialMenuView) {
         runCatching { windowManager.removeViewImmediate(view) }
+        view.reset()
     }
 
     // ---- 「更多」面板 ----
@@ -928,7 +1058,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             "PERF_DRAWER_ENTER side=$side ts=${System.currentTimeMillis()}",
         )
         drawerSide = side
-        hideDrawer()
+        // 马上要建新面板，旧的不能留（淡出会和新的叠在一起）。
+        hideDrawer(fade = false)
         // 应用目录是**服务启动时加载的一份快照**，新装的应用不会自己出现。
         //
         // 早先的做法是「过期就先重读完再显示面板」——那要让用户对着空屏等一次
@@ -979,7 +1110,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                         }
                         appEntries = catalog
                         allApps = toolEntries + catalog
-                        // 固定的应用可能已被卸载：重算一次，免得扇形里留一个点不动的格子。
+                        // 固定的应用可能已被卸载：重算一次，免得轮盘里留一个点不动的格子。
                         applyPins()
                         drawerView?.updateApps(catalog)
                     }
@@ -1031,10 +1162,12 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val tStart = android.os.SystemClock.elapsedRealtime()
         // 先清干净：这一路上有好几条异步路径（目录刷新完回来、启动应用前的延迟）都能走到这里，
         // 不先撤掉旧的就会叠出「关了上面那个、下面还有一个」的僵尸面板。
-        hideDrawer()
+        hideDrawer(fade = false)
         val tHidden = android.os.SystemClock.elapsedRealtime()
         if (appEntries.isEmpty() && toolEntries.isEmpty()) {
             DebugLog.warn("DRAWER_EMPTY", "应用列表与工具都为空")
+            // 面板不会出现了 ⇒ 没有谁来接棒，轮盘得自己撤（点「更多」那条路径故意没撤它）。
+            removeMenu()
             return
         }
         DebugLog.info(
@@ -1077,7 +1210,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     onToggleDock = { entry -> toggleDock(entry) },
                     onReorderDock = { order -> store.reorderDock(order) },
                     // 工具页拖拽排序：落盘即可。面板自身会同步本地顺序（见 commitToolReorder）。
-                    // **只影响工具页那个网格**——扇形看 pinnedComponents、底栏看 dockComponents，
+                    // **只影响工具页那个网格**——轮盘看 pinnedComponents、底栏看 dockComponents，
                     // 三处各管各的（用户明确不要联动）。
                     onReorderTools = { ids -> store.toolOrder = ids },
                     onClearRecent = { store.clearRecent() },
@@ -1090,9 +1223,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 showToolMessage(
                     "「更多」面板打不开：" + (error.message ?: error.javaClass.simpleName),
                 )
+                // 同上：面板没建出来，轮盘自己撤。
+                removeMenu()
                 return
             }
         val tBuilt = android.os.SystemClock.elapsedRealtime()
+        // ★ 轮盘「交棒」的触发点：面板**首帧布局落定**的那一刻（也就是它开始淡入的那一刻）。
+        //   从这里让轮盘整层淡出，两层正好交叉——亮度从轮盘的 18% 单调升到面板的 60%，
+        //   中间不会出现「轮盘没了、面板还没出来」的全亮空档。见 [handOffMenuToDrawer]。
+        panel.onEnterStart = { handOffMenuToDrawer() }
         // 面板窗口铺满整屏，卡片画在内部居中；点卡片外的遮罩即关闭。
         // 关键：加 FLAG_NOT_FOCUSABLE——否则面板窗口抢走输入焦点，角落触摸条收不到触摸，
         // 「轮盘呼不出」；而 modal（不加 NOT_TOUCH_MODAL）则让点卡片外能关闭。
@@ -1131,24 +1270,107 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             // 不这么做的话，遮罩（层级 31）会压在面板（层级 11）之上，
             // 面板里每点一下都被当成「点了窗外」→ 关掉一个本来就开着的小窗。
             FreeformAccessibilityService.refreshIfRunning()
+            // 兜底：面板万一没走到首帧（`onGlobalLayout` 没来），轮盘不能就这么一直挂着——
+            // 它虽然被面板压着、吃不到触摸，但面板一关就会露出来。正常路径到这里时
+            // `menuView` 早就是 null 了，这句是空转。
+            handler.postDelayed(
+                {
+                    if (menuView != null) {
+                        DebugLog.warn("DRAWER_HANDOFF_TIMEOUT", "面板首帧迟迟未到，轮盘自行退场")
+                        removeMenu()
+                    }
+                },
+                DRAWER_HANDOFF_TIMEOUT_MS,
+            )
         } catch (exception: RuntimeException) {
             DebugLog.error("DRAWER_ADD_FAILED", null, exception)
+            // 面板没铺上，轮盘得自己撤。
+            removeMenu()
         }
     }
 
-    private fun hideDrawer() {
-        if (drawerPanels.isEmpty()) return
+    /**
+     * 收起「更多」面板。
+     *
+     * @param fade 要不要**先淡出**再摘窗口。默认 true。
+     *   - **true（用户交互关闭）**：点面板外（`onDismiss`）/ 选中应用（`onSelected`）。
+     *     用户 2026-10-08：「退出面板也没动画，很生硬」—— 原来是一刀摘掉的，60% 的遮罩
+     *     **瞬间消失**，又是一次大面积亮度突变（和轮盘退场是同一个病）。
+     *   - **false（环境类清理）**：灭屏 / 屏幕方向变化 / 服务销毁 / 关掉「主动呼出」/
+     *     [showDrawer] 与 [showDrawerNow] 开头那次清理。这些要么进程马上没了、要么新面板
+     *     立刻要盖上来，等淡出跑完只会让两层叠在一起。
+     */
+    private fun hideDrawer(fade: Boolean = true) {
+        if (drawerPanels.isEmpty()) {
+            // 没有活面板。**只有「要求立即撤」的调用**才需要把正在淡出的那批也收掉
+            // （建新面板前的清理、关掉功能、服务销毁…）。
+            // 普通的重复关闭（用户连点两下）**不能**走这条：把淡出打断就是硬切，
+            // 那正是这次要修的东西。
+            if (!fade) flushFadingDrawers()
+            return
+        }
+        // 有活面板要撤：更早那批还在淡出的先就地收掉，免得和接下来这个叠层。
+        flushFadingDrawers()
         // 一次撤掉**所有**面板，而不是只撤最后建的那个——见 [drawerPanels] 的说明。
         val closing = drawerPanels.toList()
         drawerPanels.clear()
-        closing.forEach { panel ->
-            runCatching { windowManager.removeViewImmediate(panel) }
-                .onFailure { DebugLog.warn("DRAWER_REMOVE_FAILED", null, it) }
-        }
         DebugLog.info("DRAWER_HIDDEN", "撤下面板 ${closing.size} 个")
-        // 面板撤下 = 「点哪儿都不再是点窗外」，遮罩该铺回来了。
-        // 主动催一次而不是等下一个窗口变化事件：事件可能根本不来（面板撤下本身不产生窗口变化），
-        // 那遮罩就一直挂着不铺，用户得等到下一次别的窗口变动才恢复。
+        if (!fade) {
+            closing.forEach { removeDrawerNow(it) }
+            afterDrawerRemoved()
+            return
+        }
+        closing.forEach { panel ->
+            fadingDrawerPanels += panel
+            panel.fadeOut {
+                removeDrawerNow(panel)
+                // 最后一个淡完才收尾（遮罩该铺回来了）。`remove` 返回 false 说明这一块已经被
+                // 兜底任务摘走了，收尾也轮不到这里。
+                if (fadingDrawerPanels.remove(panel) && fadingDrawerPanels.isEmpty()) {
+                    handler.removeCallbacks(fadingDrawerRemoval)
+                    afterDrawerRemoved()
+                }
+            }
+        }
+        handler.removeCallbacks(fadingDrawerRemoval)
+        handler.postDelayed(
+            fadingDrawerRemoval,
+            AppDrawerPanel.PANEL_EXIT_DURATION_MS + DRAWER_FADE_SLACK_MS,
+        )
+    }
+
+    /**
+     * 把「正在淡出」的那批面板**就地收掉**，不等动画了。
+     *
+     * 只在「它们马上会被别的东西盖住 / 进程要没了」时才调（见 [hideDrawer] 里那两处）——
+     * 其余情况让淡出自己走完。
+     */
+    private fun flushFadingDrawers() {
+        if (fadingDrawerPanels.isEmpty()) return
+        val stale = fadingDrawerPanels.toList()
+        fadingDrawerPanels.clear()
+        handler.removeCallbacks(fadingDrawerRemoval)
+        stale.forEach { removeDrawerNow(it) }
+        afterDrawerRemoved()
+    }
+
+    /** 真正把面板窗口摘掉（幂等：已摘过、窗口已不在都无害）。 */
+    private fun removeDrawerNow(panel: AppDrawerPanel) {
+        runCatching { windowManager.removeViewImmediate(panel) }
+            .onFailure { DebugLog.warn("DRAWER_REMOVE_FAILED", null, it) }
+    }
+
+    /**
+     * 面板**全部摘掉之后**的收尾（淡出与立即两条路共用）。
+     *
+     * ⚠️ 必须在窗口真的摘掉之后才催无障碍重排：淡出期间窗口还挂在最上层，这时把「点窗外」
+     * 的遮罩铺回来（层级 31）会盖在面板（层级 11）上，用户看到的是「面板还没退完就被一层
+     * 东西压住」。
+     *
+     * 主动催一次而不是等窗口变化事件：事件可能根本不来（面板撤下本身不产生窗口变化），
+     * 那遮罩就一直挂着不铺，用户得等到下一次别的窗口变动才恢复。
+     */
+    private fun afterDrawerRemoved() {
         FreeformAccessibilityService.refreshIfRunning()
     }
 
@@ -1201,19 +1423,25 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         if (slot >= 0) {
             val entry = radialApps.getOrNull(view.appIndexForSlot(slot))
             val isMore = view.hasMoreItem && slot == view.moreSlotIndex
-            removeMenu()
             // 无条件收：`side` 为空时更要收（那说明连呼出边都没记下来，残留没人清）。
             collapseTrigger()
             when {
                 isMore -> {
                     DebugLog.info("GESTURE_COMMIT_MORE", "松手在「更多」，打开面板（$side）")
+                    // ★ 这里**故意不撤轮盘**：面板构造是主线程同步的（冷启动几百毫秒），
+                    //   轮盘先撤掉的话这段空档屏幕全亮 = 用户说的「闪一下」。
+                    //   轮盘要一直撑到面板首帧，由 [handOffMenuToDrawer] 收（见那里的说明）。
                     showDrawer(side)
                 }
                 entry != null -> {
+                    removeMenu()
                     DebugLog.info("GESTURE_COMMIT", "side=$side app=${entry.label} ${entry.component.flattenToString()}")
                     worker.execute { launch(entry) }
                 }
-                else -> DebugLog.info("GESTURE_COMMIT_EMPTY", "side=$side 槽位 $slot 无对应应用")
+                else -> {
+                    removeMenu()
+                    DebugLog.info("GESTURE_COMMIT_EMPTY", "side=$side 槽位 $slot 无对应应用")
+                }
             }
             return
         }
@@ -1243,7 +1471,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             // 粘滞态下 `activeSide` 还在，趁撤轮盘之前抄下来（撤了它就空了）。
             val side = activeSide
             DebugLog.info("MENU_TAP_MORE", "点「更多」，打开面板（$side）")
-            removeMenu()
+            // ★ 这里**故意不撤轮盘**：面板构造是主线程同步的（冷启动几百毫秒），轮盘先撤掉的话
+            //   这段空档屏幕全亮 = 用户说的「闪一下」。轮盘要撑到面板首帧，见 [handOffMenuToDrawer]。
             collapseTrigger()
             showDrawer(side)
             return
@@ -1470,7 +1699,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         menuView?.let { menu ->
             if (!menu.isAttachedToWindow) {
                 DebugLog.warn("TRIGGER_WATCHDOG", "轮盘窗口已不在，清掉残留引用")
-                removeMenu()
+                // 窗口本来就没了，只是清引用——没有可淡的东西，也等不起。
+                removeMenu(MenuExit.NONE)
             }
         }
         // **正在用的时候绝不重建窗口**：重建是「移除 + 新增」，那会把一条正在进行的手势
@@ -1556,7 +1786,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         worker.execute {
             val catalog = AppCatalog.load(this)
             val tools = SystemTools.load(this)
-            // 不再「没固定就默认塞前几个」：扇形只显示用户显式固定的应用（与工具），
+            // 不再「没固定就默认塞前几个」：轮盘只显示用户显式固定的应用（与工具），
             // 其余全部走「更多」面板，避免一上来就是一排不明所以的图标。
             handler.post {
                 appEntries = catalog
@@ -1570,7 +1800,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     /**
-     * 用已缓存的目录重算扇形里的应用。
+     * 用已缓存的目录重算轮盘里的应用。
      *
      * 固定项在设置页和「更多」面板两处都能改，两条路径最后都落到这里，保证只有一处真相。
      * 不重新枚举应用，所以可以在面板里连续增删而感觉不到停顿。
@@ -1580,15 +1810,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val selected =
             pins.mapNotNull { component -> allApps.firstOrNull { it.component == component } }
         radialApps = selected
-        DebugLog.info("PINS_APPLIED", "扇形=${selected.size} 固定=${pins.size}")
+        DebugLog.info("PINS_APPLIED", "轮盘=${selected.size} 固定=${pins.size}")
     }
 
     /**
-     * 切换一个应用在扇形里的固定状态。
+     * 切换一个应用在轮盘里的固定状态。
      *
      * 返回 null 表示成功，否则是给用户看的失败原因——面板会把这句话直接显示在操作卡上。
      * 上限拦在这里而不是依赖 [SettingsStore.pinnedComponents] 的静默截断，否则用户会看到
-     * 「加进去了但扇形里没多」这种没头没尾的现象。
+     * 「加进去了但轮盘里没多」这种没头没尾的现象。
      */
     private fun togglePin(entry: AppEntry): String? {
         val current = store.pinnedComponents
@@ -1597,10 +1827,10 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 current.filterNot { it == entry.component }
             } else {
                 if (current.size >= SettingsStore.MAX_PINS) {
-                    return "扇形最多固定 ${SettingsStore.MAX_PINS} 个，先移出一个再添加"
+                    return "轮盘最多固定 ${SettingsStore.MAX_PINS} 个，先移出一个再添加"
                 }
-                // 新项插到**最前**。扇形里 0 号位紧挨着「更多」，所以新加的最靠近「更多」；
-                // 在「已选」条上（那条从左往右 = 扇形里自上而下）就落在**最右端**。
+                // 新项插到**最前**。轮盘里 0 号位紧挨着「更多」，所以新加的最靠近「更多」；
+                // 在「已选」条上（那条从左往右 = 轮盘里自上而下）就落在**最右端**。
                 //
                 // 这里必须和 [SettingsStore.togglePin] 保持一致。早先是 `current + entry.component`
                 // 追加到末尾，于是「面板里刚加的在最右、重开面板却跑到最左」——因为面板本地按
@@ -1621,7 +1851,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /**
      * 切换「底栏」成员。
      *
-     * 底栏只影响「更多」面板底部那一行，不参与扇形，所以**不需要** [applyPins]。
+     * 底栏只影响「更多」面板底部那一行，不参与轮盘，所以**不需要** [applyPins]。
      * 上限同样在这里拦，好在面板上直接给出可读原因。
      */
     private fun toggleDock(entry: AppEntry): String? {
@@ -1640,7 +1870,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /**
      * 执行一个内置工具。
      *
-     * 工具用伪组件编码（见 [SystemTools]），所以从扇形或面板点它，最终都走到这里；
+     * 工具用伪组件编码（见 [SystemTools]），所以从轮盘或面板点它，最终都走到这里；
      * 与普通应用的区别只有「不经过 PackageManager、不套小窗参数」这一点。
      */
     private fun runTool(id: String) {
@@ -1753,6 +1983,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     private fun runScreenText() {
+        // ★ 非 ColorOS：**连遮罩都不盖、一步都不注入**，直接走自研读字。
+        // 识屏的注入路是为 ColorOS 的「小布识屏」准备的（见 [NativeScreenText.trigger]）；
+        // 别家没有东西会接这记盲注入的双指长按，盖遮罩 + 按一下只是白走一趟，还会误伤前台应用。
+        if (!SystemSupport.isColorOs(this)) {
+            runOwnScreenText()
+            return
+        }
         // 注入前先盖上 [gestureShield]：否则那记双指按压会先打到前台应用身上。
         // 但**盖完不能立刻注入**——`addView` 返回时系统还没把这个窗口登记成「可点窗口」，
         // 真机实测（平板 / 酷安）立刻注入的话触摸仍旧落到酷安窗口上。隔一帧再注入就稳了。
@@ -2042,7 +2279,26 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
          */
         private const val CATALOG_REFRESH_DELAY_MS = 700L
 
-        private const val DRAWER_LAUNCH_DELAY_MS = 180L
+        /**
+         * 面板淡出的**兜底**多留的余量（ms）。见 [fadingDrawerRemoval]。
+         *
+         * 动画回调万一没来，靠它把窗口摘掉；留 120ms 是给「动画已经跑完、但回调还排在消息
+         * 队列里」的余量。
+         */
+        private const val DRAWER_FADE_SLACK_MS = 120L
+
+        /**
+         * 选中应用后、真正拉起小窗之前等多久（ms）。
+         *
+         * **必须 ≥ 面板的退场时长**（[AppDrawerPanel.PANEL_EXIT_DURATION_MS]）：面板是可聚焦的
+         * 悬浮窗，刚持有过焦点的调用方去发起自由窗启动，ColorOS 可能判定为「非小窗场景」而
+         * 退回全屏（见 `onSelected` 那段说明）。内置工具同理 —— 面板必须先撤下，
+         * 识屏 / 截屏才拿得到干净的屏幕内容。
+         *
+         * 原来是写死的 180（那时面板一刀就摘了、没有退场动画）。现在面板要淡出
+         * [AppDrawerPanel.PANEL_EXIT_DURATION_MS]，这里**跟着它算**，别再写死一个数。
+         */
+        private const val DRAWER_LAUNCH_DELAY_MS = AppDrawerPanel.PANEL_EXIT_DURATION_MS + 60L
 
         /**
          * 旋转之后补校正触摸条位置的时刻（ms）。
@@ -2084,6 +2340,31 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
         /** 回放的兜底恢复时间。派发回调万一不来，也不能让触摸条一直点不动。 */
         private const val TAP_THROUGH_TIMEOUT_MS = 700L
+
+        /**
+         * 轮盘衬底**淡出**时长（ms）。见 [removeMenu]。
+         *
+         * ⚠️ **必须与 `RadialMenuView.SCRIM_FADE_MS` 一致**——和 `DEFAULT_SWING_DEG` 那对常量
+         * 同一个道理：两处不一致会表现成「偶尔闪一下」，还很难查。改一处记得改另一处。
+         */
+        private const val MENU_SCRIM_FADE_MS = 200L
+
+        /**
+         * 淡出兜底多留的余量（ms）。见 [fadingMenuRemoval]。
+         *
+         * 动画回调万一不来，靠它把窗口摘掉；留 120ms 是给「动画已经跑完、但回调还排在消息队列里」
+         * 留的余量，免得兜底抢在正常回调前面把窗口摘了（那样也**没错**，只是白跑一趟）。
+         */
+        private const val MENU_SCRIM_FADE_SLACK_MS = 120L
+
+        /**
+         * 点「更多」后，轮盘最多等面板多久（ms）。见 [showDrawerNow] 结尾的兜底。
+         *
+         * 正常路径上面板首帧只要几十毫秒，这条永远不会触发；它防的是「面板 addView 成功但
+         * 布局回调没来」这种极端情况——那时轮盘会一直挂在屏上，面板一关就露出来。
+         * 取 1500 是「明显大于任何一次正常构造（含冷启动类加载）」又「不至于让用户干等」。
+         */
+        private const val DRAWER_HANDOFF_TIMEOUT_MS = 1_500L
 
         /**
          * 巡检判定「回放标记已经死了」的时限（ms）。
@@ -2164,7 +2445,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             )
         }
 
-        /** 固定项变化后只重算扇形，不重新枚举应用。服务没在跑就什么都不用做。 */
+        /** 固定项变化后只重算轮盘，不重新枚举应用。服务没在跑就什么都不用做。 */
         fun refreshPins(context: Context) {
             if (!isRunning) return
             context.startService(

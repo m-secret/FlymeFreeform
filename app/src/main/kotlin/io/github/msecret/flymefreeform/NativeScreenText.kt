@@ -171,14 +171,28 @@ object NativeScreenText {
     /**
      * 唤起系统识屏。
      *
-     * 顺序：**先走侧边栏功能 URI**（免权限，但只在还注册着该 scheme 的老 ROM 上生效）→
-     * 前台是桌面就直接收手（见 [isDesktopForeground]）→ 否则**重放双指长按**。
+     * 顺序：**非 ColorOS 直接收手**（见下）→ **先走侧边栏功能 URI**（免权限，但只在还注册着该
+     * scheme 的老 ROM 上生效）→ 前台是桌面就直接收手（见 [isDesktopForeground]）→ 否则
+     * **重放双指长按**。
+     *
+     * ★ **非 ColorOS 上必须一开始就返回 [Outcome.FALLBACK]**，一条注入路都不要走：
+     * 「小布识屏」是 ColorOS 的功能，别家系统上没有东西会接这记双指长按，而我们的注入是
+     * **盲注入**（落点是屏幕正中）—— 那一按只会打到前台应用身上：长按选中一段文字、弹出
+     * 上下文菜单、把列表项拖走……白误伤一次，然后照样退回自研读字。既然结果一样，
+     * 就别先按那一下（判据见 [SystemSupport]）。
      *
      * **调用方必须在调它之前把注入遮罩盖上**（`OverlayGestureService.coverGestureShield`）：
      * 不盖的话这记按压会先打到前台应用身上。盖的动作要在**调这个函数之前**完成、
      * 并且留出一帧让系统登记那个窗口，所以调用方是「先盖 → 稍等 → 再调本函数」。
      */
     fun trigger(context: Context): Outcome {
+        if (!SystemSupport.isColorOs(context)) {
+            DebugLog.info(
+                "TOOL_SCREEN_TEXT_NOT_COLOROS",
+                "非 ColorOS：没有小布识屏，跳过双指长按注入（盲注入会误伤前台应用），直接读无障碍文字",
+            )
+            return Outcome.FALLBACK
+        }
         if (triggerViaSidebarFeature(context)) return Outcome.TRIGGERED
         if (isDesktopForeground(context)) return Outcome.UNSUPPORTED
         if (replayTwoFingerLongPress(context)) return Outcome.TRIGGERED
