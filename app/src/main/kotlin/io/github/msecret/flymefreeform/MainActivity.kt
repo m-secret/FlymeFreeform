@@ -322,6 +322,11 @@ class MainActivity : Activity() {
      * 更新记录；而运行环境是**装到另一台机器上就会变**的运行时状态，两者性质不同）。
      */
     private fun buildCallTab() {
+        // ★ 顶部留白得**自己补**：本格一个区块标题都没有（理由见上），而另外两格各自靠第一个
+        // [Ui.sectionTitle] 自带的 [Ui.SPACE_SECTION_TOP] 把内容从大标题下拉下来。首页少了那一步，
+        // 卡片就直接贴在「Flyme 小窗」下面（用户 2026-10-09：「首页的框很贴近 Flyme 小窗，
+        // 和别的页面不一样，现在每页都不一样」）。取值见 [TAB_TOP_GAP_DP]。
+        callTab.addView(Ui.spacer(this, TAB_TOP_GAP_DP))
         overlayRow =
             permissionRow(
                 name = "悬浮窗权限",
@@ -411,7 +416,9 @@ class MainActivity : Activity() {
      * - **小窗**——小窗怎么关。
      */
     private fun buildFeatureTab() {
-        featureTab.addView(Ui.spacer(this, TAB_TOP_GAP_DP))
+        // ⚠️ 这里**不要**补顶部留白：本格第一个元素就是 [Ui.sectionTitle]，它自带
+        // [Ui.SPACE_SECTION_TOP]，再叠一段就比「设置」多出整整 30dp（2026-10-09 修掉的那处
+        // 三格不齐，错的一头正是这里多出来的那一份 —— 见 [TAB_TOP_GAP_DP]）。
         // 计数放**副标题**，和「更多面板 / 默认页 · 横屏位置」一个样式；塞进标题的话标题长短会随
         // 计数跳（早先就是「管理应用（已固定 4 / 6）」）。初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
         appManageButton =
@@ -1192,11 +1199,22 @@ class MainActivity : Activity() {
         const val SLIDE_MS = 200L
 
         /**
-         * 没有区块标题的两格，用这段留白把内容从标题栏下拉下来（原来是标题自己占的高度）。
+         * **没有区块标题**的那一格，用这段留白把内容从大标题下拉下来（原来是标题自己占的高度）。
          * 每格内容都不到一屏，留白给宽一点，免得整块挤在标题下面（用户：「现在切分成 tab
          * 每页感觉很空」「可以适当拉大间距」）。
+         *
+         * ## ★ 现在只该有**首页**用它（2026-10-09 收敛）
+         *
+         * 顶部留白是有**唯一来源**的：第一个 [Ui.sectionTitle] 自带的 [Ui.SPACE_SECTION_TOP]。
+         * 「功能」「设置」两格的第一个元素都是区块标题，所以它们**不需要**这段 spacer；
+         * 只有首页（四行前提检查表，一个标题都不配）得自己补上同样的一份。
+         *
+         * 曾经三个值分别是 **0 / 30 / 60**：功能格在 10-08 加了小节标题之后这份 spacer
+         * 没撤（叠加成 60），首页在 10-09 撤掉「状态 / 权限」两个标题之后又没补回来（归零）。
+         * ⚠️ 它的值**直接绑到 [Ui.SPACE_SECTION_TOP]**（不是抄一个 30 过来）：三格顶部留白
+         * 本就是这个值的两个出口，绑在一起才不会再各走各的。
          */
-        const val TAB_TOP_GAP_DP = 30
+        const val TAB_TOP_GAP_DP = Ui.SPACE_SECTION_TOP
 
         /** 同一格内，卡片与卡片 / 卡片与主按钮之间的实缝。比全局的 [Ui.SPACE_CARD] 更宽——这几屏内容少。 */
         const val GROUP_GAP_DP = 26
