@@ -542,40 +542,8 @@ class OutsideTapSettingsActivity : Activity() {
             detail = detail,
             onCommit = onChange,
         ) { inputLabel, current, lo, hi, apply ->
-            showInputDialog(inputLabel, current, lo, hi, apply)
+            // ★ 走 [AppDialog.showInput]：原来这里那份系统 `AlertDialog.Builder` 是「旧样式」
+            // （用户 2026-10-09），两个设置页各抄一份也正是重复的源头。
+            AppDialog.showInput(this, inputLabel, current, lo, hi, apply)
         }
-
-    /** 手动输入数值：校验范围，越界给提示、不生效。 */
-    private fun showInputDialog(
-        label: String,
-        current: Int,
-        min: Int,
-        max: Int,
-        onConfirm: (Int) -> Unit,
-    ) {
-        val input =
-            android.widget.EditText(this).apply {
-                inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                setText(current.toString())
-                setSelection(text.length)
-                setPadding(Ui.dp(this@OutsideTapSettingsActivity, 20), Ui.dp(this@OutsideTapSettingsActivity, 12), Ui.dp(this@OutsideTapSettingsActivity, 20), Ui.dp(this@OutsideTapSettingsActivity, 12))
-            }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("$label（$min ~ $max）")
-            .setView(input)
-            .setPositiveButton("确定") { _, _ ->
-                val typed = input.text.toString().trim().toIntOrNull()
-                if (typed == null || typed < min || typed > max) {
-                    android.widget.Toast.makeText(
-                        this,
-                        "请输入 $min ~ $max 之间的整数",
-                        android.widget.Toast.LENGTH_SHORT,
-                    ).show()
-                } else {
-                    onConfirm(typed)
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
 }

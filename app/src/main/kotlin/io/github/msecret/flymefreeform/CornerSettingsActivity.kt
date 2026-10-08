@@ -583,42 +583,10 @@ class CornerSettingsActivity : Activity() {
             onLive = onLive,
             onCommit = onChange,
         ) { inputLabel, current, lo, hi, apply ->
-            showInputDialog(inputLabel, current, lo, hi, apply)
+            // ★ 走 [AppDialog.showInput] 而不是系统 `AlertDialog.Builder`：那套灰底 + 另一份字号
+            // 和本应用的 M3 浅色并排就是「不搭」（用户 2026-10-09：「数值调整的弹窗还是旧样式」）。
+            AppDialog.showInput(this, inputLabel, current, lo, hi, apply)
         }
-
-    /** 手动输入数值：校验范围，越界给提示、不生效。 */
-    private fun showInputDialog(
-        label: String,
-        current: Int,
-        min: Int,
-        max: Int,
-        onConfirm: (Int) -> Unit,
-    ) {
-        val input =
-            android.widget.EditText(this).apply {
-                inputType = android.text.InputType.TYPE_CLASS_NUMBER
-                setText(current.toString())
-                setSelection(text.length)
-                setPadding(dp(20), dp(12), dp(20), dp(12))
-            }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("$label（$min ~ $max）")
-            .setView(input)
-            .setPositiveButton("确定") { _, _ ->
-                val typed = input.text.toString().trim().toIntOrNull()
-                if (typed == null || typed < min || typed > max) {
-                    android.widget.Toast.makeText(
-                        this,
-                        "请输入 $min ~ $max 之间的整数",
-                        android.widget.Toast.LENGTH_SHORT,
-                    ).show()
-                } else {
-                    onConfirm(typed)
-                }
-            }
-            .setNegativeButton("取消", null)
-            .show()
-    }
 
     /** 按屏幕短边比例算尺寸（px），以 400dp 短边为设计基准。 */
     private fun dp(value: Int): Int = Ui.dp(this, value)

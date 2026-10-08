@@ -9,6 +9,8 @@ import android.widget.Toast
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.Instant
+import java.time.ZoneId
 import java.util.concurrent.Executors
 import org.json.JSONArray
 
@@ -84,7 +86,7 @@ object UpdateChecker {
      *
      * [version] 是去掉 `v` 前缀的版本号（`v1.1.0` → `1.1.0`），[url] 是它的**网页地址**
      * （`html_url`，页面里能下 APK），[notes] 是正文（Markdown 原文，交给 `Changelog` 渲染），
-     * [publishedAt] 是发布日期的 `2026-10-08` 部分（没发布日期的空着）。
+     * [publishedAt] 是**本地时区**下的发布日期（`2026-10-09`；没发布日期的空着）。
      */
     data class Release(
         val version: String,
@@ -185,8 +187,8 @@ object UpdateChecker {
                         version = tag.trimStart('v', 'V'),
                         url = json.optString("html_url").ifBlank { RELEASES_PAGE },
                         notes = json.optString("body"),
-                        // `published_at` 是 `2026-10-08T12:34:56Z`，只留日期部分。
-                        publishedAt = json.optString("published_at").take(10),
+                        // `published_at` 是 **UTC**，必须换算成本地日期再显示（见 [localDateOf]）。
+                        publishedAt = localDateOf(json.optString("published_at")),
                     )
             }
             if (releases.isEmpty()) throw NoReleaseException()
@@ -195,4 +197,19 @@ object UpdateChecker {
             connection.disconnect()
         }
     }
+
+    /**
+     * GitHub 的 `published_at`（UTC，形如 `2026-10-08T16:29:04Z`）→ **本地时区**的 `yyyy-MM-dd`。
+     *
+     * 为什么不能像原来那样 `take(10)` 图省事：UTC 比北京时间晚 8 小时，**凌晨发布的版本会被
+     * 显示成前一天**（2026-10-09 00:29 发的 1.1.2 显示成 `2026-10-08`，刚发完看着像旧日志）。
+     * 发布日期是给人看的，就该按用户所在时区算。
+     *
+     * 空串 / 解析不出来返回**空串**（`Changelog` 会照旧不显示日期）—— ⚠️ **别退回 `take(10)`**，
+     * 那正是这里要修的东西。用 `java.time` 而不是 `SimpleDateFormat` 是因为后者**不是线程安全的**，
+     * 而这里没有值得为它加锁的理由（`minSdk` 已经是 35，`java.time` 随手可用）。
+     */
+    private fun localDateOf(raw: String): String =
+        runCatching { Instant.parse(raw).atZone(ZoneId.systemDefault()).toLocalDate().toString() }
+            .getOrDefault("")
 }

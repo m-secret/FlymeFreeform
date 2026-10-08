@@ -4,9 +4,12 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.text.InputType
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -34,6 +37,16 @@ import android.widget.TextView
  *    弹两下。宽度规则是 `targetWidth()`：左右各留边、再封顶（不是「屏宽 90%」）。
  * 3. **高度必须封顶**：`setMessage` 那条路是系统帮我们滚的，换成自绘控件就得自己管，
  *    不封顶的话内容一长就把底下两颗按钮顶出屏幕（见 [CappedScrollView]）。
+ *
+ * ## ★ 点窗口外面 = 关窗（2026-10-09 统一）
+ *
+ * 用户原话：「数值调整的弹窗还是旧样式，不过有点好处是**点窗外可以自动关闭**，我们自建的就不行」
+ * —— 旧样式那个系统 `AlertDialog` 能这么关，是因为它的对话框主题自带
+ * `android:windowCloseOnTouchOutside`；我们这套既要自绘皮、又没显式声明，就**不能**靠主题兜底。
+ * 所以三处都显式写 [AlertDialog.setCanceledOnTouchOutside]`(true)`，别再依赖默认值。
+ *
+ * [Changelog] 那个对话框 2026-10-08 曾显式设成 `false`（怕「弹出来就自动关」），
+ * 2026-10-09 一并放开 —— 见那里的说明。
  *
  * ⚠️ **`targetWidth()` 用的是 [Ui.dp]，它不是按 density 换算的 dp** —— 而是
  * 「按屏幕短边 × 用户 UI 缩放」等比缩放（`CornerGeometry.designShortEdgePx`）。所以同一个
@@ -94,6 +107,8 @@ object AppDialog {
                 .setNegativeButton(negativeText, null)
                 .create()
         restyle(dialog)
+        // ★ 显式写死「点窗外关窗」，不靠主题默认值（理由见类注释那节）。
+        dialog.setCanceledOnTouchOutside(true)
         dialog.setOnShowListener {
             // 兜底：万一某个 ROM 仍在别处把宽度改回去，这里再补一次。
             // 正常路径下宽度**已经是对的**（上一句刚设过），所以这是一次空操作，不会闪。
@@ -134,8 +149,104 @@ object AppDialog {
                 .create()
         dialogRef[0] = dialog
         restyle(dialog)
+        // ★ 同 [showDialog]：点窗外关窗。这一条对它尤其自然 —— 每行点一下就走了，没有「确定」。
+        dialog.setCanceledOnTouchOutside(true)
         dialog.setOnShowListener {
             if (dialog.window?.attributes?.width != targetWidth(dialog.context)) restyle(dialog)
+        }
+        dialog.show()
+    }
+
+    /**
+     * 弹一个「输入一个整数」的对话框。
+     *
+     * ## 为什么有它
+     *
+     * 滑块的数值胶囊点一下要能直接输具体数字（比在滑块上瞄半天准），这条路原来在两个设置页
+     * 各写了一份 **系统 `AlertDialog.Builder`**：用户 2026-10-09 指出「数值调整的弹窗还是旧样式」
+     * —— 那块灰底和另一套字号就是类注释里说的「和当前应用不搭」。**删掉那两份，都走这里。**
+     *
+     * ## 校验不过**不关窗**
+     *
+     * `.setPositiveButton()` 默认点了就关，越界只能靠 Toast 事后追认。这里把 positive 的点击
+     * 覆写成「先校验，过了才 `dismiss()` 再回调」，并在输入框下面就地显示一行红字 ——
+     * 用户还在原页面，改一个数字不用重新点开。
+     *
+     * [label] 会带上区间写成标题（`"触摸区宽度（20 ~ 120）"`）：范围是这一屏唯一的必知信息，
+     * 藏在副标题里不如直接摆在标题上。
+     */
+    fun showInput(
+        activity: Activity,
+        label: String,
+        current: Int,
+        min: Int,
+        max: Int,
+        onConfirm: (Int) -> Unit,
+    ) {
+        val input =
+            EditText(activity).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                setText(current.toString())
+                setSelection(text.length)
+                isSingleLine = true
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(activity, 15f))
+                setTextColor(Ui.COLOR_ON_SURFACE)
+                setPadding(
+                    Ui.dp(activity, 14),
+                    Ui.dp(activity, 10),
+                    Ui.dp(activity, 14),
+                    Ui.dp(activity, 10),
+                )
+                // 对话框是白底，所以输入框用**页底色**当底：一眼能看出「这一格能改」，
+                // 又不会像描边输入框那样在卡片里多出一道框线。
+                background =
+                    GradientDrawable().apply {
+                        setColor(Ui.COLOR_SURFACE)
+                        cornerRadius = Ui.dpF(activity, Ui.SHAPE_MEDIUM.toFloat()).toFloat()
+                    }
+            }
+        // 越界提示：默认不占位置（`GONE`），出错时才顶出来一行。
+        val error =
+            TextView(activity).apply {
+                setTextSize(TypedValue.COMPLEX_UNIT_PX, Ui.sp(activity, 12f))
+                setTextColor(Ui.COLOR_ERROR)
+                visibility = View.GONE
+            }
+        val field =
+            LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(input)
+                addView(
+                    error,
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = Ui.dp(activity, 6) },
+                )
+            }
+        val dialog =
+            AlertDialog.Builder(activity)
+                .setView(content(activity, "$label（$min ~ $max）", field))
+                // 传 `null` 监听：真正的逻辑挂在 `onShow` 里（见下），这里只是把按钮画出来。
+                .setPositiveButton("确定", null)
+                .setNegativeButton("取消", null)
+                .create()
+        restyle(dialog)
+        dialog.setCanceledOnTouchOutside(true)
+        dialog.setOnShowListener {
+            if (dialog.window?.attributes?.width != targetWidth(dialog.context)) restyle(dialog)
+            // ★ 必须等 `show()` 之后才拿得到按钮：三颗按钮是 `AlertDialog.onCreate()` 里建的，
+            // `create()` 完时 `getButton()` 返回 null。
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setOnClickListener {
+                val typed = input.text.toString().trim().toIntOrNull()
+                if (typed == null || typed < min || typed > max) {
+                    error.text = "请输入 $min ~ $max 之间的整数"
+                    error.visibility = View.VISIBLE
+                } else {
+                    dialog.dismiss()
+                    onConfirm(typed)
+                }
+            }
         }
         dialog.show()
     }
