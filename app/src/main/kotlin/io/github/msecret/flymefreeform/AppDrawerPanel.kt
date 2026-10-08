@@ -2334,10 +2334,16 @@ class AppDrawerPanel(
                 // 0.023 / 0.080 ≈ 0.2875，两者观感才对得上。
                 labelTextScale = 0.2875f,
                 onLongPress = { entry -> if (!manageMode) showPinAction(entry) },
-                // 工具页**不长按拖动排序**：这里长按的意图是「管理这一项」（弹动作卡），而拖动
-                // 那套视觉（放大 1.12 + 灰底 + 浮起）一出现就像点坏了——用户报的「更多里工具
-                // 长按时会向上缩」就是它。工具顺序在「更多面板 → 工具顺序」里调。
-                longPressDrag = false,
+                // ★ 长按拖 = 排序；长按后**不拖动**松手 = 弹管理菜单。两种意图共用一条手势，
+                //   正是网格下面那句提示（「长按拖动可排序；长按后松手（不拖动）可加入轮盘或底栏」）
+                //   写的事，也是 [PinnedStripView.onLongPress] 的默认行为。
+                //
+                // ⚠️ 这里一度是 `longPressDrag = false`，用户 2026-10-09 报
+                //   「更多面板工具的长按拖动功能没了」—— 那条理由现在两条都不成立：
+                //   ① 当时说的「按住图标会向上缩」是 [PinnedStripView] 把网格行距漏掉的 bug，
+                //      已在控件里修掉（行距用 `rowStride`、跟手用位移）；
+                //   ② 它指向的替代入口「更多面板 → 工具顺序」后来也撤了（三个重置动作都搬到
+                //      「管理应用」页）。⇒ 排序能力必须留在这里，`commitToolReorder` 也才有主。
                 columns = columns,
                 nestedScroll = true,
                 // 纵向节奏和应用页的网格对齐：那边每一行自带 8dp 上下内边距，两行之间是 16dp；
@@ -2482,7 +2488,20 @@ class AppDrawerPanel(
                     }
                 },
                 onReorder = { order -> commitReorder(order) },
-                columns = SELECTOR_COLUMNS,
+                // ★ 和下面的网格**用同一个列数**（`columns`），不再另定一个。
+                //
+                // 用户 2026-10-09：「已选为什么固定一行 4 个，但是下面的列表可以更多」——
+                // 原先这里写死 4（`SELECTOR_COLUMNS`），而网格早已改成自适应（[GRID_MIN_COLUMNS] ~
+                // [GRID_MAX_COLUMNS]）：平板横屏上网格排 7 列、已选还是 4 列，同一个面板里两种密度，
+                // 两块图标的竖线也对不上了。
+                //
+                // 能直接共用，是因为**两条的可用宽度本来就相等**（都是 `cardW − 48`）：
+                // ```
+                // 已选：16(卡片) + 8(内容层)                 左 ／ 6(卡片) + 6(内容层) + 12(本条右缩) 右
+                // 网格：16(卡片) + 0(列表) + 8(行内)         左 ／ 6(卡片) + 10(列表右缩) + 8(行内)   右
+                // ```
+                // 列数一致 ⇒ 槽宽一致 ⇒ 图标列落在同一条竖线上。见 [SELECTOR_STRIP_RIGHT_INSET_DP]。
+                columns = columns,
             )
         selectorStrip.removeBadgeVisible = manageMode
         // 右边同样给索引条让位（不然最右那格的「－」会和索引条叠在一起）；
@@ -3908,7 +3927,9 @@ class AppDrawerPanel(
          * 右 =  6 (卡片) + 6 (内容层) + 12    = 24   ✓
          * ```
          *
-         * 补完之后「已选」的图标列和下面网格的图标列**落在同一条竖线上**（都是四列等分）。
+         * 补完之后「已选」的可用宽度和下面网格的**完全相等**（都是 `cardW − 48`），
+         * 所以只要两者**列数相同**，图标列就落在同一条竖线上——列数由
+         * [buildSelectorSection] 直接共用网格那个 `columns`（原来这里写死 4，网格改自适应后就对不上了）。
          */
         const val SELECTOR_STRIP_RIGHT_INSET_DP = 12
 
@@ -3939,9 +3960,6 @@ class AppDrawerPanel(
          * 按「本值 × 2」补成行间距传进去（见 `gridRowGapPx`）——两页的纵向节奏才对得上。
          */
         const val GRID_ROW_PADDING_DP = 8
-
-        /** 「已选」条一行放几个，多的换行。固定项上限 6 个，4 个一行正好两行。 */
-        const val SELECTOR_COLUMNS = 4
 
         /** 表示「肯定已经滚过一整行了」的一个足够大的滚动量（见 `estimateScrollOffset`）。 */
         const val OVERSCROLLED = 100_000
