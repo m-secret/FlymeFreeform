@@ -50,7 +50,7 @@ import android.graphics.drawable.Drawable
  * ## ★★ 线条色必须在**浅底**上清楚
  *
  * 这条最容易踩：工具图标真正落的地方是**白卡片**（面板 `AppDrawerPanel.CARD_COLOR = #FFFFFF`、
- * 「轮盘应用」管理页）和页面底 `Ui.COLOR_SURFACE = #F5F6F8` —— **app 是浅色主题**；
+ * 「管理应用」页）和页面底 `Ui.COLOR_SURFACE = #F5F6F8` —— **app 是浅色主题**；
  * 轮盘那层衬底也只是默认 18% 黑（`SettingsStore.DEFAULT_MENU_SCRIM_PERCENT`），叠上去仍是浅底。
  *
  * 所以颜色一律取**中明度、高饱和**。原来给「深色圆底」当亮端的那套色（`#FFD54F` 亮黄、
@@ -506,7 +506,7 @@ object SystemTools {
      * ## ★ 为什么必须是**纯白**（[PLATE_COLOR]）
      *
      * 因为白垫层要在两处同时成立：**白卡片上完全隐形**（面板 `AppDrawerPanel.CARD_COLOR`、
-     * 「轮盘应用」管理页、「图标」页的卡片都是 `#FFFFFF`），**轮盘上又挡得住遮罩**。
+     * 「管理应用」页、「图标」页的卡片都是 `#FFFFFF`），**轮盘上又挡得住遮罩**。
      * 只有「和卡片同色的白」能两头都占：面板 / 管理页 / 图标页看起来和 [BARE] 一模一样，
      * 只有图标底下压着遮罩时才显形（而且默认衬底才 18% 黑，那圈白很淡）。
      *

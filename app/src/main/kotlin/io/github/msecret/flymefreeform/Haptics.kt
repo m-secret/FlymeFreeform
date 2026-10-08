@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.content.Context
+import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -27,18 +28,65 @@ import android.os.VibratorManager
  */
 object Haptics {
 
-    /** 划过轮盘图标时的轻触感。 */
-    fun tick(context: Context) = play(context, intensity = INTENSITY_TICK, short = true)
+    /**
+     * 触感**来源**。每次调用都要报上自己是谁 —— 设置里是按**行为**分开开关的
+     * （见 `HapticSettingsActivity`）：一个笼统的「面板」开关盖不住「切页想安静、长按要确认」
+     * 这种差别。
+     *
+     * ⚠️ 这里**故意不给默认值**：新增调用点时漏了分类，编译器会当场拦下来；给了默认值的话，
+     * 新动作会悄悄跟着别人的开关走（用户关了 A、结果 B 也不震，或反过来）。
+     */
+    enum class Source {
+        /** 主动呼出：轮盘上划过图标。 */
+        RADIAL,
 
-    /** 长按弹出、加入/移出轮盘、拖拽换位等「确认」类反馈。 */
-    fun confirm(context: Context) = play(context, intensity = INTENSITY_CONFIRM, short = false)
+        /** 「更多」面板：在应用 / 工具两页之间切换。 */
+        PANEL_TAB_SWITCH,
 
-    private fun play(context: Context, intensity: Float, short: Boolean) {
+        /** 「更多」面板：长按弹出的操作卡，以及卡片里的动作（加入 / 移出轮盘、底栏、管理模式、拖拽换位）。 */
+        PANEL_LONG_PRESS,
+
+        /** 「更多」面板：右侧索引条（含顶部那颗「回顶部」的星星）。 */
+        PANEL_INDEX,
+
+        /**
+         * 上面几类之外的零散反馈：识屏面板的「复制全部」、「已选」旁的「?」气泡、清除「最近使用」。
+         *
+         * **只受总开关管**：它们不成体系，不值得为每一个再配一颗开关；而「总开关关掉就全静音」
+         * 这条又必须对它们成立。
+         */
+        OTHER,
+    }
+
+    /** 划过时的轻触感。 */
+    fun tick(context: Context, source: Source) = play(context, source, short = true)
+
+    /** 长按弹出、加入/移出、拖拽换位等「确认」类反馈。 */
+    fun confirm(context: Context, source: Source) = play(context, source, short = false)
+
+    /** 按 [source] 对应的开关决定这次要不要震，然后再走下面的通道。 */
+    private fun enabled(context: Context, source: Source): Boolean {
+        // ★ 设置**每次触发现读**、不许缓存：这里跑在悬浮窗服务进程里，而开关是在设置页改的，
+        // 两个进程只靠 SharedPreferences 同步（`getSharedPreferences` 自带缓存，读一次很便宜）。
+        val store = SettingsStore(context)
+        if (!store.hapticEnabled) return false
+        return when (source) {
+            Source.RADIAL -> store.menuHapticEnabled
+            Source.PANEL_TAB_SWITCH -> store.panelTabSwitchHapticEnabled
+            Source.PANEL_LONG_PRESS -> store.panelLongPressHapticEnabled
+            Source.PANEL_INDEX -> store.panelIndexHapticEnabled
+            Source.OTHER -> true
+        }
+    }
+
+    private fun play(context: Context, source: Source, short: Boolean) {
+        if (!enabled(context, source)) return
         val vibrator = resolve(context)
         if (vibrator == null || !vibrator.hasVibrator()) {
             DebugLog.warn("HAPTIC_SKIP", "没有可用的震动马达")
             return
         }
+        val intensity = if (short) INTENSITY_TICK else INTENSITY_CONFIRM
 
         // 1) X 轴马达的点击原语——只有确认支持才用，否则它会静默无效。
         if (runCatching { vibrator.areAllPrimitivesSupported(PRIMITIVE_CLICK) }.getOrDefault(false)) {
@@ -75,10 +123,31 @@ object Haptics {
             vibrator.areEffectsSupported(effectId).firstOrNull() == Vibrator.VIBRATION_EFFECT_SUPPORT_YES
         }.getOrDefault(false)
 
+    /**
+     * 本机有没有可用的振动马达。
+     *
+     * ★ 判据只有这一个：`Vibrator.hasVibrator()`。**不能靠「震了没反应」去推断** ——
+     * 没有马达的设备上 `vibrate()` 不抛异常、也不震，调用方一无所知（这正是 [play] 里那句
+     * `HAPTIC_SKIP` 日志存在的原因）。平板这类设备整机就没有马达，所以设置页必须先问这一句，
+     * 而不是把开关摆出来让用户一个个试。
+     *
+     * 用处见 [HapticSettingsActivity]（整页压暗 + 写明原因）和 `MainActivity.buildFeatureTab`
+     * （「触感」那一行压暗、副标题改成「本机无振动马达」）。
+     */
+    fun isSupported(context: Context): Boolean =
+        runCatching { resolve(context)?.hasVibrator() == true }.getOrDefault(false)
+
     private fun resolve(context: Context): Vibrator? =
         runCatching {
-            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)
-                ?.defaultVibrator
+            // API 31 起才有 VibratorManager；再往下只剩老的 VIBRATOR_SERVICE 这一条路
+            // （拿不到就返回 null = 当作没有马达，UI 那边会如实显示）。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)
+                    ?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            }
         }.getOrNull()
 
     private const val PRIMITIVE_CLICK = VibrationEffect.Composition.PRIMITIVE_CLICK

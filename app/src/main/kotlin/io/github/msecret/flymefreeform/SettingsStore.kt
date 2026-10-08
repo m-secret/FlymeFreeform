@@ -579,10 +579,50 @@ class SettingsStore(context: Context) {
                 .putInt(KEY_MENU_HEIGHT_DP, value.coerceIn(MIN_MENU_DIM_DP, MAX_MENU_DIM_DP))
                 .apply()
 
-    /** 手指划过轮盘图标时触发系统触感反馈。 */
+    // ---- 触感（振动）：一处总开关 + 四条行为各自的开关 ----
+    //
+    // 全都在「功能」tab →「触感」页调（`HapticSettingsActivity`）。**别再往各自主页里塞一份**：
+    // 「主动呼出与轮盘」页原先自己挂着一颗「划过图标时震动」，2026-10-09 挪走了 —— 同一个
+    // 开关出现在两处，用户在一边关掉、去另一边看还是开着的，只会以为设置没生效。
+    //
+    // 开关的粒度是**行为**、不是「页面」：面板里「切页 / 长按 / 索引」三种动静的手感诉求本来就
+    // 不一样（切页只想安静，长按要确认感），一个面板一个开关盖不住。
+
+    /** 触感总开关。关掉之后下面几项一律不起作用（它们的值会保留，不会被抹掉）。 */
+    var hapticEnabled: Boolean
+        get() = preferences.getBoolean(KEY_HAPTIC_ENABLED, true)
+        set(value) = preferences.edit().putBoolean(KEY_HAPTIC_ENABLED, value).apply()
+
+    /** 主动呼出（轮盘）：手指划过图标时的触感。默认 **开**。 */
     var menuHapticEnabled: Boolean
         get() = preferences.getBoolean(KEY_MENU_HAPTIC, true)
         set(value) = preferences.edit().putBoolean(KEY_MENU_HAPTIC, value).apply()
+
+    /**
+     * 「更多」面板：在**应用 / 工具**两页之间切换时的触感。
+     *
+     * 默认 **关**（2026-10-09 用户指定）—— 切页是个高频动作，多数人不想每切一次都震一下。
+     */
+    var panelTabSwitchHapticEnabled: Boolean
+        get() = preferences.getBoolean(KEY_PANEL_HAPTIC_TAB_SWITCH, false)
+        set(value) = preferences.edit().putBoolean(KEY_PANEL_HAPTIC_TAB_SWITCH, value).apply()
+
+    /**
+     * 「更多」面板：**长按**图标弹出的操作卡，以及卡片里的动作（加入 / 移出轮盘、底栏、管理模式、
+     * 拖动换位）。默认 **开**。
+     */
+    var panelLongPressHapticEnabled: Boolean
+        get() = preferences.getBoolean(KEY_PANEL_HAPTIC_LONG_PRESS, true)
+        set(value) = preferences.edit().putBoolean(KEY_PANEL_HAPTIC_LONG_PRESS, value).apply()
+
+    /**
+     * 「更多」面板：右侧**索引条**的触感（含顶部那颗「回顶部」的星星）。默认 **开**。
+     *
+     * 索引条要一格格划过，触感是它唯一的位置提示 —— 所以默认留着。
+     */
+    var panelIndexHapticEnabled: Boolean
+        get() = preferences.getBoolean(KEY_PANEL_HAPTIC_INDEX, true)
+        set(value) = preferences.edit().putBoolean(KEY_PANEL_HAPTIC_INDEX, value).apply()
 
     /**
      * 隐藏轮盘里的「更多」入口。默认 **false**（保留，行为不变）。
@@ -988,7 +1028,7 @@ class SettingsStore(context: Context) {
      * 越界时静默停住边界，不循环——循环会让「点两下回到原点」这种操作看起来像没生效。
      *
      * ⚠️ **当前没有 UI 调用它**（2026-10-08）：管理页原来行尾那两颗 `↑` `↓` 已经拆掉，
-     * 顺序统一由「已固定」条的**长按拖动**走 [reorderPins]。留着这个一位微调的口子，
+     * 顺序统一由「轮盘」条的**长按拖动**走 [reorderPins]。留着这个一位微调的口子，
      * 是因为它和 [togglePin] / [reorderPins] 是同一组语义完整的 API，删了反而要在别处重写；
      * 真要用它，记得连 UI 一起加回来，别再让两个入口同时改顺序。
      */
@@ -1291,7 +1331,21 @@ class SettingsStore(context: Context) {
         private const val KEY_RECENT = "recent_used"
 
         private const val KEY_MENU_RADIUS_PERCENT = "menu_radius_percent"
+
+        /** 见 [menuHapticEnabled]：轮盘划过图标的触感。 */
         private const val KEY_MENU_HAPTIC = "menu_haptic"
+
+        /** 见 [hapticEnabled]：触感总开关。 */
+        private const val KEY_HAPTIC_ENABLED = "haptic_enabled"
+
+        /** 见 [panelTabSwitchHapticEnabled]：「更多」面板里应用 / 工具切换的触感（默认关）。 */
+        private const val KEY_PANEL_HAPTIC_TAB_SWITCH = "panel_haptic_tab_switch"
+
+        /** 见 [panelLongPressHapticEnabled]：「更多」面板里长按操作的触感。 */
+        private const val KEY_PANEL_HAPTIC_LONG_PRESS = "panel_haptic_long_press"
+
+        /** 见 [panelIndexHapticEnabled]：「更多」面板索引条的触感。 */
+        private const val KEY_PANEL_HAPTIC_INDEX = "panel_haptic_index"
 
         /** 见 [hideMoreEntry]：轮盘里不再有「更多」入口。 */
         private const val KEY_HIDE_MORE_ENTRY = "hide_more_entry"
@@ -1394,6 +1448,9 @@ class SettingsStore(context: Context) {
                 KEY_MENU_RADIUS_PERCENT, KEY_MENU_HAPTIC, KEY_MENU_ICON_DP, KEY_MENU_SWING_DEG,
                 KEY_MENU_SCRIM_PERCENT, KEY_MENU_WIDTH_DP, KEY_MENU_HEIGHT_DP,
                 KEY_MENU_CORNER_INSET_PERCENT, KEY_LEGACY_MENU_CORNER_INSET_DP,
+                // 触感（总开关 + 面板三种行为）
+                KEY_HAPTIC_ENABLED, KEY_PANEL_HAPTIC_TAB_SWITCH,
+                KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX,
                 // 图标
                 KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
                 // 其它

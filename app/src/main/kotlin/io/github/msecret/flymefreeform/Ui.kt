@@ -601,7 +601,7 @@ object Ui {
      *
      * 标题与副标题两个 TextView 一起挂在返回 View 的 `tag` 上（[RowTexts]）——需要动态改文案的
      * 入口取出来直接用。**会变的数字放副标题，别塞进标题**：标题长短随计数跳（「管理应用
-     * （已固定 3 / 6）」），整卡的文字左边缘就参差不齐了。
+     * （轮盘 3 / 6）」），整卡的文字左边缘就参差不齐了。
      */
     fun entryRow(
         context: Context,
@@ -629,7 +629,7 @@ object Ui {
     /**
      * [entryRow] 挂在自己 `tag` 上的两个文本。
      *
-     * 为什么要一起交出去：有些入口的文案是**动态的**——「管理应用 / 已固定 3 / 6」、
+     * 为什么要一起交出去：有些入口的文案是**动态的**——「管理应用 / 轮盘 3 / 6」、
      * 「图标包 / 从 xx 读取」。调用方得在刷新时改它，而这些 View 没有 id 可 `findViewById`，
      * 只能顺着 tag 拿。
      *
@@ -740,7 +740,7 @@ object Ui {
             setColor(color)
         }
 
-    /** 小胶囊标签（如「已固定 2」）。 */
+    /** 小胶囊标签（如「轮盘 2」）。 */
     fun pill(context: Context, text: String, highlighted: Boolean = true): TextView =
         TextView(context).apply {
             this.text = text

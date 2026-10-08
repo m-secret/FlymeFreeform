@@ -1687,7 +1687,7 @@ class AppDrawerPanel(
         activeTab = targetTab
         refreshTabBar()
         syncIndexVisibility()
-        if (changed) Haptics.tick(context)
+        if (changed) Haptics.tick(context, Haptics.Source.PANEL_TAB_SWITCH)
         // 共享状态不仅是浮层的 translationY，目标页的滚动容器也必须落在同一偏移。
         // 否则应用页上滑后切到工具页时，浮层已经上移而工具内容仍从 scrollY=0 开始，
         // 中间会留下整段 header 空白；用户第一次滑动又会用 0 覆盖共享状态，使「已选」落回。
@@ -1858,7 +1858,7 @@ class AppDrawerPanel(
                 // 上字样与气泡被放大一倍，字母列装不下字形。见 [AlphabetIndexView] 类注释。
                 shortEdgePx = shortEdgePx,
                 onLetter = { letter ->
-                    Haptics.tick(context)
+                    Haptics.tick(context, Haptics.Source.PANEL_INDEX)
                     queueIndexLetter(letter)
                 },
                 onLetterEnd = {
@@ -1867,7 +1867,7 @@ class AppDrawerPanel(
                 // 顶部那颗五角星：把列表带回最上面——「已选」条就在那儿，
                 // 它平时会被滚动推出去，这是让它回来的最快入口。
                 onStar = {
-                    Haptics.tick(context)
+                    Haptics.tick(context, Haptics.Source.PANEL_INDEX)
                     if (activeTab != TAB_APPS) selectTab(TAB_APPS)
                     // **平滑**滚回顶部，别用 `setSelection(0)`：那是瞬移，手指还在索引条上
                     // 滑着、列表却已经「啪」地换了位置，看着就是断的。
@@ -2333,7 +2333,7 @@ class AppDrawerPanel(
                 // 网格项的标签是 sizeByScreen(0.023f)、图标是 ui(GRID_ICON_FRACTION=0.080f)：
                 // 0.023 / 0.080 ≈ 0.2875，两者观感才对得上。
                 labelTextScale = 0.2875f,
-                onLongPress = { entry -> if (!manageMode) showPinAction(entry) },
+                onLongPress = { entry -> if (!manageMode) showPinAction(entry, haptic = false) },
                 // ★ 长按拖 = 排序；长按后**不拖动**松手 = 弹管理菜单。两种意图共用一条手势，
                 //   正是网格下面那句提示（「长按拖动可排序；长按后松手（不拖动）可加入轮盘或底栏」）
                 //   写的事，也是 [PinnedStripView.onLongPress] 的默认行为。
@@ -2372,10 +2372,17 @@ class AppDrawerPanel(
     }
 
     /**
-     * 工具页拖拽排序结束：把回传的组件顺序翻成工具 id，写回上层，并**同步本地 [tools]**。
+     * 工具页拖拽排序结束：把回传的组件顺序翻成工具 id，写回上层，**同步本地 [tools] 并当场重画网格**。
      *
      * 本地必须跟着重排：否则下次刷新（切管理模式、目录重读回来）重建网格时又会用旧顺序，
      * 用户会看到刚拖好的顺序「弹回去」。
+     *
+     * ★★ **必须当场 [renderTools] 重画**（2026-10-09 补）。拖拽期间变的是 `order` + 各格的
+     * `translation`，松手时 `PinnedStripView.finishDrag` 会把 translation 全部归零、上层再回传新顺序
+     * ——**如果没人重建，屏幕上留下的就是「归零后」的排列，也就是拖动前那一套**，用户看到的是
+     * 「拖完自己弹回去了、根本没挪动」（用户 2026-10-09：「想挪到最后一个挪不过去」）。
+     * 另外两条（「已选」/ 底栏）各有 `syncSelector()` / `syncDock()` 在同一个回调里兜着，
+     * **只有工具页这一条漏了**。
      */
     private fun commitToolReorder(order: List<ComponentName>) {
         val ids = order.mapNotNull { component -> SystemTools.specOf(component)?.id }
@@ -2388,6 +2395,9 @@ class AppDrawerPanel(
         if (reordered.isNotEmpty()) tools = reordered
         DebugLog.info("TOOLS_REORDERED", next.joinToString(" > "))
         onReorderTools(next)
+        renderTools()
+        // 工具网格的高度可能变了（换行数变化），底部留白要跟着重算——与 [refreshContent] 同一套。
+        if (::toolsBody.isInitialized) toolsBody.post { syncToolsInset() }
     }
 
     // ---- 「已选」区（轮盘固定项） ----
@@ -2630,7 +2640,7 @@ class AppDrawerPanel(
      */
     private fun toggleHintBubble() {
         if (!::selectorHint.isInitialized || !::hintToggle.isInitialized) return
-        Haptics.tick(context)
+        Haptics.tick(context, Haptics.Source.OTHER)
         if (hintBubble != null) {
             dismissHintBubble()
             return
@@ -3041,9 +3051,15 @@ class AppDrawerPanel(
 
     // ---- 长按操作卡 ----
 
-    private fun showPinAction(entry: AppEntry) {
+    private fun showPinAction(entry: AppEntry, haptic: Boolean = true) {
         dismissPinAction()
-        Haptics.confirm(context)
+        // ★ [haptic] 决定「这里要不要补一记」——两条调用路径的答案不一样，两处都写着用户报过的
+        //   那个现象：**同一次长按响两下**。
+        //   - 应用页网格（[buildGridItem] 的长按）：这条手势没有「起拖」那一步，长按的确认感
+        //     只能由这里给 ⇒ **给**（默认）。
+        //   - 工具页网格（[PinnedStripView] 的 `onLongPress`）：那条开的是「长按拖 = 排序」，
+        //     起拖时 `beginDrag` 已经 confirm 过一记，这里再补就是第二记 ⇒ **不给**。
+        if (haptic) Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
         val pinned = isPinned(entry.component)
         val docked = isDocked(entry.component)
 
@@ -3108,7 +3124,7 @@ class AppDrawerPanel(
                 if (error != null) {
                     status.text = error
                     status.setTextColor(WARN_COLOR)
-                    Haptics.tick(context)
+                    Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
                     return@sheetButton
                 }
                 pinnedOrder =
@@ -3120,7 +3136,7 @@ class AppDrawerPanel(
                 syncSelector()
                 adapter.notifyDataSetChanged()
                 refreshContent()
-                Haptics.confirm(context)
+                Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
                 dismissPinAction()
             },
         )
@@ -3133,7 +3149,7 @@ class AppDrawerPanel(
                 if (error != null) {
                     status.text = error
                     status.setTextColor(WARN_COLOR)
-                    Haptics.tick(context)
+                    Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
                     return@sheetButton
                 }
                 dockOrder =
@@ -3143,7 +3159,7 @@ class AppDrawerPanel(
                         (dockOrder + entry.component).toMutableList()
                     }
                 syncDock()
-                Haptics.confirm(context)
+                Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
                 dismissPinAction()
             },
         )
@@ -3201,7 +3217,7 @@ class AppDrawerPanel(
         refreshSelectorHint()
         adapter.notifyDataSetChanged()
         refreshContent()
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     /** 管理模式里点「已选」条上的图标：移出轮盘。 */
@@ -3211,14 +3227,14 @@ class AppDrawerPanel(
         if (error != null) {
             selectorHint.setTextColor(WARN_COLOR)
             selectorHint.text = error
-            Haptics.tick(context)
+            Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
             return
         }
         pinnedOrder = pinnedOrder.filterNot { it == entry.component }.toMutableList()
         syncSelector()
         adapter.notifyDataSetChanged()
         refreshContent()
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     /** 管理模式里点底栏上的图标：移出底栏。 */
@@ -3228,12 +3244,12 @@ class AppDrawerPanel(
         if (error != null) {
             selectorHint.setTextColor(WARN_COLOR)
             selectorHint.text = error
-            Haptics.tick(context)
+            Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
             return
         }
         dockOrder = dockOrder.filterNot { it == entry.component }.toMutableList()
         syncDock()
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     /**
@@ -3247,7 +3263,7 @@ class AppDrawerPanel(
         if (error != null) {
             selectorHint.setTextColor(WARN_COLOR)
             selectorHint.text = error
-            Haptics.tick(context)
+            Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
             return
         }
         pinnedOrder =
@@ -3260,7 +3276,7 @@ class AppDrawerPanel(
         syncSelector()
         adapter.notifyDataSetChanged()
         refreshContent()
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     // ---- 列表 Adapter ----
@@ -3379,7 +3395,7 @@ class AppDrawerPanel(
      */
     private fun clearRecent() {
         if (recentOrder.isEmpty()) return
-        Haptics.tick(context)
+        Haptics.tick(context, Haptics.Source.OTHER)
         onClearRecent()
         recentOrder = emptyList()
         flatItems = buildFlatItems()
@@ -3432,6 +3448,31 @@ class AppDrawerPanel(
                 layoutParams =
                     LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 isClickable = true
+                // ★ 关掉**框架自己**的长按触感（用户报的「应用页长按震两下」）。
+                //
+                // `View.performLongClickInternal` 在长按判定成立时会**无条件**补一记
+                // `performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)`（= constant 0），
+                // 和下面那个长按监听返回 true / false **无关**。真机 logcat 实证（ColorOS 17）：
+                //
+                // ```
+                // vibrate is ... opPkg=io.github.msecret.flymefreeform,
+                //   effect=…OplusVibrationEffectSegment{mEffectStrength=-1}…,
+                //   reason=performHapticFeedback(constant=0): ViewRootImpl#performHapticFeedback
+                // ```
+                //
+                // 它和我们 [showPinAction] 里那记 `Haptics.confirm` 同时发出 ⇒ 一次长按紧挨着**两下**
+                // （管理模式长按本来什么也不做，那记框架触感也照样响——用户说「管理模式没事」
+                // 就是这个「一下」）。两记出自两个不同的 effect（框架那记 `mEffectStrength=-1`、
+                // 我们那记 = 定长震动），所以是能听出来的两下。
+                //
+                // 只关「框架发起」的触感：`performHapticFeedback` 会先问 `isHapticFeedbackEnabled()`，
+                // 关掉之后这一记就没了；而 [Haptics] 是直接找 `Vibrator` 服务的，**不受影响**，
+                // 「长按弹操作卡」的确认感仍由我们给，且**只给一次**。
+                //
+                // 不反过来留框架那记的原因：它走 `ViewRootImpl` → 系统通道，在悬浮窗（Service 里的
+                // `TYPE_APPLICATION_OVERLAY`）上未必稳（见 [Haptics] 开头那几条教训），我们那记才
+                // 每次都响。管理模式下长按现在**完全静音**——那一下本来就没有任何动作。
+                isHapticFeedbackEnabled = false
                 setOnClickListener {
                     if (actionLayers.isNotEmpty()) return@setOnClickListener
                     if (manageMode) {

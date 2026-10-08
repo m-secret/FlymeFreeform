@@ -92,6 +92,12 @@
             android:exported="false"
             android:label="更多面板" />
 
+        <!-- 触感（振动）：总开关 + 轮盘 / 面板切页 / 长按 / 索引四处开关。 -->
+        <activity
+            android:name=".HapticSettingsActivity"
+            android:exported="false"
+            android:label="触感" />
+
         <!-- 图标：来源选择 + 「默认 vs 当前来源」的对比预览。 -->
         <activity
             android:name=".IconSettingsActivity"

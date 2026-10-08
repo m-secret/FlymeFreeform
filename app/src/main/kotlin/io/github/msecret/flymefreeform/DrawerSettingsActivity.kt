@@ -9,7 +9,7 @@ import android.view.View
  *
  * 面板本身是 Service 里的悬浮 View，它的行为参数没有别的地方可放，集中在这里：
  *
- * 0. **能不能从轮盘进来**——存 `SettingsStore.hideMoreEntry`。它和「主动呼出与轮盘设置」页里
+ * 0. **能不能从轮盘进来**——存 `SettingsStore.hideMoreEntry`。它和「主动呼出与轮盘」页里
  *    那个「隐藏「更多」入口」是**同一个设置项**，两处读写同一份数据，改哪边另一边都跟着变；
  * 1. **打开时默认显示哪一页**（应用 / 工具）——存 `SettingsStore.drawerDefaultTab`，
  *    面板每次弹出都从这一页开始；
@@ -78,7 +78,7 @@ class DrawerSettingsActivity : Activity() {
 
         // ---- 入口 ----
         //
-        // 和「主动呼出与轮盘设置」页里那个开关是**同一个设置项**（`SettingsStore.hideMoreEntry`）：
+        // 和「主动呼出与轮盘」页里那个开关是**同一个设置项**（`SettingsStore.hideMoreEntry`）：
         // 两处都能改、改哪边另一边都跟着变（用户 2026-10-08 要求「数据源一致」）。放在这一页
         // 是因为它的作用就是「进不进得来这个面板」，用户在这儿最容易想到它。
         root.addView(Ui.sectionTitle(this, "入口"))

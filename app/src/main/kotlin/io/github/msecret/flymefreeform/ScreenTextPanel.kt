@@ -212,7 +212,7 @@ class ScreenTextPanel(
                 manager.setPrimaryClip(ClipData.newPlainText("识屏", text))
                 true
             }.getOrDefault(false)
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.OTHER)
         button.text = if (copied) "已复制 ✓" else "复制失败"
         // 一秒后还原按钮文案，方便连续复制。
         button.postDelayed({ runCatching { button.text = "复制全部" } }, COPY_FEEDBACK_MS)

@@ -14,7 +14,11 @@ import android.widget.Switch
 import android.widget.TextView
 
 /**
- * 「主动呼出」二级设置页（Material 3 版面）。
+ * 「主动呼出与轮盘」二级设置页（Material 3 版面）。
+ *
+ * ⚠️ 页名 2026-10-09 去掉了「设置」二字（原「主动呼出与轮盘设置」）。理由是「功能」tab
+ * 「呼出与触感」那一节里另外两行是「更多面板」「触感」，**都不带「设置」后缀**，只有它带；
+ * 而且它本身就在设置里，后缀是废话。**入口行名与页内大标题要一致**，别只改一个。
  *
  * 从主设置页拆出来：主页面被授权、手势、窗外关闭、应用管理、日志等塞得太长，
  * 这里只放与「主动呼出 / 轮盘设置」相关的设置项。
@@ -183,7 +187,7 @@ class CornerSettingsActivity : Activity() {
 
     private fun buildContent(): View {
         val root = Ui.pageRoot(this)
-        root.addView(Ui.title(this, "主动呼出"))
+        root.addView(Ui.title(this, "主动呼出与轮盘"))
 
         // ---- 触摸区 ----
         //
@@ -373,15 +377,10 @@ class CornerSettingsActivity : Activity() {
                         store.menuScrimPercent = value
                     },
                 )
-                .row(
-                    Ui.switchRow(
-                        this,
-                        "划过图标时震动",
-                        store.menuHapticEnabled,
-                    ) { checked ->
-                        store.menuHapticEnabled = checked
-                    },
-                )
+                // ⚠️ 「划过图标时震动」2026-10-09 挪到了「功能」tab →「触感」页：触感现在是一整块
+                // 设置（总开关 + 轮盘 / 面板切页 / 长按 / 索引），散在各自主页里就没法对照着调。
+                // **别在这里再加回来** —— 同一个开关出现在两处，用户在一边关掉、去另一边看还是
+                // 开着的，只会以为设置没生效。
                 .row(
                     Ui.switchRow(
                         this,

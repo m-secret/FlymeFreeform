@@ -619,7 +619,7 @@ class RadialMenuView(context: Context) : View(context) {
     /** 滑到一个新图标时的轻触感，见 [Haptics]。带上自己这个 View，最后一级兜底要走系统通道。 */
     private fun hapticTick() {
         if (!hapticEnabled) return
-        Haptics.tick(context)
+        Haptics.tick(context, Haptics.Source.RADIAL)
     }
 
     override fun onDraw(canvas: Canvas) {

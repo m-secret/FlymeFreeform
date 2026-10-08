@@ -479,7 +479,7 @@ class IconSettingsActivity : Activity() {
                     addView(
                         Ui.rowDetail(
                             this@IconSettingsActivity,
-                            "按轮盘里图标的实际大小画的（那个大小在「主动呼出与轮盘设置」里调）。" +
+                            "按轮盘里图标的实际大小画的（那个大小在「主动呼出与轮盘」里调）。" +
                                 "每个应用一列：上面默认、下面当前来源，两排一样大就是对齐了。",
                         ),
                     )

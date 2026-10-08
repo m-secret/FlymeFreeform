@@ -37,7 +37,7 @@ import java.util.concurrent.Executors
  * ## 三条配置区（用户 2026-10-08：「能不能像面板里面一样长按排序删除」+「工具页的排序也支持在
  * 应用里面处理。底栏也是支持排序和添加删除」）
  *
- * 从上到下：**已固定（轮盘）→ 工具页的顺序 → 底栏**。三条都是同一个 [PinnedStripView]，
+ * 从上到下：**轮盘 → 工具页的顺序 → 底栏**。三条都是同一个 [PinnedStripView]，
  * 也就是「更多面板」里「已选」条与底栏用的那个控件，所以手感完全一致：
  *
  * - **长按拎起来 → 拖到位 → 松手** = 排序（越位换位、震动反馈都是那一套）；
@@ -49,7 +49,7 @@ import java.util.concurrent.Executors
  * 「添加」不在这三条上做，而在下面每行的两颗药丸里（见 [membershipToggle]）：**轮盘**和
  * **底栏**是两份互相独立的配置，一行里并排摆出来，看一眼就知道这个应用在哪一路、点一下就切。
  *
- * **重置**（已固定 / 底栏「清空」、工具页「恢复默认」）挂在各条标签行的**右端**（见 [sectionLabel]）：
+ * **重置**（轮盘 / 底栏「清空」、工具页「恢复默认」）挂在各条标签行的**右端**（见 [sectionLabel]）：
  * 顺序在哪儿改，重置就在哪儿。这是用户同一天的第二条意见——原先这三个动作留在「更多面板」
  * 设置页里，而排序入口在这一页，同一件事被劈成两处（「不觉得很割裂吗，工具页恢复放在了更多
  * 面板设置里」）。
@@ -97,10 +97,14 @@ class AppManagementActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         setContentView(buildContent())
+        // **先挂监听、再读目录**：反过来的话，目录读完那一拍（`render`）与服务"喊了一声"挤在
+        // 同一瞬间时，那次通知会因为监听还没挂上而丢掉，页面就停在旧状态。
+        SettingsEvents.addListener(panelChangeListener)
         loadApps()
     }
 
     override fun onDestroy() {
+        SettingsEvents.removeListener(panelChangeListener)
         worker.shutdownNow()
         super.onDestroy()
     }
@@ -117,7 +121,7 @@ class AppManagementActivity : Activity() {
         )
         // 计数：**刻意不用 `Ui.pill`**。
         //
-        // 那个胶囊是给「已固定 2」这种**短标签**设计的（11sp 粗体 + primaryContainer 底色），
+        // 那个胶囊是给「轮盘 2」这种**短标签**设计的（11sp 粗体 + primaryContainer 底色），
         // 塞进「工具 4 个 · 应用 12 个」这种长文本之后，就变成一条又宽又重的绿色药丸，
         // 夹在说明文字和下面的区块标题之间，**比区块标题还抢眼**——用户 2026-10-08 说的
         // 「工具 x 个，应用 y 个那个样式不太协调」就是这个。
@@ -131,7 +135,7 @@ class AppManagementActivity : Activity() {
         root.addView(sectionsContainer)
 
         // ★ 配置区与搜索框之间**必须有这道实缝**。
-        // ⚠️ 底栏（或「已固定」）为空时，那一节最后落下来的是一段 `Ui.hint`，而它的
+        // ⚠️ 底栏（或「轮盘」）为空时，那一节最后落下来的是一段 `Ui.hint`，而它的
         //    **下边距只有 2dp**（见 `Ui.hint`）；搜索框自己也没有上边距。两者一叠，浅灰小字
         //    就紧贴着搜索框的浅灰底，看起来是「一整块」——用户 2026-10-08 报的
         //    「搜索应用和工具在底栏没有东西的情况下像是一块的」就是这里。
@@ -228,7 +232,7 @@ class AppManagementActivity : Activity() {
         val pinned = store.pinnedComponents
         val docked = store.dockComponents
         // 三块配置区各自的计数都写在自己的标签行里，所以这一行只报总量。
-        // 分隔符用 `·`，和页面上其它标签（「已固定 · 3 / 6」）保持一致。
+        // 分隔符用 `·`，和页面上其它标签（「轮盘 · 3 / 6」）保持一致。
         countView.text = "工具 ${toolEntries.size} 个 · 应用 ${appEntries.size} 个"
         renderSections(pinned, docked)
         val trimmed = keyword.trim()
@@ -261,19 +265,19 @@ class AppManagementActivity : Activity() {
         }
 
     /**
-     * 分块小标题，形状：`面板工具 · 12 个（已固定 2）`。
+     * 分块小标题，形状：`面板工具 · 12 个（轮盘 2）`。
      *
      * 用 M3 的 `titleSmall` + primary 色，和区块内那张卡一起构成一个分组。
      */
     private fun sectionTitle(title: String, entries: List<AppEntry>, pinned: List<ComponentName>): View {
         val fixed = entries.count { entry -> pinned.any { it == entry.component } }
-        return Ui.sectionTitle(this, "$title（已固定 $fixed）")
+        return Ui.sectionTitle(this, "$title（轮盘 $fixed）")
     }
 
     // ---- 三条配置区（轮盘 / 工具页 / 底栏） ----
 
     /**
-     * 三块配置区，从上到下：**已固定（轮盘）→ 工具页顺序 → 底栏**。
+     * 三块配置区，从上到下：**轮盘 → 工具页顺序 → 底栏**。
      *
      * 三块都是同一个 [PinnedStripView]（也就是「更多面板」里「已选」条与底栏用的控件），
      * 所以手感一致：长按拎起来 → 拖到位 → 松手落盘；长按后**不拖动**松手算一次点击。
@@ -295,22 +299,24 @@ class AppManagementActivity : Activity() {
         sectionsContainer.removeAllViews()
         // 区块标题 2026-10-08 由「轮盘与面板」改成「**图标与顺序**」（用户：「名字现在也不合适了」）：
         // 下面三条里轮盘只占一条，另外两条是**工具页顺序**和**底栏**，老标题把它们全漏了；
-        // 而且三条的标签自己就写着「已固定 / 工具页顺序 / 底栏」，标题再列一遍名字是重复的。
+        // 而且三条的标签自己就写着「轮盘 / 工具页顺序 / 底栏」，标题再列一遍名字是重复的。
         // 现在这个标题只说这一节是干什么的：**放哪些图标、按什么顺序**。
         sectionsContainer.addView(Ui.sectionTitle(this, "图标与顺序"))
 
         // 已卸载的项会被 [byComponent] 滤掉——存储里可能还留着它，但这里不该画空格子。
         addSection(
-            label = "已固定 · ${pinned.size} / ${SettingsStore.MAX_PINS}",
+            label = "轮盘 · ${pinned.size} / ${SettingsStore.MAX_PINS}",
             actionText = "清空",
             onAction = { confirmClearPins() },
+            // ★ 空了就没有可清的东西，那颗药丸**不出现**（用户 2026-10-09：「清空也是」）。
+            showAction = pinned.isNotEmpty(),
             // ★ **倒序提交**。这一条**从左往右 = 轮盘自上而下**，和「更多」面板里那条「已选」
             //   口径完全一致（`AppDrawerPanel.syncSelector` 里那句 `pinnedOrder.reversed()`）。
             //   `SettingsStore.pinnedComponents` 存的是**轮盘顺序**：首位 = 紧挨「更多」的那一格，
             //   也就是轮盘**最下面**那格。横着摆出来必须翻过来才和轮盘对得上。
             //   用户 2026-10-08 报的「设置里顺序和『更多』是反的」，就是这一处漏了翻转。
             entries = pinned.reversed().mapNotNull { byComponent[it] },
-            emptyHint = "还没固定任何应用。在下面点「轮盘」那颗药丸，它就会出现在这里和轮盘上。",
+            emptyHint = "轮盘还是空的。在下面点「轮盘」那颗药丸，它就会出现在这里和轮盘上。",
             onTap = { entry -> confirmRemovePin(entry) },
             onReorder = { ordered ->
                 // 条上回传的是**显示顺序**（从左到右），落盘前要翻回存储用的轮盘顺序——
@@ -323,19 +329,26 @@ class AppManagementActivity : Activity() {
             label = "工具页顺序 · ${toolEntries.size} 个",
             actionText = "恢复默认",
             onAction = { resetToolOrder() },
+            // ★ 顺序**本来就没动过**时，这颗药丸没有意义，不出现（用户 2026-10-09：
+            //   「恢复默认顺序隐藏如果顺序没动过」）。拖过一次、或旧配置里存着和默认不同的
+            //   次序，它才会重新露出来。
+            showAction = toolOrderChanged(),
             entries = toolsInOrder(),
             emptyHint = null,
             onTap = { toast("长按拖动可调整「更多 › 工具」页里的顺序") },
             onReorder = { ordered ->
-                // 只认工具 id，落盘即可——面板下次打开会按新顺序重建（见 AppDrawerPanel.commitToolReorder）。
+                // 只认工具 id 落盘，然后**通知服务重读**——服务里那份 `toolEntries` 是启动时的快照，
+                // 不通知的话「更多 › 工具」还按旧顺序画（见 [refreshTools]）。
                 store.toolOrder = ordered.mapNotNull { component -> SystemTools.specOf(component)?.id }
-                refreshPins()
+                refreshTools()
             },
         )
         addSection(
             label = "底栏 · ${docked.size} / ${SettingsStore.MAX_DOCK}",
             actionText = "清空",
             onAction = { confirmClearDock() },
+            // ★ 同「轮盘」：空的时候没有可清的东西，药丸隐藏。
+            showAction = docked.isNotEmpty(),
             entries = docked.mapNotNull { byComponent[it] },
             emptyHint = "底栏还是空的。在下面点「底栏」那颗药丸，把常用的放进面板下方那一行。",
             onTap = { entry -> confirmRemoveDock(entry) },
@@ -347,9 +360,25 @@ class AppManagementActivity : Activity() {
     }
 
     /**
+     * 「工具页顺序」是否**已经偏离**默认次序。
+     *
+     * 判据是**和 [SystemTools.specs] 的次序逐项比对**，不是「存储里有没有写过值」：
+     * [SettingsStore.toolOrder] 的 getter 会把缺失的工具按默认顺序补齐，所以它任何时候都
+     * 返回一份**完整**列表——没动过的时候，这份列表恰好就等于 `specs` 的 id 序列。
+     * 反过来，只要用户拖过一格，或者老配置里存着一份和现在不同的次序（含已下线工具被剔除后
+     * 剩下的那部分），这里就会判成「动过」，把「恢复默认」露出来。
+     *
+     * 只在 [renderSections] 里用一次；`store.toolOrder` 每次读都要解析字符串，但这一页
+     * 一屏只有三条，代价可以忽略。
+     */
+    private fun toolOrderChanged(): Boolean =
+        store.toolOrder != SystemTools.specs.map { it.id }
+
+    /**
      * 一块配置区：**一张白底圆角卡片**里装「一行标签 + 图标条」。
      *
-     * 标签行左 = 名字 + 计数，右 = 这一条自己的重置动作（清空 / 恢复默认）。
+     * 标签行左 = 名字 + 计数，右 = 这一条自己的重置动作（清空 / 恢复默认；**没东西可重置时整颗不出现**，
+     * 见 [sectionLabel] 与 `showAction`）。
      *
      * ## ★ 卡片是 2026-10-08 用户要求加回来的（「每一个像别的一样有个遮罩是不是更好看」）
      *
@@ -375,6 +404,7 @@ class AppManagementActivity : Activity() {
         emptyHint: String?,
         onTap: (AppEntry) -> Unit,
         onReorder: (List<ComponentName>) -> Unit,
+        showAction: Boolean = true,
     ) {
         val padV = Ui.dp(this, SECTION_CARD_PADDING_V)
         val card =
@@ -387,7 +417,7 @@ class AppManagementActivity : Activity() {
                     }
                 setPadding(Ui.dp(this@AppManagementActivity, Ui.ROW_PADDING_H), padV, Ui.dp(this@AppManagementActivity, Ui.ROW_PADDING_H), padV)
             }
-        card.addView(sectionLabel(label, actionText, onAction))
+        card.addView(sectionLabel(label, if (showAction) actionText else null, onAction))
         if (entries.isEmpty()) {
             if (emptyHint != null) card.addView(Ui.hint(this, emptyHint))
         } else {
@@ -406,7 +436,11 @@ class AppManagementActivity : Activity() {
     }
 
     /**
-     * 标签行：`已固定 · 3 / 6` + 右侧一颗重置动作（清空 / 恢复默认）。
+     * 标签行：`轮盘 · 3 / 6` + 右侧一颗重置动作（清空 / 恢复默认）。
+     *
+     * ⚠️ 右侧那颗是**可缺省**的（`actionText = null` ⇒ 不画）：**没东西可重置时它就该消失**——
+     * 空条目的「清空」、没动过顺序的「恢复默认」，摆在上面只会让人点一下吃个 toast
+     * （用户 2026-10-09：「恢复默认顺序隐藏如果顺序没动过，清空也是」）。判据在调用点。
      *
      * 这里**不用 `Ui.sectionTitle`**：那个是「区块标题」，自带 30dp 的上间距，三块叠起来就是
      * 90dp 的空白。三条并排时它们只是**组内的小标签**，用 [Ui.rowTitle] 的正文字号就够了。
@@ -421,7 +455,7 @@ class AppManagementActivity : Activity() {
      * 提示语（「长按拖动排序 · 点按移出」）从这一行去掉了，统一由页面顶部那段 [Ui.hint] 交代——
      * 一行里塞「名字 + 计数 + 提示 + 按钮」在窄屏上必然折行。
      */
-    private fun sectionLabel(label: String, actionText: String, onAction: () -> Unit): View {
+    private fun sectionLabel(label: String, actionText: String?, onAction: () -> Unit): View {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -433,7 +467,12 @@ class AppManagementActivity : Activity() {
                 Ui.rowTitle(this@AppManagementActivity, label),
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
             )
-            addView(Ui.smallAction(this@AppManagementActivity, actionText, emphasized = false) { onAction() })
+            // ★ `actionText == null` ⇒ 这一条**当前没有可重置的东西**，整颗药丸不出现
+            //   （判据见各调用点的 `showAction`）。空出来的那点宽度被标题格的 `weight = 1`
+            //   吃掉，标签行高度不变、图标条也不会跟着动。
+            if (actionText != null) {
+                addView(Ui.smallAction(this@AppManagementActivity, actionText, emphasized = false) { onAction() })
+            }
         }
     }
 
@@ -544,10 +583,11 @@ class AppManagementActivity : Activity() {
     // ---- 三条各自的重置动作（原在「更多面板」设置页，2026-10-08 挪到这里） ----
 
     /**
-     * 清空「已固定」整条（= 轮盘里的全部固定项）。
+     * 清空「轮盘」整条（= 轮盘里的全部固定项）。
      *
      * 这比 [confirmRemovePin] 狠得多——一次撤掉用户一个个挑出来的东西，所以照样问一句。
-     * 已经空的时候直接提示，不弹一个空对话框。
+     * 空的时候直接提示，不弹一个空对话框（**正常路径下按钮已经隐藏了**，见 `showAction`，
+     * 这里只是防御）。
      */
     private fun confirmClearPins() {
         val count = store.pinnedComponents.size
@@ -557,7 +597,7 @@ class AppManagementActivity : Activity() {
         }
         AppDialog.show(
             activity = this,
-            title = "清空已固定",
+            title = "清空轮盘",
             message = "轮盘里的 **$count 个**固定项会一次性全部移出。应用本身不受影响，之后可以随时加回来。",
             positiveText = "清空",
         ) {
@@ -587,19 +627,32 @@ class AppManagementActivity : Activity() {
     /**
      * 工具页网格的顺序恢复成默认（[SystemTools.specs] 的次序）。
      *
-     * **刻意不弹确认**：它只是把顺序重排、没有删任何东西，再拖一次就回去了——和上面两个
-     * 「清空」不是一回事，套同一个确认框反而让人以为会丢东西。
+     * ★ 2026-10-09 **补上二次确认**。用户指出三条的重置动作不一致：「底栏的清空有二次确认，
+     * 但是已固定没有，工具栏恢复也没有」。（已固定其实一直有——[confirmClearPins] 里就是同一个
+     * [AppDialog]，用户多半是点到了**空条**那条只 toast 的路径。）真正缺的是这一条，现在三条
+     * 统一：**凡是要落盘改配置的，先问一句**。
+     *
+     * ⚠️ 这里原本写着「刻意不弹确认：它只是把顺序重排、没有删任何东西」——**那个理由不成立**：
+     * 用户一个个拖出来的顺序**本身就是他花过的功夫**，一键抹平照样该问。工具确实一个都不会少，
+     * 所以文案里要把这点说清楚，别让人以为会丢东西。
      */
     private fun resetToolOrder() {
-        store.toolOrder = SystemTools.specs.map { it.id }
-        refreshPins()
-        toast("工具页顺序已恢复默认")
+        AppDialog.show(
+            activity = this,
+            title = "恢复默认顺序",
+            message = "工具页的排列会回到**出厂次序**。工具本身一个都不会少，只是位置重排。",
+            positiveText = "恢复默认",
+        ) {
+            store.toolOrder = SystemTools.specs.map { it.id }
+            refreshTools()
+            toast("工具页顺序已恢复默认")
+        }
     }
 
     private fun row(entry: AppEntry, pinned: List<ComponentName>, docked: List<ComponentName>): View {
         val rank = pinned.indexOfFirst { it == entry.component }
         val inPinned = rank >= 0
-        // 序号露出**「已固定」条里的显示位次**（0 = 条的最左端 = 轮盘最上面那一格），
+        // 序号露出**「轮盘」条里的显示位次**（0 = 条的最左端 = 轮盘最上面那一格），
         // 和上面那一条的左右顺序一一对应。
         // ⚠️ 不能直接拿存储下标当序号：条是**倒序**显示的（见 [renderSections]），
         // 存储首位其实是轮盘最下面、排在条的最右端。
@@ -702,6 +755,43 @@ class AppManagementActivity : Activity() {
     /** 固定项 / 底栏 / 工具顺序变了：重算轮盘，再重排版面。 */
     private fun refreshPins() {
         OverlayGestureService.refreshPins(this)
+        render()
+    }
+
+    /**
+     * 工具页顺序变了：通知正在跑的呼出服务**重读工具清单**，再重画本页。
+     *
+     * ★ 通知这一步不能省：服务里那份 `toolEntries` 是它启动时的快照，
+     * 只有装/卸载广播才会重读。少了这一句，本页拖好的顺序就传不到「更多 › 工具」
+     * ——用户 2026-10-09 报的「工具里的顺序和更多里的不同步」正是这条。
+     * 本页自己那条顺序**一直是对的**（[toolsInOrder] 每次 [render] 现读 `store.toolOrder`），
+     * 所以两端不一致时，错的一定是「更多」那边。
+     */
+    private fun refreshTools() {
+        reloadTools()
+        OverlayGestureService.refreshTools(this)
+    }
+
+    /**
+     * 「面板在别处改了设置」的回调（见 [SettingsEvents]）。
+     *
+     * 面板是悬浮窗 —— 不占焦点、也不让本页暂停，所以本页**收不到 `onResume`、
+     * 也收不到 `onWindowFocusChanged`**，只能靠这条通道。用户 2026-10-09 报的
+     * 「在管理应用里呼出面板，面板里调了之后下面的应用页没更新，得退出重进才行」就是它。
+     */
+    private val panelChangeListener: () -> Unit = {
+        if (!isFinishing && !isDestroyed) reloadTools()
+    }
+
+    /**
+     * 重读工具清单 + 重建反查表 + 重画本页。
+     *
+     * 工具就十来条静态表，重读很便宜；**刻意不碰 `appEntries`** —— 那个要跑 `AppCatalog.load`
+     * （给每个应用解析图标再裁圆角，几百毫秒），而面板改不了「装了哪些应用」。
+     */
+    private fun reloadTools() {
+        toolEntries = SystemTools.load(this)
+        byComponent = (toolEntries + appEntries).associateBy { it.component }
         render()
     }
 

@@ -348,6 +348,18 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 applyPins()
                 return START_STICKY
             }
+            // 工具页顺序变了（管理页拖过 / 「恢复默认」，或面板里拖过）：只重读工具清单。
+            //
+            // ★ 不重读的话，服务里那份 [toolEntries] 会一直停在**启动那一刻**的快照上：
+            //   用户刚在「管理应用 › 工具页顺序」里拖好，回到「更多 › 工具」看到的还是旧顺序
+            //   （用户 2026-10-09 报的「工具里的顺序和更多里的不同步」就是这条）。
+            //   工具是十来条静态表，重读只花几次 PackageManager 查询，不像 [ACTION_REFRESH_APPS]
+            //   那样要跑一遍 LauncherApps 给每个应用解析图标再裁圆角。
+            ACTION_REFRESH_TOOLS -> {
+                startAsForeground()
+                applyTools()
+                return START_STICKY
+            }
             // 预览触摸区：给触摸条涂半透明色，设置页调参数时用来定位。开/关由 extra 控制。
             ACTION_PREVIEW -> {
                 startAsForeground()
@@ -1202,17 +1214,40 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                             DRAWER_LAUNCH_DELAY_MS,
                         )
                     },
-                    onTogglePin = { entry -> togglePin(entry) },
+                    // ⚠️ 下面五处**改完设置都要 [notifyPanelChanged]**：面板是「不占焦点、也不让
+                    // 下面的 Activity 暂停」的悬浮窗，所以底下那页（「管理应用」/ 首页）既不会
+                    // `onResume`、也不会 `onWindowFocusChanged` —— 没有任何机会知道自己该重画
+                    // （用户 2026-10-09：「面板里调了之后下面的应用页没更新，得退出重进才行」）。
+                    onTogglePin = { entry ->
+                        val failure = togglePin(entry)
+                        notifyPanelChanged()
+                        failure
+                    },
                     onReorderPins = { order ->
                         store.reorderPins(order)
                         applyPins()
+                        notifyPanelChanged()
                     },
-                    onToggleDock = { entry -> toggleDock(entry) },
-                    onReorderDock = { order -> store.reorderDock(order) },
-                    // 工具页拖拽排序：落盘即可。面板自身会同步本地顺序（见 commitToolReorder）。
+                    onToggleDock = { entry ->
+                        val failure = toggleDock(entry)
+                        notifyPanelChanged()
+                        failure
+                    },
+                    onReorderDock = { order ->
+                        store.reorderDock(order)
+                        notifyPanelChanged()
+                    },
+                    // 工具页拖拽排序：落盘 + **立刻把服务里那份 [toolEntries] 换成新顺序**。
+                    // 面板自身也重排了本地列表（见 `AppDrawerPanel.commitToolReorder`），但那只活
+                    // 在**这一个面板实例**里；服务那份不换，关掉再打开又回到旧顺序
+                    // （「刚拖好的顺序弹回去」）。
                     // **只影响工具页那个网格**——轮盘看 pinnedComponents、底栏看 dockComponents，
                     // 三处各管各的（用户明确不要联动）。
-                    onReorderTools = { ids -> store.toolOrder = ids },
+                    onReorderTools = { ids ->
+                        store.toolOrder = ids
+                        applyTools()
+                        notifyPanelChanged()
+                    },
                     onClearRecent = { store.clearRecent() },
                     onDismiss = { hideDrawer() },
                 )
@@ -1814,6 +1849,41 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     /**
+     * 重读**工具清单**并换上（顺序来自 `SettingsStore.toolOrder`，见 [SystemTools.load]）。
+     *
+     * 为什么不复用 [refreshApps]：那个要重新枚举全部已安装应用（每个都得解析图标再裁圆角，
+     * 几百毫秒），而工具是一张静态表、图标是当场画出来的十来个小位图 —— 重读可以忽略不计。
+     * 所以顺序一变就立刻换，不必等下一次「应用目录过期」。
+     *
+     * 换完必须 [applyPins]：[allApps] 变了，轮盘里固定着的工具要重挑一遍
+     * （也顺带处理「工具因为对方应用被卸载而消失」）。
+     */
+    private fun applyTools() {
+        worker.execute {
+            val tools = SystemTools.load(this)
+            handler.post {
+                toolEntries = tools
+                allApps = tools + appEntries
+                applyPins()
+                // 这一行同时是「顺序有没有传到位」的取证：它按**当时**的 prefs 读出来，
+                // 所以顺序一变就该出现一条新顺序的 TOOLS_LOADED。
+                DebugLog.info(
+                    "TOOLS_LOADED",
+                    "工具=${tools.size} ${tools.joinToString(" > ") { it.label }}",
+                )
+            }
+        }
+    }
+
+    /**
+     * 「面板里改了设置」→ 喊一声，让可能正显示着的「管理应用」页与首页自己重读。
+     *
+     * 只有**面板侧**的改动点该调它：界面自己发起的动作本来就立刻重画，再喊一次等于白重画一遍
+     * （「管理应用」页一次要重建八十几行列表）。为什么非喊不可，见 [SettingsEvents] 的类注释。
+     */
+    private fun notifyPanelChanged() = SettingsEvents.notifyChanged()
+
+    /**
      * 切换一个应用在轮盘里的固定状态。
      *
      * 返回 null 表示成功，否则是给用户看的失败原因——面板会把这句话直接显示在操作卡上。
@@ -2386,6 +2456,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         const val ACTION_START = "io.github.msecret.flymefreeform.action.START"
         const val ACTION_STOP = "io.github.msecret.flymefreeform.action.STOP"
         const val ACTION_REFRESH_PINS = "io.github.msecret.flymefreeform.action.REFRESH_PINS"
+        const val ACTION_REFRESH_TOOLS = "io.github.msecret.flymefreeform.action.REFRESH_TOOLS"
         const val ACTION_PREVIEW = "io.github.msecret.flymefreeform.action.PREVIEW"
         const val ACTION_PREVIEW_SYNC = "io.github.msecret.flymefreeform.action.PREVIEW_SYNC"
         const val ACTION_REFRESH_APPS = "io.github.msecret.flymefreeform.action.REFRESH_APPS"
@@ -2458,6 +2529,19 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             if (!isRunning) return
             context.startService(
                 Intent(context, OverlayGestureService::class.java).setAction(ACTION_REFRESH_APPS),
+            )
+        }
+
+        /**
+         * 工具页顺序变化后重读工具清单。服务没在跑就忽略（它下次启动会按新顺序读）。
+         *
+         * 和 [refreshPins] 对称：那个管轮盘固定项，这个管「更多 › 工具」那个网格的顺序 ——
+         * 两者都是**服务持有的快照**，改了 prefs 必须通知一声，否则就是「设置里变了、面板里没变」。
+         */
+        fun refreshTools(context: Context) {
+            if (!isRunning) return
+            context.startService(
+                Intent(context, OverlayGestureService::class.java).setAction(ACTION_REFRESH_TOOLS),
             )
         }
 

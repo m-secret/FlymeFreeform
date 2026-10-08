@@ -36,7 +36,7 @@ import java.util.concurrent.Executors
  * | tab | 放什么 |
  * | --- | --- |
  * | **首页** | 一张「前提检查表」：运行环境 + 权限三行 → 缺项提示 → `[启动主动呼出]` |
- * | **功能** | 分三节：页面设置（主动呼出与轮盘设置 / 更多面板）、应用与图标（管理应用 / 图标）、小窗（小窗关闭方式） |
+ * | **功能** | 分三节：呼出与触感（主动呼出与轮盘 / 更多面板 / 触感）、应用与图标（管理应用 / 图标）、小窗（小窗关闭方式） |
  * | **设置** | 「常规」（后台隐藏）/「备份与恢复」/「调试」（运行日志）/「关于」（一行入口 → [AboutActivity]）四节 |
  *
  * ## 区块标题：只有「功能」「设置」两格有
@@ -74,7 +74,7 @@ class MainActivity : Activity() {
     /**
      * 「功能」tab 卡片里的「图标」那一行。
      *
-     * 2026-10-08 从「主动呼出与轮盘设置」页搬来：图标来源是全局观感，不属于「呼出」那套参数。
+     * 2026-10-08 从「主动呼出与轮盘」页搬来：图标来源是全局观感，不属于「呼出」那套参数。
      * 标题随当前来源变（[updateIconSourceLabel]），**没有副标题**（见 [buildFeatureTab] 里那段）。
      *
      * 点它进 [IconSettingsActivity] —— 来源选择与「默认 vs 当前来源」的对比预览都在那一页
@@ -141,6 +141,17 @@ class MainActivity : Activity() {
     private val a11yConnectionListener: () -> Unit = { if (!isFinishing && !isDestroyed) refreshStatus() }
 
     /**
+     * 「面板在别处改了设置」（轮盘固定 / 底栏 / 工具顺序）→ 重刷状态。
+     *
+     * 面板是**不占焦点、也不让本页暂停**的悬浮窗，所以本页收不到 `onResume`：
+     * 用户在面板里把某个应用加进轮盘之后回来，「管理轮盘应用」那行的「已固定 N / 6」会停在旧值。
+     * 机制见 [SettingsEvents]。
+     */
+    private val panelChangeListener: () -> Unit = {
+        if (!isFinishing && !isDestroyed) refreshStatus()
+    }
+
+    /**
      * 「后台隐藏」：用户主动离开应用时，把整个 task 结束并移出「最近任务」。
      * 为什么必须逐个 Activity 挂、为什么不用别的 API，都写在 [AppContext.hideFromRecentsOnLeave]。
      */
@@ -179,6 +190,7 @@ class MainActivity : Activity() {
         // 顺手静默查一次更新（开关关着、或距上次不到设定频率就直接返回，见 [UpdateCenter]）。
         // ★ **先挂监听再查**：查到新版本时关于入口那一行要立刻亮起来。
         UpdateCenter.addListener(updateBadgeListener)
+        SettingsEvents.addListener(panelChangeListener)
         UpdateCenter.autoCheck(this)
     }
 
@@ -200,6 +212,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         FreeformAccessibilityService.removeConnectionListener(a11yConnectionListener)
         UpdateCenter.removeListener(updateBadgeListener)
+        SettingsEvents.removeListener(panelChangeListener)
         worker.shutdown()
         super.onDestroy()
     }
@@ -313,7 +326,7 @@ class MainActivity : Activity() {
      * 于是并列的两个标题成了**上位词与下位词**（权限本身就是状态的一种），语义上自相矛盾。
      *
      * 结论：这四行回答的是**同一个问题**——「为什么点了没反应 / 我还缺什么」，本来就该在一组里。
-     * 而[区块标题存在的条件是「有 ≥2 个组需要区分」]：「功能」tab 有「页面设置 / 应用与图标 / 小窗」
+     * 而[区块标题存在的条件是「有 ≥2 个组需要区分」]：「功能」tab 有「呼出与触感 / 应用与图标 / 小窗」
      * 三节、需要路标；首页只有这一组可枚举的行，标题不承担区分任务，纯占位。卡片自身
      * （白底圆角）已经是足够的分组信号。
      *
@@ -407,22 +420,26 @@ class MainActivity : Activity() {
      * - **「图标」挂在「面板」下面是错的**——图标来源是**全局**的：轮盘、更多面板、底栏共用
      *   同一套，放进「面板与图标」会让人以为它只管面板；
      * - **「管理应用」跟「呼出」没关系**——它管的是「轮盘里放哪些应用」＝**内容**，而
-     *   「主动呼出与轮盘设置」管的是「怎么呼出、轮盘多大」＝**外观与行为**，一个标题盖不住两样。
+     *   「主动呼出与轮盘」管的是「怎么呼出、轮盘多大」＝**外观与行为**，一个标题盖不住两样。
      *
      * 现在按用户给的分法：
      *
-     * - **页面设置**——怎么呼出、轮盘多大、面板什么行为（都是「这个页面怎么表现」）；
+     * - **呼出与触感**——怎么呼出、轮盘多大、面板什么行为、哪些动作震（都是「这个东西怎么表现」）；
      * - **应用与图标**——放哪些应用、这些应用长什么样（都是「内容与素材」）；
      * - **小窗**——小窗怎么关。
+     *
+     * ⚠️ 第一节 2026-10-09 从「页面设置」改成「**呼出与触感**」：加了「触感」这一行之后，
+     * 「页面设置」既和底栏那个「设置」tab 撞名，又和旁边两节的名词并列句式对不上；而「触感」
+     * 之所以不叫「反馈」——「反馈」在中文里首先被读成「提意见 / 问题反馈」。
      */
     private fun buildFeatureTab() {
         // ⚠️ 这里**不要**补顶部留白：本格第一个元素就是 [Ui.sectionTitle]，它自带
         // [Ui.SPACE_SECTION_TOP]，再叠一段就比「设置」多出整整 30dp（2026-10-09 修掉的那处
         // 三格不齐，错的一头正是这里多出来的那一份 —— 见 [TAB_TOP_GAP_DP]）。
         // 计数放**副标题**，和「更多面板 / 默认页 · 横屏位置」一个样式；塞进标题的话标题长短会随
-        // 计数跳（早先就是「管理应用（已固定 4 / 6）」）。初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
+        // 计数跳（早先就是「管理应用（轮盘 4 / 6）」）。初始值先给 0，`refreshStatus()` 会立刻刷成真实值。
         appManageButton =
-            Ui.entryRow(this, "管理应用", "已固定 0 / ${SettingsStore.MAX_PINS}") {
+            Ui.entryRow(this, "管理应用", "轮盘 0 / ${SettingsStore.MAX_PINS}") {
                 openPage(Intent(this, AppManagementActivity::class.java))
             }
         // 图标来源：标题写**当前**用的是哪一类。点它进 [IconSettingsActivity]（选择 + 对比
@@ -436,12 +453,27 @@ class MainActivity : Activity() {
                 openPage(Intent(this, IconSettingsActivity::class.java))
             }
 
-        // ---- 页面设置：怎么呼出、面板什么行为 ----
-        featureTab.addView(Ui.sectionTitle(this, "页面设置"))
+        // ---- 呼出与触感：怎么呼出、面板什么行为、震哪些动作 ----
+        //
+        // ⚠️ 「触感」这一行要在 [CardGroup.row] **之前**调 [Ui.setRowEnabled]：CardGroup 装行时
+        // 是看 `clickable` 决定刷不刷涟漪的（同「小窗关闭方式」那一行的处理），装完再压会留下
+        // 「灰的还能点」。判据只有一个：本机有没有振动马达（[Haptics.isSupported]）—— 平板整机
+        // 没有马达，那种机器上 `vibrate()` 不报错也不震，开关摆出来只会让人以为是我们没实现。
+        val hapticsUsable = Haptics.isSupported(this)
+        val hapticRow =
+            Ui.entryRow(
+                this,
+                "触感",
+                if (hapticsUsable) "轮盘 / 更多面板" else "本机无振动马达",
+            ) {
+                openPage(Intent(this, HapticSettingsActivity::class.java))
+            }
+        Ui.setRowEnabled(hapticRow, hapticsUsable)
+        featureTab.addView(Ui.sectionTitle(this, "呼出与触感"))
         featureTab.addView(
             CardGroup(this)
                 .row(
-                    Ui.entryRow(this, "主动呼出与轮盘设置") {
+                    Ui.entryRow(this, "主动呼出与轮盘") {
                         openPage(Intent(this, CornerSettingsActivity::class.java))
                     },
                 )
@@ -451,7 +483,8 @@ class MainActivity : Activity() {
                     Ui.entryRow(this, "更多面板", "默认页 / 横屏位置") {
                         openPage(Intent(this, DrawerSettingsActivity::class.java))
                     },
-                ),
+                )
+                .row(hapticRow),
         )
 
         // ---- 应用与图标：内容与素材 ----
@@ -831,7 +864,7 @@ class MainActivity : Activity() {
     // ---- 呼出晃动角度 ----
     //
     // 设置项 2026-10-08 已从这里的「调试」节挪进正式设置：
-    // 「功能」tab → 主动呼出与轮盘设置 → 轮盘设置 → 「呼出晃动」（滑块，0~60°）。
+    // 「功能」tab → 主动呼出与轮盘 → 轮盘设置 → 「呼出晃动」（滑块，0~60°）。
     // 数据仍是同一个 [SettingsStore.menuSwingDeg]，这里不再留任何入口。
 
     /**
@@ -994,7 +1027,7 @@ class MainActivity : Activity() {
         // 已经跑起来时永远允许点（那是「停止」），哪怕权限中途被撤。
         Ui.setButtonEnabled(serviceButton, OverlayGestureService.isRunning || overlayGranted)
         (appManageButton.tag as? Ui.RowTexts)?.detail?.text =
-            "已固定 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}"
+            "轮盘 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}"
         // 图标来源可能在别处（以后加别的入口）被改，回页面时对一次。
         updateIconSourceLabel()
         // 「更新与下载」入口的副标题要跟着「有没有新版本」变（自动检查在 [UpdateCenter] 里跑）。

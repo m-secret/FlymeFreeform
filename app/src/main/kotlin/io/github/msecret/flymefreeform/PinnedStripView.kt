@@ -18,6 +18,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import kotlin.math.abs
+import kotlin.math.floor
 
 /**
  * 轮盘固定项的排列条，对应魅族「More apps」面板顶部的 Selected 区。
@@ -237,9 +238,8 @@ class PinnedStripView(
     /** 竖排（[vertical]）时一个槽位的高度——纵向命中与换位都以它为单位。 */
     private var slotHeight = 0
 
-    /** 网格模式下：内容区左上角（= padding）与每格宽高。 */
+    /** 网格模式下：内容区左边缘（= paddingLeft）、每格宽高，以及行数换算用到的两个量（见 [gridRowAt]）。 */
     private var gridLeft = 0
-    private var gridTop = 0
     private var colWidth = 0
     private var rowHeight = 0
 
@@ -252,6 +252,15 @@ class PinnedStripView(
      * 会上移」（用户 2026-10-08 报的正是这个）。
      */
     private var rowStride = 0
+
+    /**
+     * 网格**第 0 行图标中心**在本视图坐标系里的 y —— 纵向命中与换位的基准。
+     *
+     * ⚠️ **不是行的顶边**：行的内容并不是从顶边就铺开的，槽位自己有内边距、图标又在 holder 里
+     * 垂直居中，图标中心落在行带 73/243 的位置。拿顶边当基准，边界就会偏到图标中心下方一大截
+     * （详见 [gridRowAt]）。
+     */
+    private var rowIconCenter0 = 0f
 
     private var iconSizePx = 0
 
@@ -536,14 +545,36 @@ class PinnedStripView(
     /**
      * 网格落点 → 槽位下标；落在网格外时按边界夹住。
      *
-     * 纵向按 [rowStride]（行高 + 行间距）换算，**不是** [rowHeight]：用行高会把落点一行行
-     * 往上"挤"，越靠下偏得越多（第 r 行差 r × 行距），点第一行图标的下沿会被认成第二行。
+     * 纵向走 [gridRowAt]（按「离哪一行的图标中心更近」定行），横向按 [colWidth] 等分——
+     * 两个轴都是「离谁的中心近就是谁」，手感一致。
+     *
+     * ⚠️ 纵向**别退回 `((y − paddingTop) / rowStride)` 那种"行带"算法**：那套把行的**顶边**当行的
+     * 中心，而图标中心其实在行带里 73/243 的位置（槽位内边距 + 图标在 holder 里居中），于是边界
+     * 落在图标中心下方 170px，而相邻两行图标中心的中点只有 121px。原因与数字见 [gridRowAt]。
      */
     private fun gridIndexAt(x: Float, y: Float): Int {
-        if (colWidth <= 0 || rowStride <= 0 || rowContainers.isEmpty()) return -1
+        if (colWidth <= 0 || rowContainers.isEmpty()) return -1
         val col = ((x - gridLeft) / colWidth).toInt().coerceIn(0, columns - 1)
-        val row = ((y - gridTop) / rowStride).toInt().coerceIn(0, rowContainers.lastIndex)
-        return row * columns + col
+        return gridRowAt(y) * columns + col
+    }
+
+    /**
+     * 网格纵向 → 行号：**离哪一行的图标中心更近就是哪一行**。
+     *
+     * ★ 2026-10-09 换掉「行带取整」那套，真机量的数字（面板工具网格，4 列）：
+     * 行距 243px、两行图标中心在 y=1278 / 1521，而**行带的边界**（当初那套算出来是 `paddingTop + rowStride`）在 1448
+     * —— 也就是「往上拖 73px 就换位、往下拖要 170px」，同一个动作两个方向差 **2.3 倍**。
+     * 「离哪行更近」的中点则是 121px，上下对称，也和横向（按列等分，边界正好落在两列中心的中点）
+     * 同一套口径。
+     *
+     * 用户的原话是「顺序很不好控制」「想挪到最后一个挪不过去」：往下拖时图标早就压住下面那一行了，
+     * 判定却还赖在上一行，非要再拖小半行才换。
+     */
+    private fun gridRowAt(y: Float): Int {
+        val rows = rowContainers.size
+        if (rows <= 1 || rowStride <= 0) return 0
+        val v = (y - rowIconCenter0) / rowStride
+        return floor(v + 0.5f).toInt().coerceIn(0, rows - 1)
     }
 
     // ---- 触摸：单击 / 长按 / 拖拽 ----
@@ -597,7 +628,8 @@ class PinnedStripView(
                     draggedPointerX = event.x
                     draggedPointerY = event.y
                     applyDraggedTranslation()
-                    moveDraggedTo(positionAt(event.x, event.y))
+                    // 换位判定读的是**被拖项自己的中心**（不是手指），所以必须在平移之后算。
+                    moveDraggedTo(positionAt())
                     refreshSiblings(animate = true)
                     return true
                 }
@@ -727,23 +759,47 @@ class PinnedStripView(
         parent?.requestDisallowInterceptTouchEvent(false)
     }
 
-    /** 手指所在的虚拟位次，也就是被拖项应当占据的位置。 */
-    private fun positionAt(x: Float, y: Float): Int {
+    /** 被拖项此刻的**视觉中心**（本视图坐标系，含跟手平移）。 */
+    private fun draggedCenterX(): Float {
+        val slot = slots.getOrNull(draggedIndex) ?: return 0f
+        return slotOriginLeft(draggedIndex) + slot.root.translationX +
+            slot.iconHolder.left + slot.iconHolder.width / 2f
+    }
+
+    /** 同上，纵轴。 */
+    private fun draggedCenterY(): Float {
+        val slot = slots.getOrNull(draggedIndex) ?: return 0f
+        return slotOriginTop(draggedIndex) + slot.root.translationY +
+            slot.iconHolder.top + slot.iconHolder.height / 2f
+    }
+
+    /**
+     * 被拖项此刻该占的位次（也就是它松手后会落在哪一格）。
+     *
+     * ★ **按被拖项自己的中心算，不按手指**（2026-10-09 改）。手指按住图标的哪一点是随机的，
+     * 而「要拖多远才换位」= 边界 − 手指起点，于是**抓哪儿就偏多少**：一格才 180~200px
+     * （面板 4 列 ≈199px、管理应用页 6 列 ≈180px），抓在图标上沿/下沿一指就偏 60px ≈ 1/3 格。
+     * 症状正是「明明已经拖到那一格了，它就是不肯换过来」——用户按在图标下沿，图标自己早压在下一行上，
+     * 判定却还留在上一行（2026-10-09：「想挪到最后一个挪不过去」）。
+     *
+     * 换成被拖项自己的中心之后，抓哪儿都一样，而且判定依据和用户眼睛盯的东西（图标本身）同源。
+     */
+    private fun positionAt(): Int {
         if (slots.isEmpty()) return 0
         val index =
             when {
                 vertical -> {
                     if (slotHeight <= 0) return 0
                     val base = slots.first().root.top
-                    ((y - base) / slotHeight).toInt()
+                    ((draggedCenterY() - base) / slotHeight).toInt()
                 }
 
-                columns > 0 -> gridIndexAt(x, y)
+                columns > 0 -> gridIndexAt(draggedCenterX(), draggedCenterY())
 
                 else -> {
                     if (slotWidth <= 0) return 0
                     val base = slots.first().root.left
-                    ((x - base) / slotWidth).toInt()
+                    ((draggedCenterX() - base) / slotWidth).toInt()
                 }
             }
         return index.coerceIn(0, slots.size - 1)
@@ -768,7 +824,7 @@ class PinnedStripView(
             }
         // 嵌在可滚动容器里时，此刻才把滚动手势从外层抢回来——否则手指一横移就被外层滚走。
         if (nestedScroll) requestDisallowInterceptTouchEvent(true)
-        Haptics.confirm(context)
+        Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     /**
@@ -793,7 +849,7 @@ class PinnedStripView(
         if (current < 0 || current == target) return
         order.removeAt(current)
         order.add(target, draggedIndex)
-        Haptics.tick(context)
+        Haptics.tick(context, Haptics.Source.PANEL_LONG_PRESS)
     }
 
     /**
@@ -824,7 +880,7 @@ class PinnedStripView(
                 columns > 0 -> {
                     // 目标位置 = **「自然位次 = position」的那一格自己**的位置。
                     //
-                    // ⚠️ 别再写成 `gridTop + row * rowHeight`：那套等距公式把行间距
+                    // ⚠️ 别再写成 `行顶边 + row * rowHeight`：那套等距公式把行间距
                     // [gridRowGapPx] 漏掉了，第 r 行的目标位置会比它的真实位置高 r × 行距，
                     // 于是一起拖的时候下面几行的图标**整体往上跳一截**（用户 2026-10-08 报的
                     // 「工具页顺序的工具按住了图标会上移」）。槽位的真实坐标（[slotOriginLeft]
@@ -880,10 +936,15 @@ class PinnedStripView(
         val reordered = order.mapNotNull { slots.getOrNull(it)?.entry?.component }
         // 顺序没变就别惊动上层：空跑一次会让面板白白重建一回。
         if (reordered.isNotEmpty() && reordered != slots.map { it.entry.component }) {
-            Haptics.confirm(context)
-            // 上层收到通知后会重建本视图的子 View。这行代码跑在 onTouchEvent 里，
-            // 当场把正在派发事件的孩子拆掉太冒险，绕一次消息队列再动手。
-            // 带上代次号：期间内容若被换过（比如用户顺手点了别的），这份顺序就作废。
+            Haptics.confirm(context, Haptics.Source.PANEL_LONG_PRESS)
+            // 上层收到通知后**必须重建本视图的子 View**（`submit()`）：上面那几句已经把各格
+            // translation 归零，要是没人重建，屏幕上留下的就是**拖动前**的排列——用户看到的是
+            // 「拖完自己弹回去了、根本没挪动」。「更多」面板的工具页 2026-10-09 就是这么漏的
+            // （`commitToolReorder` 那时只更新了本地列表、没重画），改完四条路径都会重建。
+            //
+            // 这行代码跑在 onTouchEvent 里，当场把正在派发事件的孩子拆掉太冒险，
+            // 绕一次消息队列再动手。带上代次号：期间内容若被换过（比如用户顺手点了别的），
+            // 这份顺序就作废。
             val generation = contentGeneration
             handler.post {
                 if (generation == contentGeneration) onReorder(reordered)
@@ -896,7 +957,6 @@ class PinnedStripView(
         if (slots.isNotEmpty()) {
             if (columns > 0) {
                 gridLeft = paddingLeft
-                gridTop = paddingTop
                 val usable = (width - paddingLeft - paddingRight).coerceAtLeast(1)
                 colWidth = usable / columns
                 rowHeight = rowContainers.firstOrNull()?.height ?: 0
@@ -911,6 +971,16 @@ class PinnedStripView(
                     } else {
                         rowHeight + gridRowGapPx
                     }
+                // 第 0 行图标中心的 y（= 行顶边 + 槽位内边距 + holder 的一半）。
+                // 命中/换位的纵向基准，见 [gridRowAt]——**别拿行顶边（paddingTop）代替它**。
+                val holder = slots.getOrNull(0)?.iconHolder
+                rowIconCenter0 =
+                    slotOriginTop(0) +
+                        if (holder != null && holder.height > 0) {
+                            holder.top + holder.height / 2f
+                        } else {
+                            rowHeight / 2f
+                        }
             } else if (vertical) {
                 // 竖排：一格的高度就是斜向命中和换位的单位（槽位高矮一致，取第一个即可）。
                 slotHeight = slots.first().root.height
