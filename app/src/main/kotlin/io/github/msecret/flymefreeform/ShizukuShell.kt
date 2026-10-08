@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import rikka.shizuku.Shizuku
 
 /**
@@ -58,13 +59,16 @@ object ShizukuShell {
                     DebugLog.info("SHIZUKU_AUTO_REQUEST", "未授权，自动发起授权请求")
                     requestPermission(AUTO_REQUEST_CODE)
                 } else {
-                    // 有权限了：顺手看一眼无障碍有没有被系统清掉（重启后常见），有就写回去。
-                    // 只有用户开着主开关（或窗外点击关闭）时才动——他要是自己把功能关了，我们不该偷偷打开。
+                    // 有权限了：顺手看一眼无障碍有没有被 ColorOS 关掉（开机后必定被关，见
+                    // `BootReceiver` 的注释）。只在用户开着主开关（或窗外点击关闭）时才动——
+                    // 他要是自己把功能关了，我们不该偷偷打开。
                     AppContext.value?.let { context ->
                         val settings = SettingsStore(context)
                         if (settings.enabled || settings.outsideTapCloseEnabled) {
                             AccessibilityGrant.restoreIfMissing(context)
                         }
+                        // Shizuku 重连了：「窗内关闭」的常驻监听可能就是因为掉线才断的，重新同步一次。
+                        CaptionTapClose.sync(context)
                     }
                 }
             }
@@ -95,6 +99,7 @@ object ShizukuShell {
             DebugLog.warn("SHIZUKU_INJECT_NO_PERMISSION", "点 ($x,$y)")
             return false
         }
+        noteSelfTouch(x, y)
         Thread(
             {
                 val result = run("input tap $x $y")
@@ -119,6 +124,7 @@ object ShizukuShell {
             DebugLog.warn("SHIZUKU_INJECT_NO_PERMISSION", "滑 ($x1,$y1)->($x2,$y2)")
             return false
         }
+        noteSelfTouch(x1, y1)
         Thread(
             {
                 val result = run("input swipe $x1 $y1 $x2 $y2 $durationMs")
@@ -131,6 +137,50 @@ object ShizukuShell {
             "shizuku-inject-swipe",
         ).start()
         return true
+    }
+
+    /**
+     * 起一个**常驻**进程，把活的 [Process] 交给调用方，由它自己读流、自己 `destroy()`。
+     *
+     * 与 [run] 的分工：`run` 是「起进程 → 等它退出 → 把输出收干」的一次性用法，
+     * `logcat` 不带 `-d` 时**永不退出**，走 `run` 会一路等到超时、拿不到任何东西。
+     * 需要持续监听（[CaptionTapClose]）只能用这一条。
+     */
+    fun startProcess(command: String): Process? = newProcess(command)
+
+    /**
+     * 最近由**本应用自己**注入的触摸起点（`[x, y, 时刻]`）。
+     *
+     * 为什么需要它：[CaptionTapClose] 判「用户单击了小横条」靠的是系统日志里那一对
+     * 「按下点 + `onSingleTapUp`」。可我们**自己的关闭链路**也会往小横条上注入
+     * `input tap`（点亮目标窗那一记），而注入与真人点击在系统日志里**完全同形**。
+     * 不认出来的话就会自己触发自己，在已经滑过一刀之后再补一刀。
+     */
+    private val selfTouches = ArrayDeque<LongArray>()
+
+    /** [selfTouches] 的有效窗口。够覆盖「注入 → 系统打日志 → 我们读到」这一段即可。 */
+    private const val SELF_TOUCH_WINDOW_MS = 2_500L
+
+    /** 判定「同一个点」的容差（px）。注入的坐标就是系统日志里的坐标，留一点余量即可。 */
+    private const val SELF_TOUCH_SLACK_PX = 16
+
+    private fun noteSelfTouch(x: Int, y: Int) {
+        synchronized(selfTouches) {
+            selfTouches.addLast(longArrayOf(x.toLong(), y.toLong(), SystemClock.elapsedRealtime()))
+            while (selfTouches.size > 8) selfTouches.removeFirst()
+        }
+    }
+
+    /** 这个按下点是不是我们刚刚自己注入的（见 [selfTouches]）。 */
+    fun isRecentSelfTouch(x: Int, y: Int): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(selfTouches) {
+            selfTouches.removeAll { now - it[2] > SELF_TOUCH_WINDOW_MS }
+            return selfTouches.any {
+                kotlin.math.abs(it[0] - x) <= SELF_TOUCH_SLACK_PX &&
+                    kotlin.math.abs(it[1] - y) <= SELF_TOUCH_SLACK_PX
+            }
+        }
     }
 
     /** 以 shell 身份执行命令。命令执行在后台线程，调用方需自行处理线程。 */

@@ -35,10 +35,15 @@
             <data android:scheme="alipays" />
         </intent>
         <!--
-          识屏这边**不再需要任何包可见性声明**：小布识屏没有公开入口可以直启，也不吃侧边栏的
-          feature scheme（这两条路都试过、行不通，见 NativeScreenText），现在只靠重放它的
-          唤醒手势——那是纯无障碍注入，不涉及解析别人的组件。
+          识屏：
+          - **首选路要这条可见性声明。** 「侧边栏功能 URI」是把 Intent 交给
+            `com.coloros.smartsidebar` 去执行，我们要在本进程里 `resolveActivity` 判它认不认
+            这个 scheme（ColorOS 17 已移除，16 及更早才有）。Android 11+ 的包可见性会把没声明的
+            包过滤掉，不声明的话 `resolveActivity` 恒为 null —— 那就会「明明系统里有入口，
+            却每次都退回兜底手势」。
+          - 兜底路（重放双指长按）是纯无障碍注入，不涉及解析别人的组件，不需要声明。
         -->
+        <package android:name="com.coloros.smartsidebar" />
     </queries>
 
     <application
@@ -79,7 +84,7 @@
         <activity
             android:name=".OutsideTapSettingsActivity"
             android:exported="false"
-            android:label="窗外点击关闭" />
+            android:label="小窗关闭方式" />
 
         <!-- 「更多」面板的行为参数（默认页 / 工具顺序 / 底栏沉底）。 -->
         <activity

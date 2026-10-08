@@ -35,21 +35,40 @@ import kotlin.math.sin
  *
  * 代价是这块加宽的区域会覆盖到列表右侧——因此触摸必须**只在字母列范围内**才接管
  * （见 [onTouchEvent]），左边那块一律放行，否则列表右侧一竖条的点击/滚动都会被吃掉。
+ *
+ * ## 尺寸基准必须和面板用**同一把尺子**
+ *
+ * 字号（[NORMAL_TEXT_FRACTION] / [ACTIVE_TEXT_FRACTION]）、气泡（[BUBBLE_R_FRACTION] /
+ * [BUBBLE_GAP_FRACTION]）、底部留白（[BOTTOM_INSET_FRACTION]）全都按「屏幕短边」取比例，
+ * 而这里的短边**必须是 [CornerGeometry.designShortEdgePx]**——也就是面板给本 View 定宽
+ * （`AppDrawerPanel.indexTotalWidthPx`）、定字母列宽时用的那把尺子。
+ *
+ * ★ 早先这里直接读 `resources.displayMetrics` 的**原始**短边，手机上看不出问题：手机的
+ * `uiScale` 落在上下限之间，原始短边与等效短边**恰好相等**（1272px）。但平板的原始短边
+ * 2400px 是等效短边 1207px 的 **1.99 倍**（大屏被 `MAX_UI_SCALE = 1.15` 封了顶），于是
+ * 字号、气泡直径、底部留白整体被放大一倍，而面板按等效短边预留的字母列只有 20dp(≈60px)——
+ * 比放大后的字形还窄：**最宽的那个字母（W）右半边被裁掉**，气泡也胀成两倍大、直接压到
+ * 字母列上面（用户 2026-10-08：「平板上更多的索引 W 右侧被遮盖了」）。
+ *
+ * 所以基准改由面板**传进来**（[shortEdgePx]），跟面板共用同一个值——一处收敛，不会再各算一份。
  */
 class AlphabetIndexView(
     context: Context,
     private var letters: List<String>,
     /** 右侧字母列的宽度（px）。它左边的区域用于画气泡，**不接收触摸**。 */
     private val letterColumnWidthPx: Int,
+    /**
+     * **尺寸基准**（px）：与面板同一个「等效短边」，见 [CornerGeometry.designShortEdgePx]。
+     *
+     * 字号 / 气泡 / 底部留白全部按它取比例。**绝不能再退回阅读 `displayMetrics` 的原始短边**
+     * （理由见类注释「尺寸基准必须和面板用同一把尺子」）。
+     */
+    private val shortEdgePx: Float,
     private val onLetter: (String) -> Unit,
     private val onLetterEnd: () -> Unit,
     /** 最上面那颗五角星被点中。 */
     private val onStar: () -> Unit,
 ) : View(context) {
-
-    /** 屏幕短边（px），索文字号按它的比例算，大小屏一致。 */
-    private val shortEdgePx =
-        min(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
 
     /** 气泡半径（px）。 */
     private val bubbleRadius: Float get() = shortEdgePx * BUBBLE_R_FRACTION

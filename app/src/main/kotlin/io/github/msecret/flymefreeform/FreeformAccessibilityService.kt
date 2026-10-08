@@ -1029,6 +1029,28 @@ class FreeformAccessibilityService : AccessibilityService() {
         return ScreenTextReport(lines.toList(), sourcePackage)
     }
 
+    /**
+     * 当前最上层那个**应用**窗口的包名——多半就是用户正在看的那个 App。
+     *
+     * 取法与 [collectScreenText] 同源（先问活动窗口，再退到窗口列表里最靠前的非本应用窗口），
+     * 但**只判身份、不读内容**，所以不需要节点树可读，桌面这种只有图标的界面照样能认出来。
+     *
+     * 读不到时返回 null（调用方按「不知道」处理，别当成「没有」）。
+     */
+    private fun foregroundAppPackageInternal(): String? {
+        val activeRoot = runCatching { rootInActiveWindow }.getOrNull()
+        val activeOwner = runCatching { activeRoot?.packageName?.toString() }.getOrNull()
+        if (!activeOwner.isNullOrBlank() && activeOwner != packageName) return activeOwner
+        val windowList = runCatching { windows }.getOrNull().orEmpty()
+        for (window in windowList.sortedByDescending { it.isFocused }) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val root = runCatching { window.root }.getOrNull() ?: continue
+            val owner = runCatching { root.packageName?.toString() }.getOrNull()
+            if (!owner.isNullOrBlank() && owner != packageName) return owner
+        }
+        return null
+    }
+
     /** 深度优先收集 `text` 与 `contentDescription`，两者都空则跳过。 */
     private fun collectTextNodes(
         node: AccessibilityNodeInfo?,
@@ -1621,24 +1643,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         // [closeAnchorPoint]：后者带「抬升到屏幕底部手势区上沿」的兜底，会把落点从横条上
         // 抬走几十像素，横屏下就必然滑不到横条（真机日志：注入 (693,1188)，窗口底边却是 1246）。
         val point = captionPoint(bounds, store)
-        val shortEdge =
-            minOf(resources.displayMetrics.widthPixels, resources.displayMetrics.heightPixels).toFloat()
-        // 距离与时长都可由用户在设置页调：判定「快速上滑」的阈值各家 ROM 不一样，写死就会
-        // 出现「先缩一下再关」（被当成拖动）或「滑了没反应」（太短）。
-        //
-        // ★ 距离另加一条**绝对下限** [MIN_CLOSE_SWIPE_DP]。百分比是按屏幕短边算的，
-        // 而 ColorOS 判「快速上滑」用的是 `minDistanceDp = 75`（系统日志原文，
-        // 与 `quickSwipeMinDis=197px` 在平板上恰好对上：75dp × 2.625 ≈ 197px）——
-        // 低于它一律判成「缩小回弹」＝用户说的「缩一下就停住」。
-        // 平时够不着这条下限（默认 40%：平板 960px、手机 509px），但设置项允许拉到
-        // 4%（`MIN_CLOSE_SWIPE_DISTANCE`），那在平板上只有 96px ≈ 36dp，**必然回弹**。
-        val floor = CornerGeometry.dp(this, MIN_CLOSE_SWIPE_DP).toFloat()
-        val distance = maxOf(
-            (shortEdge * store.closeSwipeDistancePercent / 100f) *
-                (if (isRetry) SWIPE_UP_RETRY_FACTOR else 1f),
-            floor,
-        )
-        val durationMs = store.closeSwipeDurationMs
+        // 距离与时长由用户在设置页调，**两条关闭路径共用同一组值**
+        // （见 [FreeformCaption.swipeDistancePx]：那边的下限、重试放大系数也都收在同一个地方）。
+        val distance = FreeformCaption.swipeDistancePx(this, isRetry)
+        val durationMs = FreeformCaption.swipeDurationMs(this)
 
         // 「先确保目标窗是焦点窗」那一步已经提到 [performCloseMode] 开头了——它对**所有**
         // 关闭方式都是前提（ColorOS 的关闭手势只认焦点窗）。放在这里只会让
@@ -2382,17 +2390,6 @@ class FreeformAccessibilityService : AccessibilityService() {
          */
         private const val CAPTION_NEAR_BOTTOM_DP = 48
 
-        /**
-         * 关闭上滑距离的**绝对下限**（dp）。见 [swipeUpOnCaption] 里算距离那一段。
-         *
-         * ColorOS 判「快速上滑」的阈值是 `minDistanceDp = 75`（系统日志原文，平板上
-         * `quickSwipeMinDis=197px` 恰好等于 75dp × 2.625）。真机实测：192px(73dp) 回弹、
-         * 300px(114dp) 关闭。取 150dp 留出余量，同时远小于默认的 40% 短边
-         * （平板 960px、手机 509px），所以对现状零影响——它只在用户把设置项拉到很小
-         * （最低 4%）、或屏幕特别小的机器上才起作用。
-         */
-        private const val MIN_CLOSE_SWIPE_DP = 150
-
         /** 无障碍回退路径下，「点一下」的按压时长。 */
         private const val CLOSE_FOCUS_TAP_MS = 60L
 
@@ -2427,14 +2424,6 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 也不要盲目补刀。
          */
         private const val MAX_RETRY = 1
-
-        /**
-         * 上滑失败重试时把距离放大的倍数。
-         *
-         * 距离和时长放在 [SettingsStore.closeSwipeDistancePercent] /
-         * [SettingsStore.closeSwipeDurationMs]，由用户在设置页调——判定阈值各家 ROM 不同。
-         */
-        private const val SWIPE_UP_RETRY_FACTOR = 1.4f
 
         /** 校准准星的尺寸、描边宽度与最小中心点。 */
         private const val MARKER_SIZE_DP = 30
@@ -2580,6 +2569,15 @@ class FreeformAccessibilityService : AccessibilityService() {
          */
         fun twoFingerPress(x: Float, y: Float, spreadPx: Float, durationMs: Long): Boolean =
             instance?.performTwoFingerPress(x, y, spreadPx, durationMs) ?: false
+
+        /**
+         * 当前前台应用（最上层应用窗口）的包名，读不到时 null。
+         *
+         * 用途：有些系统级动作**只在特定界面才有意义**——典型是「小布识屏」，它在**桌面**
+         * 上根本没有，盲注入双指按压只会把桌面图标按住（用户 2026-10-08 报的正是这个）。
+         * 做这种动作之前得先知道「现在前台是谁」。服务没连上时返回 null。
+         */
+        fun foregroundAppPackage(): String? = instance?.foregroundAppPackageInternal()
 
         /**
          * 截屏：提交一次截屏请求并把结果写进相册。

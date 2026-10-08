@@ -27,7 +27,7 @@ class LockScreenAdmin : DeviceAdminReceiver()
 object LockScreen {
 
     fun lock(context: Context): String {
-        // 与 Pano 一样，优先通过 Shizuku/shell 发送 KEYCODE_SLEEP（223）。
+        // 优先通过 Shizuku/shell 发送 KEYCODE_SLEEP（223）。
         // 这会让屏幕休眠而非调用 DevicePolicyManager.lockNow()；后者在部分 ColorOS
         // 设备上会要求下一次解锁必须输入密码。设备行为因 ROM/安全策略而异，需真机验证。
         if (ShizukuShell.hasPermission) {

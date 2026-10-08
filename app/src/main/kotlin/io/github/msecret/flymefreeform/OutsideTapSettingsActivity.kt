@@ -7,9 +7,15 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 /**
- * 「窗外点击关闭」二级设置页（Material 3 版面）。
+ * 「小窗关闭方式」二级设置页（Material 3 版面）。
  *
- * 从主设置页拆出来：窗外关闭涉及无障碍、点击方式、关闭方式、落点校准、强力关闭等一堆项，
+ * 两种**触发方式**：
+ * - **窗外关闭** —— 点小窗**外面**，靠无障碍铺一层遮罩接住点击；
+ * - **窗内关闭** —— 点小窗**自己的小横条**，靠 Shizuku 常驻读系统日志认出这一下单击（见 [CaptionTapClose]）。
+ *
+ * 两者共用的**动作**是同一件事：在小横条上补一记快速上滑（ColorOS 自带的关闭手势）。
+ *
+ * 从主设置页拆出来：涉及无障碍、Shizuku、点击方式、关闭方式、落点校准、强力关闭等一堆项，
  * 放主页会顶得很长。
  *
  * ## 关于「单击 / 双击」
@@ -17,7 +23,7 @@ import android.widget.TextView
  * 判定逻辑早就在 [OutsideTapBlocker.dispatchOutsideClick] 里实现好了（双击模式下第一次点击
  * 只是起头，[android.view.ViewConfiguration.getDoubleTapTimeout] 之内没有第二次才算单击），
  * 值也从 [SettingsStore.outsideTapClickMode] 读；**只是一直没有暴露这个开关**——用户拿不到。
- * 这一版把它放到最上面、紧跟总开关。
+ * 这一版把它放在最上面、紧跟总开关。
  */
 class OutsideTapSettingsActivity : Activity() {
 
@@ -57,12 +63,12 @@ class OutsideTapSettingsActivity : Activity() {
 
     private fun buildContent(): View {
         val root = Ui.pageRoot(this)
-        root.addView(Ui.title(this, "窗外点击关闭"))
+        root.addView(Ui.title(this, "小窗关闭方式"))
         root.addView(
             Ui.hint(
                 this,
-                "在小窗**外面**点一下（或两下）就把小窗关掉。实现方式是在小窗四周铺一层透明遮罩，" +
-                    "所以必须先开无障碍服务。",
+                "两种**触发方式**，可以各自开关：在小窗**外面**点一下关掉，或者点小窗**自己的小横条**关掉。" +
+                    "两者最后做的事是同一件 —— 在小横条上补一记快速上滑，那正是 ColorOS 自带的关闭手势。",
             ),
         )
         // 用户 2026-10-07：「关闭落点校准这个优先级比较高，得让用户知道它在不生效时应该调它」。
@@ -75,23 +81,16 @@ class OutsideTapSettingsActivity : Activity() {
             ),
         )
 
-        // ---- 总开关与点击方式 ----
+        // ---- 触发方式 ----
         //
-        // 这三行必须落在**同一个 [CardGroup]** 里。早先「单击 / 双击」是一张卡片、总开关是另一张，
-        // 两张之间一点缝都没有，上面那张的下圆角与下面那张的上圆角拼在一起就凹出一个坑
-        // （用户报的「这块还是有凹陷」）。同组内的行是贴实的，只有整组最外圈带圆角，才不会出坑。
-        root.addView(Ui.sectionTitle(this, "开关"))
+        // 每个 [CardGroup] 内部的行是贴实的，只有整组最外圈带圆角 —— 所以**两张卡相邻**时中间
+        // 必须垫点东西，否则上面那张的下圆角与下面那张的上圆角拼在一起会凹出一个坑
+        // （用户报的「这块还是有凹陷」）。这里两张卡之间垫了一条 [Ui.hint]。
+        root.addView(Ui.sectionTitle(this, "触发方式"))
         switchSection =
             LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(switchSection)
         renderSwitchSection()
-        root.addView(
-            Ui.hint(
-                this,
-                "总开关打开之后，下面两项才能选。「双击」防的是误触：单手拿着、在小窗边缘滑动时，" +
-                    "很容易碰出一次无意点击；双击模式下第一次点击只作起头，需要在系统双击间隔内再点一次才关闭。",
-            ),
-        )
         root.addView(Ui.spacer(this))
 
         // ---- 关闭方式 ----
@@ -102,8 +101,9 @@ class OutsideTapSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "动作是：在小窗底部的小横条上模拟一次快速上滑（那是 ColorOS 手势模式**自带**的关闭手势），" +
-                    "落点按小窗边界估算，不需要额外权限。",
+                "**两种触发方式共用的动作**：在小窗底部的小横条上补一记快速上滑 —— 那是 ColorOS 手势模式" +
+                    "**自带**的关闭手势。下面「关闭落点校准」只影响**窗外关闭**（它的落点按小窗边界估算）；" +
+                    "「窗内关闭」用的是你点下去的那个真实坐标。而「高级设置 → 上滑手势」里的**距离与时长是两种方式共用**的。",
             ),
         )
         root.addView(
@@ -338,49 +338,114 @@ class OutsideTapSettingsActivity : Activity() {
     }
 
     /**
-     * 重画「开关」整组。
+     * 重画「触发方式」那一段：**两张卡片**。
      *
-     * 顺序是用户点名的：**总开关在最上面**，单击 / 双击是它的子项——总开关关着的时候，
-     * 下面两项置灰且点不动（它们选了也没有任何意义，遮罩根本不会铺）。
+     * - 第一张：两个**并列的总开关** —— 「窗外关闭」（点小窗外面）与「窗内关闭」（点小窗自己的
+     *   小横条）。两者**互不依赖**，可以同时开，也可以只开一个。
+     * - 第二张：「窗外」的点击方式（单击 / 双击）。它是**窗外关闭的子项**，那个开关关着时置灰。
+     *
+     * 两个开关要的**前置条件完全不同**，所以可用状态各判各的：窗外要**无障碍**（那层遮罩是它铺的），
+     * 窗内要 **Shizuku**（读系统日志与注入触摸都得是 shell 身份），而且还需要本应用的后台服务在跑
+     * 当宿主（见 [CaptionTapClose]）—— 后一条在打开开关时顺手把服务拉起来。
      */
     private fun renderSwitchSection() {
-        val on = store.outsideTapCloseEnabled
+        val outside = store.outsideTapCloseEnabled
         // 遮罩是**无障碍服务**铺的：无障碍没连上，这个开关开了也不会生效，所以**不让它开**
         // （用户 2026-10-07 明确要求）。显示上也当成「关」，免得看着是开的、实际什么都不做。
         val accessible = FreeformAccessibilityService.isConnected
-        val group =
+        val caption = store.captionTapCloseEnabled
+        val shizuku = ShizukuShell.hasPermission
+
+        val triggers =
             CardGroup(this)
                 .row(
                     Ui.switchRow(
                         this,
-                        "启用窗外点击关闭",
-                        on && accessible,
+                        "窗外关闭",
+                        outside && accessible,
                         detail =
                             when {
                                 !accessible -> "需要先开启无障碍服务，否则开了也不生效"
-                                on -> "遮罩已铺开，点小窗外即可关闭"
+                                outside -> "遮罩已铺开，点小窗外即可关闭"
                                 else -> "关闭后遮罩不铺，窗外点击回到系统处理"
                             },
                         enabled = accessible,
                     ) { checked ->
                         store.outsideTapCloseEnabled = checked
                         FreeformAccessibilityService.refreshIfRunning()
-                        // 总开关变了，下面两项的可用状态跟着变，整组重画。
+                        // 总开关变了，下面两项的可用状态跟着变，整段重画。
                         renderSwitchSection()
                     },
                 )
-                .row(clickModeRow(SettingsStore.CLICK_MODE_SINGLE, "单击", "点一下窗外就关闭", on && accessible))
-                .row(clickModeRow(SettingsStore.CLICK_MODE_DOUBLE, "双击", "连点两下才关闭，减少误触", on && accessible))
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "窗内关闭",
+                        caption && shizuku,
+                        detail =
+                            when {
+                                !shizuku -> "需要先授权 Shizuku（读系统日志、注入触摸都要 shell 身份）"
+                                caption -> "单击小窗自己的小横条即可关闭"
+                                else -> "关闭后单击小横条仍是系统的「点亮」行为"
+                            },
+                        enabled = shizuku,
+                    ) { checked ->
+                        store.captionTapCloseEnabled = checked
+                        // 宿主是本应用的后台服务。打开时没在跑就拉起来；关掉时若「主动呼出」也是关的，
+                        // 顺手把服务停掉，别为已经关掉的功能留一条常驻通知。
+                        if (checked) {
+                            if (!OverlayGestureService.isRunning) OverlayGestureService.start(this)
+                        } else if (!store.enabled) {
+                            OverlayGestureService.stop(this)
+                        }
+                        CaptionTapClose.sync(this)
+                        renderSwitchSection()
+                    },
+                )
+
         switchSection.removeAllViews()
-        switchSection.addView(group)
-        // 前置条件没满足时把话说清楚：遮罩是**无障碍服务**铺的，无障碍没连上，这里怎么开都不会生效。
+        switchSection.addView(triggers)
+        switchSection.addView(
+            Ui.hint(this, "两项**可以同时开** —— 一个管小窗外面，一个管小窗自己的小横条。"),
+        )
+        switchSection.addView(Ui.sectionTitle(this, "窗外：点击方式"))
+        switchSection.addView(
+            CardGroup(this)
+                .row(clickModeRow(SettingsStore.CLICK_MODE_SINGLE, "单击", "点一下窗外就关闭", outside && accessible))
+                .row(clickModeRow(SettingsStore.CLICK_MODE_DOUBLE, "双击", "连点两下才关闭，减少误触", outside && accessible)),
+        )
+        switchSection.addView(
+            Ui.hint(
+                this,
+                "「窗外关闭」打开之后，上面两项才能选。「双击」防的是误触：单手拿着、在小窗边缘滑动时，" +
+                    "很容易碰出一次无意点击；双击模式下第一次点击只作起头，需要在系统双击间隔内再点一次才关闭。",
+            ),
+        )
+        // 前置条件没满足时把话说清楚：两个开关要的东西完全不一样，别让用户自己猜。
         // 另外要说明「只在小窗存在时才铺」——用户在桌面上试一下，很容易以为开关坏了。
         if (!accessible) {
             switchSection.addView(
                 Ui.hint(
                     this,
-                    "现在还不会生效：遮罩由无障碍服务铺开，需要先在**系统设置 → 无障碍**里开启本应用的服务" +
-                        "（主界面也有入口）。另外遮罩只在小窗存在时铺开，在桌面上看不出变化是正常的。",
+                    "「窗外关闭」现在还不会生效：遮罩由无障碍服务铺开，需要先在**系统设置 → 无障碍**里" +
+                        "开启本应用的服务（主界面也有入口）。另外遮罩只在小窗存在时铺开，在桌面上看不出变化是正常的。",
+                ),
+            )
+        }
+        if (!shizuku) {
+            switchSection.addView(
+                Ui.hint(
+                    this,
+                    "「窗内关闭」现在还不会生效：它要读系统日志才知道你点了小横条、还要以 shell 身份补一记上滑，" +
+                        "两件事都依赖 **Shizuku**（主界面「功能」页有授权入口）。",
+                ),
+            )
+        } else if (caption) {
+            switchSection.addView(
+                Ui.hint(
+                    this,
+                    "「窗内关闭」需要一个常驻宿主，所以本应用的后台服务会一直运行（会有一条常驻通知）；" +
+                        "关掉这个开关之后，如果「主动呼出」也是关的，服务会一并停下。",
                 ),
             )
         }

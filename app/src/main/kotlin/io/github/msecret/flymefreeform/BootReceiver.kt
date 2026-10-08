@@ -32,9 +32,18 @@ class BootReceiver : BroadcastReceiver() {
         AppContext.attach(context)
         DebugLog.enabled = SettingsStore(context).debugLogEnabled
         DebugLog.info("BOOT_RECEIVER", "action=${intent.action}")
-        // 开机后无障碍有可能被系统清掉：这里先看一眼（Shizuku 若还没起来，
-        // 稍后 binder 回来的那一刻 [ShizukuShell.startAutoReconnect] 里还会再查一次）。
-        // 窗外点击关闭也要靠无障碍，所以只开它、没开主动呼出时，同样要把权限补回来。
+        // 开机后无障碍**必定**被 ColorOS 关掉：`OplusRiskAccessibilityController` 会把「侧载」的
+        // 第三方无障碍服务在 `USER_UNLOCKED` 后 1 秒强制关闭（`initiatingPackageName ==
+        // "com.android.shell"` 就算 sideload，也就是 adb 安装 / 点 APK 安装）。
+        // GKD 不受影响**只是**因为它的包名在 OPPO 云端白名单里，不是因为它做得对。
+        // 详见 `.workbuddy/memory/A11Y-GRANT.md`。
+        //
+        // 所以这里要补回来——但**只在用户开着主开关（或窗外点击关闭）时**才动：
+        // 他要是自己把功能关了，我们不该偷偷打开。
+        //
+        // 补回来之后约 30 秒，ColorOS 手机管家会弹一次「检测到…获取无障碍权限」。那条框**躲不掉**：
+        // 用户手动开、磁贴开、我们写回开，判定完全一样（只看「这个包被加进 enabled 列表」，
+        // 不看是谁加的）。⇒ 自动补回并不比手动开更差，反而省掉用户每次开机的手动操作。
         val bootStore = SettingsStore(context)
         if (bootStore.enabled || bootStore.outsideTapCloseEnabled) {
             AccessibilityGrant.restoreIfMissing(context)

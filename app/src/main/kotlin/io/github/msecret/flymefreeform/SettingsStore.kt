@@ -374,6 +374,22 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_OUTSIDE_TAP, value).apply()
 
     /**
+     * 是否启用「点击小窗**里面**的小横条就把小窗关掉」。默认关闭。
+     *
+     * 与 [outsideTapCloseEnabled] 是**两个独立的触发入口**，可以同时开：
+     * - 那个是点小窗**外面**（靠无障碍铺一圈遮罩接住点击）；
+     * - 这个是点小窗**自己的小横条**（靠 Shizuku 常驻读系统日志认出这一下单击）。
+     *
+     * 两者**共用的动作**是同一件事：在小横条上补一记快速上滑（见 [outsideTapCloseMode]）。
+     *
+     * 前置条件与「窗外关闭」完全不同：它要 **Shizuku**（读 `logcat` 与注入触摸都要 shell 身份），
+     * 不要无障碍；另外需要一个常驻宿主，所以本应用的后台服务必须在跑（见 [CaptionTapClose]）。
+     */
+    var captionTapCloseEnabled: Boolean
+        get() = preferences.getBoolean(KEY_CAPTION_TAP_CLOSE, false)
+        set(value) = preferences.edit().putBoolean(KEY_CAPTION_TAP_CLOSE, value).apply()
+
+    /**
      * 遮罩铺哪几边，取值见 [MASK_ALL] / [MASK_SIDES] / [MASK_VERTICAL]。
      *
      * 少铺一边是为了**少误触**，两种取向的理由不一样：
@@ -563,6 +579,17 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_MENU_HAPTIC, value).apply()
 
     /**
+     * 隐藏扇形里的「更多」入口。默认 **false**（保留，行为不变）。
+     *
+     * 打开后扇形不再有「更多」那一格，而「更多」面板**只能**从那一格进（见 `OverlayGestureService`
+     * 里 `showDrawer` 的两个调用点），所以关掉它 = 整个抽屉都进不去了 —— 这正是用户 2026-10-08
+     * 要的效果：「隐藏了就无发通过轮盘进入」。
+     */
+    var hideMoreEntry: Boolean
+        get() = preferences.getBoolean(KEY_HIDE_MORE_ENTRY, false)
+        set(value) = preferences.edit().putBoolean(KEY_HIDE_MORE_ENTRY, value).apply()
+
+    /**
      * 扇形极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
      *
      * 决定整个扇形「离屏幕边多远」——调大则弧整体往屏幕中心收，调小则更贴角落。
@@ -599,9 +626,11 @@ class SettingsStore(context: Context) {
      * 上一次**自动**写回无障碍名单的时刻（wall clock，`System.currentTimeMillis()`）。
      *
      * 不存 `elapsedRealtime`：那个跨重启会归零，而这条记录的意义正是「跨重启也别反复写」。
-     * 用途见 [AccessibilityGrant.restoreIfMissing] 的冷却——**每次写系统无障碍名单，系统都会
-     * 认为「本应用刚获得无障碍权限」，ColorOS 安全中心于是弹一次提示**（`com.oplus.securitypermission`），
-     * 用户报的「总是提示检测到 Flyme 小窗 获取无障碍权限」就是这么来的。
+     * 用途见 [AccessibilityGrant.restoreIfMissing] 的冷却。
+     *
+     * ⚠️ 冷却**不是**为了少弹 ColorOS 那条「检测到…获取无障碍权限」——那条框在**任何一次**
+     * 重新启用时都会弹（我们写回、用户手动开、磁贴开都一样，见 `.workbuddy/memory/A11Y-GRANT.md`），
+     * 躲不掉。冷却只是防止「同一个开机周期里被误判成没开 → 反复写」。
      */
     var lastAutoA11yGrantAt: Long
         get() = preferences.getLong(KEY_LAST_AUTO_A11Y_GRANT, 0L)
@@ -631,13 +660,26 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_DEBUG_LOG, value).apply()
 
     /**
-     * 第三方图标包软件包名。空字符串表示不用图标包（用系统默认图标）。
+     * 第三方图标包软件包名。空字符串表示**不用图标包**。
      *
-     * 注意只支持「单独的图标包 app」，ColorOS 主题商店内置的图标无 root 读不到。
+     * 只在「声明了图标包 action」的 app 里选（见 [IconPackLoader.findIconPacks]）；
+     * 若这里存的值已经不是个能用的图标包（老版本误报过 `com.oplus.safecenter`），
+     * [AppCatalog.load] 会把它清空，避免它一直压着图标不生效。
      */
     var iconPackPackage: String
         get() = preferences.getString(KEY_ICON_PACK, "") ?: ""
         set(value) = preferences.edit().putString(KEY_ICON_PACK, value).apply()
+
+    /**
+     * 要不要跟随 ColorOS 的**系统图标集**（主题里那套图标）。默认**开**。
+     *
+     * 资源在 `/data/theme/icons`（世界可读，普通应用就能读，见 [SystemIconSet]）——
+     * 所以「面板里的图标和桌面一致」是能做到的。它只作用于**没被图标包命中**的应用，
+     * 于是「选了个只覆盖部分应用的图标包」时，剩下的会落到系统图标集，而不是露出没主题过的原图。
+     */
+    var useSystemIconSet: Boolean
+        get() = preferences.getBoolean(KEY_USE_SYSTEM_ICON_SET, true)
+        set(value) = preferences.edit().putBoolean(KEY_USE_SYSTEM_ICON_SET, value).apply()
 
     /**
      * 扇形图标直径，单位 dp。
@@ -651,6 +693,25 @@ class SettingsStore(context: Context) {
         set(value) =
             preferences.edit()
                 .putInt(KEY_MENU_ICON_DP, value.coerceIn(MIN_MENU_ICON_DP, MAX_MENU_ICON_DP))
+                .apply()
+
+    /**
+     * 呼出时图标的**晃动角度**（度），0 = 不晃。
+     *
+     * 它**直接就是绕图标自己圆心的最大旋转角**（20 表示右下角先顺时针转出去 20° 再回正，
+     * 左下角反过来），不需要任何换算——早先有一版把它换算成垂直位移，做成了上下平移，被用户否掉了。
+     * 位置始终不动，只有姿态在转。
+     *
+     * 用户 2026-10-08 要求做成可调，用来挑一个顺眼的幅度（默认 **30°**）；同一天又要求从「设置 → 调试」
+     * 里那个临时档位表挪进**正式设置**（「主动呼出 → 扇形设置」，见 `CornerSettingsActivity`），
+     * 并且上限放到 60°。
+     */
+    var menuSwingDeg: Int
+        get() = preferences.getInt(KEY_MENU_SWING_DEG, DEFAULT_MENU_SWING_DEG)
+            .coerceIn(MIN_MENU_SWING_DEG, MAX_MENU_SWING_DEG)
+        set(value) =
+            preferences.edit()
+                .putInt(KEY_MENU_SWING_DEG, value.coerceIn(MIN_MENU_SWING_DEG, MAX_MENU_SWING_DEG))
                 .apply()
 
     /** 更多面板默认页：apps / tools。 */
@@ -868,7 +929,13 @@ class SettingsStore(context: Context) {
     }
 
     companion object {
-        private const val FILE_NAME = "flymefreeform_noroot"
+        /**
+         * prefs 文件名。
+         *
+         * `internal` 而不是 `private`：[SettingsBackup] 要拿它读整份 `all` 做备份/恢复——
+         * 字面量只能有这一处，别在那边再写一遍。
+         */
+        internal const val FILE_NAME = "flymefreeform_noroot"
         private const val KEY_ENABLED = "enabled"
         private const val KEY_LEFT = "corner_left_enabled"
         private const val KEY_RIGHT = "corner_right_enabled"
@@ -879,6 +946,7 @@ class SettingsStore(context: Context) {
         private const val KEY_CORNER_TAP_THROUGH = "corner_tap_through_enabled"
         private const val KEY_PINS = "corner_pins"
         private const val KEY_OUTSIDE_TAP = "outside_tap_close_enabled"
+        private const val KEY_CAPTION_TAP_CLOSE = "caption_tap_close_enabled"
         private const val KEY_OUTSIDE_TAP_SIDES_ONLY = "outside_tap_sides_only"
         private const val KEY_OUTSIDE_TAP_MASK = "outside_tap_mask"
         private const val KEY_OUTSIDE_TAP_PADDING_DP = "outside_tap_padding_dp"
@@ -1098,13 +1166,18 @@ class SettingsStore(context: Context) {
 
         private const val KEY_MENU_RADIUS_PERCENT = "menu_radius_percent"
         private const val KEY_MENU_HAPTIC = "menu_haptic"
+
+        /** 见 [hideMoreEntry]：扇形里不再有「更多」入口。 */
+        private const val KEY_HIDE_MORE_ENTRY = "hide_more_entry"
         private const val KEY_MENU_ICON_DP = "menu_icon_dp"
+        private const val KEY_MENU_SWING_DEG = "menu_swing_deg"
         private const val KEY_MENU_WIDTH_DP = "menu_width_dp"
         private const val KEY_MENU_HEIGHT_DP = "menu_height_dp"
         private const val KEY_MENU_CORNER_INSET_PERCENT = "menu_corner_inset_percent"
         private const val KEY_LEGACY_MENU_CORNER_INSET_DP = "menu_corner_inset_dp"
         private const val KEY_DEBUG_LOG = "debug_log_enabled"
         private const val KEY_ICON_PACK = "icon_pack_package"
+        private const val KEY_USE_SYSTEM_ICON_SET = "use_system_icon_set"
 
         /** 扇形离角落距离的调节区间。 */
         const val MIN_MENU_CORNER_INSET_PERCENT = 0
@@ -1115,6 +1188,17 @@ class SettingsStore(context: Context) {
         const val MIN_MENU_ICON_DP = 24
         const val MAX_MENU_ICON_DP = 88
         const val DEFAULT_MENU_ICON_DP = 34
+
+        /**
+         * 呼出晃动角度的调节区间（度）。0 = 不晃。
+         *
+         * 上限 2026-10-08 由 40 提到 **60**（用户要「最大调到 60」，让幅度能拉得比原来明显）。
+         * 默认同一天由 20° 提到 **30°**（用户觉得 20° 不够看得出来）。老值超出新上限时读取处会
+         * `coerceIn` 收回来，不会崩。
+         */
+        const val MIN_MENU_SWING_DEG = 0
+        const val MAX_MENU_SWING_DEG = 60
+        const val DEFAULT_MENU_SWING_DEG = 30
 
         /** 扇形横向/纵向半径的调节区间（dp）。 */
         const val MIN_MENU_DIM_DP = 80

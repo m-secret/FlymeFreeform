@@ -37,7 +37,7 @@ object AppContext {
      * `Application.ActivityLifecycleCallbacks` **没有** user-leave-hint 这一类回调（只有
      * created / started / resumed / paused / stopped / destroyed 那套，`javap` 确认过），
      * 所以只能挂在各 Activity 的 `onUserLeaveHint()` 上。而「主动离开」可能发生在**任何一个**
-     * 界面上（主设置页、主动呼出、窗外点击关闭、应用管理、日志……），少挂一个就会出现
+     * 界面上（主设置页、主动呼出、小窗关闭方式、应用管理、日志……），少挂一个就会出现
      * 「在那个页面按 Home 就没隐藏」。
      *
      * ## 为什么不用 `AppTask.setExcludeFromRecents()`
@@ -67,7 +67,7 @@ object AppContext {
      * ## 坑：`onUserLeaveHint()` 在跳自家子页面时**也会**回调（真机实测）
      *
      * AOSP 文档说它只在「用户主动离开」时回调，程序自己 `startActivity` 不算。**ColorOS 17 不
-     * 这样**：从主设置页点「运行日志 / 更多面板 / 主动呼出 / 窗外点击关闭 / 管理扇形应用」，
+     * 这样**：从主设置页点「运行日志 / 更多面板 / 主动呼出 / 小窗关闭方式 / 管理扇形应用」，
      * 被压在下面的 MainActivity 照样收到 `onUserLeaveHint()`，于是 `finishAndRemoveTask()`
      * 把**刚打开的那一页连同整个 task** 一起清掉——用户看到的就是「点一下就闪退」。
      * （真机日志：`MainActivity t2508 f` → `onTaskVanished taskInfo:2508`，焦点直接回桌面。）

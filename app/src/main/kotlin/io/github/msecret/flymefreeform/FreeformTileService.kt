@@ -27,6 +27,16 @@ import android.service.quicksettings.TileService
  */
 class FreeformTileService : TileService() {
 
+    companion object {
+        /**
+         * 磁贴在快捷设置里显示的名字。
+         *
+         * 主界面那个「添加状态栏磁贴」的确认弹窗和手动指引都用**同一份**（[MainActivity.requestAddTile]），
+         * 改这里就够，别在别处再抄一个字面量。
+         */
+        const val TILE_LABEL = "免root小窗"
+    }
+
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onStartListening() {
@@ -65,7 +75,7 @@ class FreeformTileService : TileService() {
         val enabled = FreeformAccessibilityService.isEnabledInSettings(this)
         val connected = FreeformAccessibilityService.isConnected
         tile.state = if (connected) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-        tile.label = "免root小窗"
+        tile.label = TILE_LABEL
         tile.subtitle =
             when {
                 connected -> "无障碍已就绪"

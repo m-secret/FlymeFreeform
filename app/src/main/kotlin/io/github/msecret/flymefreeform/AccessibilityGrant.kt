@@ -39,9 +39,8 @@ object AccessibilityGrant {
      * 系统名单里有没有我们（不依赖服务是否活着）。
      *
      * ⚠️ **只当诊断看，别拿它做判据。** ColorOS 会瞬时把本服务从这条设置里抹掉（见
-     * [FreeformAccessibilityService.isEnabledInSettings]），据此判断「没开」会白白写一次设置，
-     * 而每次写都会让 ColorOS 弹一次「检测到…获取无障碍权限」。要判断开没开，用
-     * `FreeformAccessibilityService.isEnabledInSettings(context)`（见 [restoreIfMissing]）。
+     * [FreeformAccessibilityService.isEnabledInSettings]），据此判断「没开」会白白写一次设置。
+     * 要判断开没开，用 `FreeformAccessibilityService.isEnabledInSettings(context)`。
      */
     fun isListed(context: Context): Boolean {
         val raw = runCatching {
@@ -91,31 +90,34 @@ object AccessibilityGrant {
     }
 
     /**
-     * 「系统认定我们没开」时才写回去——而且**判据用权威那一路，并带冷却**。
+     * 「系统认定我们没开」时自动写回去——判据用**权威那一路**，并带冷却。
      *
-     * ## 为什么不能用 [isListed]（读 Secure 原始串）当判据
+     * ## 为什么需要它：ColorOS 每次开机都会关掉我们的无障碍
      *
-     * 这是 2026-10-08 用户报的「**为什么总是提示检测到 Flyme 小窗获取无障碍权限**」的根因。
+     * `oplus-services.jar` 里的 `OplusRiskAccessibilityController`（特性开关
+     * `oplus.software.accessibility_turn_off`）在 `USER_UNLOCKED` 后 1 秒跑一次，逐个审
+     * 「已启用的第三方无障碍服务」：跳过 OEM 包名 / OPPO 云端白名单 / 系统应用之后，
+     * 剩下的算 `sideload` 就直接 `setAccessibilityServiceState(..., false)` 关掉。
+     * `initiatingPackageName == "com.android.shell"`（adb 安装）**就算 sideload** ⇒ 我们每次开机必被关。
+     * GKD 之所以不受影响，是它的包名在 OPPO 云端白名单里（`accessibility_turn_off_skip_package`），
+     * 第一步就被跳过了。完整证据见 `.workbuddy/memory/A11Y-GRANT.md`。
+     *
+     * ## 为什么判据不能用 [isListed]（读 Secure 原始串）
      *
      * 系统里那条 `enabled_accessibility_services` **不能当真**：ColorOS 会瞬时把本服务从里面
      * 抹掉（见 `FreeformAccessibilityService.isEnabledInSettings` 的注释），几十秒后又自己写回来。
-     * 而**每一次** `settings put` 都会让系统记一笔「本应用刚获得无障碍权限」
-     * （`AccessibilityManagerServiceExtImpl: uploadCollectData … type=AccessibilityEnablePkgName`），
-     * ColorOS 安全中心（`com.oplus.securitypermission`）于是**弹一次**「检测到…获取无障碍权限」。
+     * 据此判断「没开」会白白写一次设置。所以判据用
+     * [FreeformAccessibilityService.isEnabledInSettings]（它除了读那条原始串，还会问
+     * `AccessibilityManager.getEnabledAccessibilityServiceList()`，正是 `dumpsys accessibility`
+     * 里 `Enabled services:` 的来源），外加「已经连上就绝不动手」。
      *
-     * 真机上这个误判极密集：轨迹文件（`files/a11y-trace.log`）里 30 分钟出现 **10 次**
-     * `GRANT_AUTO → GRANT_RESTORE`，而每次紧跟着的那行 `BOOT … 无障碍已开=true` 都说明
-     * **权威判据本来就认为「已启用」**——也就是说这 10 次写入全是白写，纯属自己弹自己。
+     * ## ⚠️ 冷却**不是**为了少弹那条系统框
      *
-     * 所以判据换成 [FreeformAccessibilityService.isEnabledInSettings]（它除了读那条原始串，
-     * 还会问 `AccessibilityManager.getEnabledAccessibilityServiceList()`，正是 `dumpsys
-     * accessibility` 里 `Enabled services:` 的来源），外加「已经连上就绝不动手」。
-     *
-     * ## 冷却
-     *
-     * 即便真到了「确实没开」那一步，也不要每次进程启动都重写一遍：那同样会反复弹提示。
-     * 记录上一次**自动**写回的时刻（[SettingsStore.lastAutoA11yGrantAt]），冷却期内直接跳过。
-     * 用户主动点的那些入口（磁贴 / 设置页那个药丸）走 [restore]，**不受冷却限制**。
+     * 写完之后约 30 秒，ColorOS 手机管家会弹「检测到…获取无障碍权限」（system_server 的
+     * `FraudBehaviorDetectManager` 广播给 `com.oplus.safecenter`）。但那条框**在任何一次**
+     * 重新启用时都会弹——用户手动开、磁贴开、我们写回开，**一模一样**（判定只看「这个包被加进
+     * enabled 列表」，不看是谁加的）。所以「不自动写」并不能省掉它，只会让用户每次开机多一步手动操作。
+     * 冷却的作用只是防「同一个开机周期里被误判 → 反复写」。
      *
      * @return true 表示确实动手写了。
      */
@@ -146,7 +148,7 @@ object AccessibilityGrant {
      * 自动写回的冷却时长。
      *
      * 10 分钟：短到「开机后权限真被清掉」能及时修回来（开机广播本来也不会密集重放），
-     * 长到足以把「同一段时间内反复误判 → 反复写 → 反复弹安全提示」压成一次。
+     * 长到足以把「同一段时间内反复误判 → 反复写」压成一次。
      */
     private const val AUTO_RESTORE_COOLDOWN_MS = 10 * 60 * 1000L
 

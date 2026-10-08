@@ -12,6 +12,8 @@ import android.widget.TextView
  *
  * 面板本身是 Service 里的悬浮 View，它的行为参数没有别的地方可放，集中在这里：
  *
+ * 0. **能不能从扇形进来**——存 `SettingsStore.hideMoreEntry`。它和「主动呼出与扇形设置」页里
+ *    那个「隐藏「更多」入口」是**同一个设置项**，两处读写同一份数据，改哪边另一边都跟着变；
  * 1. **打开时默认显示哪一页**（应用 / 工具）——存 `SettingsStore.drawerDefaultTab`，
  *    面板每次弹出都从这一页开始；
  * 2. **横屏时面板贴哪一侧**（跟随呼出边 / 居中 / 总是贴左 / 总是贴右）——存
@@ -87,8 +89,28 @@ class DrawerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "扇形里点「更多」弹出的那个面板。它的四件事在这里配：打开时先看哪一页、" +
-                    "横屏时贴在屏幕哪一边、工具怎么排、底栏放哪些功能。",
+                "扇形里点「更多」弹出的那个面板。它的一切都在这里配：能不能从扇形进来、" +
+                    "打开时先看哪一页、横屏时贴在屏幕哪一边、工具怎么排、底栏放哪些功能。",
+            ),
+        )
+
+        // ---- 入口 ----
+        //
+        // 和「主动呼出与扇形设置」页里那个开关是**同一个设置项**（`SettingsStore.hideMoreEntry`）：
+        // 两处都能改、改哪边另一边都跟着变（用户 2026-10-08 要求「数据源一致」）。放在这一页
+        // 是因为它的作用就是「进不进得来这个面板」，用户在这儿最容易想到它。
+        root.addView(Ui.sectionTitle(this, "入口"))
+        root.addView(
+            CardGroup(this).row(
+                Ui.switchRow(
+                    this,
+                    "隐藏「更多」入口",
+                    store.hideMoreEntry,
+                    detail = "扇形里不再放「更多」那一格，也就进不去这个面板了",
+                ) { checked ->
+                    store.hideMoreEntry = checked
+                    DebugLog.info("MENU_MORE_HIDDEN", "隐藏「更多」入口=$checked（更多面板页）")
+                },
             ),
         )
 

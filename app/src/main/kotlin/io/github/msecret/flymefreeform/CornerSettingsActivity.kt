@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -16,12 +17,20 @@ import android.widget.TextView
  * 「主动呼出」二级设置页（Material 3 版面）。
  *
  * 从主设置页拆出来：主页面被授权、手势、窗外关闭、应用管理、日志等塞得太长，
- * 这里只放与「主动呼出 / 扇形观感」相关的设置项。
+ * 这里只放与「主动呼出 / 扇形设置」相关的设置项。
  *
  * ## 版面
  *
- * 触摸区（开关与尺寸）→ 扇形观感 → 角落点击 → 图标包。每一组是一张 [CardGroup]，
+ * 触摸区（开关与尺寸）→ 扇形设置 → 角落点击。每一组是一张 [CardGroup]，
  * 组内行之间只有一条内缩分隔线，组与组之间留实缝——不会出现相邻圆角相切造成的凹陷。
+ *
+ * ⚠️ 页面有**三个**恢复默认按钮，语义严格分开（用户 2026-10-08 先报「点触摸区的恢复，把扇形设置
+ * 也一起恢复了」，随后要求「扇形设置也加入恢复默认」）：紧贴「触摸区」那一组的只管那三条
+ * （[resetTouchDefaults]）、紧贴「扇形设置」那一组的只管那五个值（[resetMenuDefaults]）、
+ * 全部恢复在**页面最底部**（[resetToDefaults]）。三者别合并、也别换位置。
+ *
+ * 「图标来源」那一组 2026-10-08 搬到了主界面「功能」tab 卡片上（见 `MainActivity` 的
+ * `iconSourceButton`）：它管的是全局观感，不属于「呼出」这一套参数。
  */
 class CornerSettingsActivity : Activity() {
 
@@ -119,18 +128,55 @@ class CornerSettingsActivity : Activity() {
         )
     }
 
-    /** 恢复所有扇形/触摸区参数到默认值。 */
+    /**
+     * 「触摸区」那一组恢复默认（宽度 / 高度 / 边缘预留）。
+     *
+     * ⚠️ **别把它和 [resetMenuDefaults] / [resetToDefaults] 合并**：页面里每个按钮都紧贴它自己那一组，
+     * 用户 2026-10-08 点「触摸区」下面那个按钮时的预期是「只把上面这三条拨回去」，结果连扇形设置的
+     * 宽度 / 高度 / 离角距离 / 图标大小 / 呼出晃动也一起被重置了——他报的就是这条。
+     * 现在**每组各管各的**，全量恢复单独放在**页面最底部**。
+     */
+    private fun resetTouchDefaults() {
+        resetTouchValues()
+        afterReset()
+    }
+
+    /** 「扇形设置」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。 */
+    private fun resetMenuDefaults() {
+        resetMenuValues()
+        afterReset()
+    }
+
+    /** 全量恢复。入口在**页面最底部**，与上面两个「本组恢复」严格区分。 */
     private fun resetToDefaults() {
+        resetTouchValues()
+        resetMenuValues()
+        afterReset()
+    }
+
+    /** 触摸区三个值写回默认（不刷界面，见 [afterReset]）。 */
+    private fun resetTouchValues() {
         store.cornerRangeDp = SettingsStore.DEFAULT_RANGE_WIDTH_DP
         store.cornerRangeHeightDp = SettingsStore.DEFAULT_RANGE_HEIGHT_DP
         store.edgeInsetDp = SettingsStore.DEFAULT_EDGE_INSET_DP
+    }
+
+    /** 扇形设置五个值写回默认。呼出晃动也算这一组的（默认 30°）。 */
+    private fun resetMenuValues() {
         store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
         store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
         store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
         store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
+        store.menuSwingDeg = SettingsStore.DEFAULT_MENU_SWING_DEG
+    }
+
+    /**
+     * 恢复默认之后的收尾（两个恢复按钮共用）：让服务重读设置、刷新屏幕预览，再**重建界面**——
+     * 滑块的位置只有重建才会回到默认值（`SeekBar` 的位置是建行时定死的）。
+     */
+    private fun afterReset() {
         OverlayGestureService.reload(this)
         refreshPreview()
-        // 重绘界面，让所有滑块回到默认值。
         setContentView(buildContent())
     }
 
@@ -234,10 +280,12 @@ class CornerSettingsActivity : Activity() {
         )
 
         root.addView(Ui.spacer(this))
-        root.addView(Ui.outlinedButton(this, "恢复默认设置") { resetToDefaults() })
+        // 只管上面那三条（宽度 / 高度 / 边缘预留）。**别改回「恢复默认设置」那种全量语义**：
+        // 它紧贴「触摸区」这一组，用户对它的预期就是「把这一组拨回去」，见 [resetTouchDefaults]。
+        root.addView(Ui.outlinedButton(this, "触摸区恢复默认") { resetTouchDefaults() })
 
-        // ---- 扇形观感 ----
-        root.addView(Ui.sectionTitle(this, "扇形观感"))
+        // ---- 扇形设置 ----
+        root.addView(Ui.sectionTitle(this, "扇形设置"))
         root.addView(
             CardGroup(this)
                 .row(
@@ -302,6 +350,21 @@ class CornerSettingsActivity : Activity() {
                     },
                 )
                 .row(
+                    seekRow(
+                        label = "呼出晃动",
+                        value = store.menuSwingDeg,
+                        min = SettingsStore.MIN_MENU_SWING_DEG,
+                        max = SettingsStore.MAX_MENU_SWING_DEG,
+                        detail = "图标呼出时转一下再回正的角度：右下角顺时针、左下角相反。0 = 不转",
+                        unit = "°",
+                    ) { value ->
+                        // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
+                        // 下次呼出就生效，不用重建服务、也不用刷新预览——预览画的是静止几何，
+                        // 而且画的是圆点，转多少度都看不出来。
+                        store.menuSwingDeg = value
+                    },
+                )
+                .row(
                     Ui.switchRow(
                         this,
                         "划过图标时震动",
@@ -309,6 +372,21 @@ class CornerSettingsActivity : Activity() {
                         detail = "沿弧线划过每个图标时给一次触感反馈",
                     ) { checked ->
                         store.menuHapticEnabled = checked
+                    },
+                )
+                .row(
+                    Ui.switchRow(
+                        this,
+                        "隐藏「更多」入口",
+                        store.hideMoreEntry,
+                        detail = "扇形里不再放「更多」那一格，也就进不去面板了",
+                    ) { checked ->
+                        store.hideMoreEntry = checked
+                        // 扇形是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
+                        // 所以下一次呼出就生效，不需要重建服务。
+                        DebugLog.info("MENU_MORE_HIDDEN", "隐藏「更多」入口=$checked")
+                        // 预览开着就地重画：那一格的有无要立刻反映出来（否则用户得重开预览才看到）。
+                        refreshPreview()
                     },
                 ),
         )
@@ -318,9 +396,18 @@ class CornerSettingsActivity : Activity() {
                 "「宽度」管横向伸展、「高度」管纵向伸展，两者一起构成椭圆弧；" +
                     "「离屏幕边距离」决定整条弧离角落多远。\n" +
                     "图标大小与扇形几何**完全解耦**：拖它只改图标本身，轮盘形状、位置、张角都不动，" +
-                    "所以调得比弧上的格子大时会相互重叠，按观感自己取。",
+                    "所以调得比弧上的格子大时会相互重叠，按观感自己取。\n" +
+                    "「呼出晃动」是图标**呼出那一瞬间**绕自身圆心转一下再回正的角度" +
+                    "（右下角顺时针、左下角逆时针；0 = 不转）。" +
+                    "它只是入场动画，跟上面几个值互不影响；想复核效果直接呼出轮盘看就行，" +
+                    "下面那张预览图里画的是圆点，转多少度都看不出来。",
             ),
         )
+
+        root.addView(Ui.spacer(this))
+        // 只管「扇形设置」这一组（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。
+        // 与上面那个「触摸区恢复默认」**对称**：每个按钮只碰它紧挨着的那一组，全量恢复在页面最底部。
+        root.addView(Ui.outlinedButton(this, "扇形设置恢复默认") { resetMenuDefaults() })
 
         // ---- 角落点击 ----
         root.addView(Ui.sectionTitle(this, "角落点击"))
@@ -348,6 +435,13 @@ class CornerSettingsActivity : Activity() {
             root.addView(Ui.tonalButton(this, "前往开启无障碍服务") { FreeformAccessibilityService.openSettings(this) })
         }
 
+        // ---- 全部恢复默认 ----
+        //
+        // 刻意放在**页面最底下**、离上面那个「触摸区恢复默认」尽量远：两个按钮挨在一起时，
+        // 用户分不清谁管谁（这正是他 2026-10-08 报的那个 bug 的一部分）。
+        root.addView(Ui.spacer(this))
+        root.addView(Ui.outlinedButton(this, "全部恢复默认") { resetToDefaults() })
+
         // ---- 通知 ----
         //
         // 这一块**空了**，不是漏了。原来这里有两个开关（「显示常驻通知」「隐藏状态栏通知」），
@@ -357,16 +451,11 @@ class CornerSettingsActivity : Activity() {
         // `OverlayGestureService.startAsForeground`）。所以那条通知现在**一直发**；
         // 用户真不想要，去系统设置里关掉本应用的通知权限即可（服务照常运行）。
 
-        // ---- 图标包 ----
-        root.addView(Ui.sectionTitle(this, "图标包"))
-        iconPackButton =
-            Ui.entryRow(this, "图标包：正在检测…") { cycleIconPack() }
-        root.addView(CardGroup(this).row(iconPackButton))
-        iconPackHint = Ui.hint(this, "正在检测图标包…")
-        root.addView(iconPackHint)
-        updateIconPackLabel()
-        // 图标包检测读资源很慢，放后台线程，避免进入页面卡一下。
-        detectIconPacksAsync()
+        // ---- 图标 ----
+        //
+        // 2026-10-08 按用户要求**搬走了**：图标来源（跟随系统图标集 / 系统默认图标 / 第三方图标包）
+        // 现在是主界面「功能」tab 卡片上的一行，见 `MainActivity` 的 `iconSourceButton`。
+        // 它是全局观感，不属于「呼出」这一套参数，放在这一页最底下本来就不合适。
 
         renderTouchDiagram()
         return Ui.scrollPage(this, root)
@@ -469,44 +558,6 @@ class CornerSettingsActivity : Activity() {
             }
     }
 
-    private lateinit var iconPackButton: android.widget.LinearLayout
-    private lateinit var iconPackHint: TextView
-    private val iconPacks = mutableListOf<String>()
-
-    private fun detectIconPacksAsync() {
-        Thread {
-            val found = IconPackLoader.findIconPacks(this)
-            runOnUiThread {
-                iconPacks.clear()
-                iconPacks.addAll(found)
-                iconPackHint.text =
-                    "只支持「单独的图标包软件」；ColorOS 主题内置图标读不到。检测到 ${found.size} 个，点击切换。"
-                updateIconPackLabel()
-            }
-        }.start()
-    }
-
-    private fun cycleIconPack() {
-        val current = store.iconPackPackage
-        val options = listOf("") + iconPacks // 空 = 不用图标包
-        if (options.size <= 1) return
-        val index = options.indexOfFirst { it == current }
-        val next = options[(index + 1) % options.size]
-        store.iconPackPackage = next
-        OverlayGestureService.reload(this)
-        updateIconPackLabel()
-    }
-
-    private fun updateIconPackLabel() {
-        val current = store.iconPackPackage
-        (iconPackButton.tag as? Ui.RowTexts)?.title?.text =
-            if (current.isBlank()) {
-                "图标包：不使用（默认图标）"
-            } else {
-                "图标包：$current"
-            }
-    }
-
     // ---- 滑块（薄封装：把「点数值胶囊 → 输入具体数字」接到 Ui.seekRow 上） ----
 
     private fun seekRow(
@@ -515,6 +566,7 @@ class CornerSettingsActivity : Activity() {
         min: Int,
         max: Int,
         detail: String? = null,
+        unit: String = "",
         onLive: ((Int) -> Unit)? = null,
         onChange: (Int) -> Unit,
     ): View =
@@ -525,6 +577,7 @@ class CornerSettingsActivity : Activity() {
             min = min,
             max = max,
             detail = detail,
+            unit = unit,
             onLive = onLive,
             onCommit = onChange,
         ) { inputLabel, current, lo, hi, apply ->

@@ -57,13 +57,53 @@ object FreeformCaption {
     private const val CACHE_TTL_MS = 30 * 60 * 1000L
 
     /**
-     * 一次 [closeSwipe] 用的**上滑距离与时长**——和 ColorOS 自带手势同量级（555px / 260ms）。
+     * 参考值：ColorOS 自带「快速上滑关闭」是 **555px / 260ms**（真机实测 3/3 判成关闭：
+     * `startGestureUpOrDown currY=-555 yVel=-2121` → `mGeatureMode.get()=0`）。
      *
-     * 真机实测（平板，横条点上滑 555px/260ms）：3/3 全部判成关闭
-     * （`startGestureUpOrDown currY=-555 yVel=-2121` → `mGeatureMode.get()=0`）。
+     * ⚠️ **它只适合系统自己重放**，我们 `input swipe` 照抄会偏慢 —— 实测 ≥120ms 就会被判成拖动。
+     * 所以这里只留作参照，真正用的是用户设置（见 [swipeDistancePx] / [swipeDurationMs]）。
      */
-    private const val CLOSE_SWIPE_DISTANCE_PX = 555
-    private const val CLOSE_SWIPE_DURATION_MS = 260
+    private const val REFERENCE_SWIPE_PX = 555
+    private const val REFERENCE_SWIPE_MS = 260
+
+    /**
+     * 关闭上滑距离的**绝对下限**（dp）。见 [swipeDistancePx]。
+     *
+     * ColorOS 判「快速上滑」的阈值是 `minDistanceDp = 75`（系统日志原文，平板上
+     * `quickSwipeMinDis=197px` 恰好等于 75dp × 2.625）。真机实测：192px(73dp) 回弹、
+     * 300px(114dp) 关闭。取 150dp 留出余量，同时远小于默认的 40% 短边
+     * （平板 960px、手机 509px），所以对现状零影响——它只在用户把设置项拉到很小
+     * （最低 4%）、或屏幕特别小的机器上才起作用。
+     */
+    private const val MIN_SWIPE_DP = 150
+
+    /** 重试时把距离放大一点，给窗口状态刷新留余量。 */
+    private const val RETRY_FACTOR = 1.4f
+
+    /**
+     * 「快速上滑关闭」这一刀该滑多远（px）。
+     *
+     * ★ 距离与时长**与「窗外关闭」共用同一组用户设置**（[SettingsStore.closeSwipeDistancePercent] /
+     * [SettingsStore.closeSwipeDurationMs]）。两条触发路径最后做的是同一件事，参数当然也该是同一份：
+     * 用户在设置页调好的值，不该只在「点窗外」那条路上生效。
+     *
+     * 为什么不能写死：系统靠「距离 ÷ 时长」判这是甩一下还是拖动，阈值各家 ROM 不同。
+     * 写死一个偏慢的值（例如 260ms）会被判成拖动 —— 小窗先缩一下再关，用户看到的就是
+     * 「动画时间有点长」。默认值往「快」的一侧取，**太慢（≥120ms）就会出这个问题**。
+     */
+    fun swipeDistancePx(context: Context, isRetry: Boolean = false): Float {
+        val store = SettingsStore(context)
+        val metrics = context.resources.displayMetrics
+        val shortEdge = minOf(metrics.widthPixels, metrics.heightPixels).toFloat()
+        val floor = CornerGeometry.dp(context, MIN_SWIPE_DP).toFloat()
+        return maxOf(
+            (shortEdge * store.closeSwipeDistancePercent / 100f) * (if (isRetry) RETRY_FACTOR else 1f),
+            floor,
+        )
+    }
+
+    /** 「快速上滑关闭」这一刀用多久（ms）。见 [swipeDistancePx]。 */
+    fun swipeDurationMs(context: Context): Int = SettingsStore(context).closeSwipeDurationMs
 
     @Volatile
     private var cachedPoint: Point? = null
@@ -147,12 +187,15 @@ object FreeformCaption {
      */
     fun closeSwipe(): Boolean {
         val point = cachedPoint ?: return false
-        val toY = (point.y - CLOSE_SWIPE_DISTANCE_PX).coerceAtLeast(0)
+        val context = AppContext.value ?: return false
+        val distance = swipeDistancePx(context)
+        val durationMs = swipeDurationMs(context)
+        val toY = (point.y - distance).toInt().coerceAtLeast(0)
         DebugLog.info(
             "CAPTION_CLOSE_SWIPE",
-            "(${point.x},${point.y}) -> (${point.x},$toY) ${CLOSE_SWIPE_DURATION_MS}ms",
+            "(${point.x},${point.y}) -> (${point.x},$toY) ${durationMs}ms",
         )
-        return ShizukuShell.injectSwipe(point.x, point.y, point.x, toY, CLOSE_SWIPE_DURATION_MS)
+        return ShizukuShell.injectSwipe(point.x, point.y, point.x, toY, durationMs)
     }
 
 }

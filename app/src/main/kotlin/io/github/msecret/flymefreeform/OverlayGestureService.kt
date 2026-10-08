@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
@@ -22,6 +23,7 @@ import android.os.Looper
 import android.util.TypedValue
 import android.view.Display
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import java.util.concurrent.Executors
@@ -40,8 +42,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "noroot-worker") }
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == Intent.ACTION_SCREEN_OFF) {
-                hideDrawer()
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    hideDrawer()
+                    // 「窗内关闭」的常驻监听跟着屏幕走：灭屏停、亮屏恢复（省电）。
+                    CaptionTapClose.setScreenOn(this@OverlayGestureService, false)
+                }
+                Intent.ACTION_SCREEN_ON -> CaptionTapClose.setScreenOn(this@OverlayGestureService, true)
             }
         }
     }
@@ -198,6 +205,16 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /** 扇形里直接显示的应用，只包含用户显式固定的那些。 */
     private var radialApps: List<AppEntry> = emptyList()
 
+    /**
+     * 扇形里是否还有「更多」那一格。
+     *
+     * ★ 这是**唯一判据**：真实扇形（[showMenu]）与设置页预览（[showMenuPreview] /
+     * [refreshMenuPreview]）都必须照它算槽位数。以前预览写死 `radialApps.size + 1`，
+     * 于是用户关掉「隐藏『更多』入口」的开关后，预览里还多画一个占位圆，和真机对不上。
+     */
+    private val menuHasMore: Boolean
+        get() = allApps.isNotEmpty() && !store.hideMoreEntry
+
     private var activeSide: CornerSide? = null
 
     /**
@@ -230,7 +247,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         runningService = this
         windowManager = getSystemService(WindowManager::class.java)
         store = SettingsStore(this)
-        registerReceiver(screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        registerReceiver(
+            screenOffReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            },
+        )
         // 先记下当前方向，之后的回调才有「变没变」的基准。
         lastLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         getSystemService(DisplayManager::class.java)?.registerDisplayListener(displayListener, handler)
@@ -244,6 +267,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         handler.postDelayed(triggerWatchdog, TRIGGER_WATCHDOG_MS)
         // 服务随开机/更新后重新拉起时会走这里：顺手把 Shizuku 重连监听挂上，授权能自动恢复。
         ShizukuShell.startAutoReconnect()
+        // 「窗内关闭」的常驻监听挂在**本服务**上（它是本应用唯一的常驻前台服务）。
+        // 服务没跑时这个功能不生效，所以这里和 [applySettings] 各同步一次。
+        CaptionTapClose.sync(this)
         // 「应用首字母分组」那套东西提前备好，**全在后台线程**：
         // 1. [AppDrawerPanel.preloadSectionLetters] 把上次算好的「标签 → 字母」读回内存；
         // 2. [AppDrawerPanel.warmSectionLetters] 把 ICU 音译器的一次性规则构建（真机实测
@@ -434,7 +460,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             widthDp = effectiveMenuWidthDp,
             heightDp = effectiveMenuHeightDp,
             iconSizeDp = effectiveIconDp,
-            itemCount = (radialApps.size + 1).coerceAtLeast(1),
+            itemCount = (radialApps.size + if (menuHasMore) 1 else 0).coerceAtLeast(1),
             leftEnabled = store.leftCornerEnabled,
             rightEnabled = store.rightCornerEnabled,
         )
@@ -477,7 +503,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 widthDp = effectiveMenuWidthDp,
                 heightDp = effectiveMenuHeightDp,
                 iconSizeDp = effectiveIconDp,
-                itemCount = (radialApps.size + 1).coerceAtLeast(1),
+                itemCount = (radialApps.size + if (menuHasMore) 1 else 0).coerceAtLeast(1),
                 leftEnabled = store.leftCornerEnabled,
                 rightEnabled = store.rightCornerEnabled,
             )
@@ -496,6 +522,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     override fun onDestroy() {
         isRunning = false
         runningService = null
+        // 宿主没了，「窗内关闭」的常驻监听也要收掉（`isRunning` 已置 false，这一句会走 shutdown）。
+        CaptionTapClose.sync(this)
         handler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(screenOffReceiver) }
         runCatching { getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(displayListener) }
@@ -602,6 +630,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     // ---- 悬浮窗 ----
 
     private fun applySettings() {
+        // 「窗内关闭」与「主动呼出」互不依赖：`enabled` 关掉时下面会移除所有悬浮窗，
+        // 但服务本身还在跑，常驻监听照常。所以这一句要在 `!enabled` 的提前 return **之前**。
+        CaptionTapClose.sync(this)
         if (!store.enabled) {
             DebugLog.info("SETTINGS_DISABLED", "移除所有悬浮窗")
             hideDrawer()
@@ -793,8 +824,40 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                // ★★ 这里**不能加 `FLAG_NOT_TOUCHABLE`**——ColorOS 会给「不可触摸的悬浮窗」记一个
+                // **恒定 `alpha=0.8`**，那层「遮罩」就是它。
+                //
+                // 症状（用户 2026-10-08）：「轮盘呼出来图标颜色是浅的，像蒙了一层遮罩，松手才正常」。
+                // `dumpsys window windows` 抓了个正着（平板 `b37664b8` / ColorOS 16.0.10，
+                // 同一窗口句柄全程未变）：
+                //
+                // | 状态 | `mAttrs` | `mShownAlpha` |
+                // |---|---|---|
+                // | 呼出阶段（手指按着，窗口带本标志） | `alpha=0.8` | `0.8` |
+                // | 按住期间连续采样 6 秒 | `alpha=0.8` | `0.8`（**恒定，不是淡入**） |
+                // | 松手进粘滞态（本标志被清掉） | 无 `alpha=`（=1.0） | 1.0 |
+                //
+                // 像素侧也对得上：按住帧图标区整体亮度 82.1、松手帧 79.2，按住时能透出底下的壁纸。
+                //
+                // 排除过程（都是真机实测，别再重跑一遍）：
+                // - **不是动画**：按住 6 秒期间恒定 0.8，没有渐变。
+                // - **不是我们自己的代码**：`LayoutParams.alpha` 默认就是 `1.0f`，全仓没有任何一处
+                //   给它赋过 0.8（无 `0.8f`、无 `params.alpha`）；同一份 dump 里 ColorOS 还往我们的
+                //   mAttrs 里塞了 `frameRateBoostOnTouch` / `dvrrWindowFrameRateHint` 这类厂商字段，
+                //   说明它确实会改写悬浮窗属性。
+                // - **不是「有触摸在进行」**：粘滞态下按住屏幕（甚至按住状态栏、让触摸落到 SystemUI
+                //   而不是本窗口）8 秒，alpha 全程仍是 1.0。
+                // - **客户端覆盖没用**：加窗后立刻 `updateViewLayout` 把 `params.alpha` 写回 1.0，
+                //   下一次系统 relayout 又被打回 0.8 ⇒ 只能从**标志**上根治，也就是这一处改动。
+                //
+                // 「可触摸」不等于「会抢指针」：呼出阶段的指针流由角落触摸条独占——它是 **modal
+                // 窗口**（故意不加 `FLAG_NOT_TOUCH_MODAL`，见 [triggerParams]），DOWN 落在它身上
+                // 之后整条流都归它，中途再加一个可触摸窗口不会把流抢走。粘滞态本来就要求这个窗口
+                // 可触摸，现在只是从加窗那一刻起就如此（[setMenuTouchable] 因此成了空转）。
+                //
+                // ⚠️ 别照抄到设置页的**预览**窗口（[showMenuPreview]）：那块也是全屏的，但它必须
+                // 不可触摸，否则会吃掉设置页的所有点击——它只画几何示意，被压到 0.8 也无所谓。
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                     WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
@@ -811,13 +874,17 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             view.begin(
                 side = side,
                 apps = radialApps,
-                hasMore = allApps.isNotEmpty(),
+                // 用户可以在设置里关掉「更多」入口（见 SettingsStore.hideMoreEntry）：
+                // 关了之后扇形就没有那一格，于是**没法从轮盘进抽屉**——这正是那个开关的用途。
+                hasMore = menuHasMore,
                 cornerX = cornerX,
                 cornerY = cornerY,
                 widthDp = store.menuWidthDp,
                 heightDp = store.menuHeightDp,
                 iconSizeDp = store.menuIconDp,
                 haptic = store.menuHapticEnabled,
+                // 呼出时图标上下摆动的幅度（度，0 = 不摆）。见 RadialMenuView.enterSwingOffsetY。
+                swingDeg = store.menuSwingDeg,
             )
             menuView = view
             activeSide = side
@@ -1197,12 +1264,20 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         worker.execute { launch(entry) }
     }
 
-    /** 切换菜单窗口的可触摸状态（粘滞态用）。 */
+    /**
+     * 切换菜单窗口的可触摸状态。
+     *
+     * 现在轮盘窗口**从加窗那一刻就是可触摸的**（理由见 [showMenu] 里那段标志说明：
+     * 带 `FLAG_NOT_TOUCHABLE` 会被 ColorOS 记一个恒定 `alpha=0.8`，图标发白），
+     * 所以进入粘滞态这一句通常就是空转。留着是为了别的路径真把它设成不可触摸时能收回来。
+     */
     private fun setMenuTouchable(touchable: Boolean) {
         val view = menuView ?: return
         val params = view.layoutParams as? WindowManager.LayoutParams ?: return
         val masked = (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0
         if (masked == !touchable) return
+        // 顺手把 alpha 也钉回 1：这个 0.8 是跟着标志走的，标志一清就该放掉，这里再写一次是防复现。
+        params.alpha = 1f
         params.flags =
             if (touchable) {
                 params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
@@ -1606,10 +1681,110 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 原生不可用（非 ColorOS / 用户没开小布识屏 / 无障碍没连上）时才退回本项目自己的实现：
      * 遍历无障碍节点树把界面文字读出来。它读不到图片里的字，但至少不会什么都不发生。
      */
+    /**
+     * 注入遮罩：一块**全屏、透明、可点**的浮层，只在注入双指长按时存在 [SHIELD_DURATION_MS]。
+     *
+     * ## 为什么必须有它（用户 2026-10-08：「我们还是会先点一下」）
+     *
+     * 双指长按是**盲注入**，触摸会被 InputDispatcher 派发给「落点最上层那个可点窗口」。不盖东西时，
+     * 那个窗口就是**前台应用本身**，于是应用先自己反应一下（长按了内容 / 打开了图片或帖子），
+     * 识屏面板随后才出来——用户看到的正是「先点了一下、按到应用的内容」。
+     *
+     * 实测（平板 `b37664b8` / ColorOS 16.0.10 / 酷安，判据是 `adb logcat -b events` 的
+     * `input_interaction`，它直接给出触摸最后落到哪个窗口）：
+     *
+     * | 注入落点上盖着谁 | `input_interaction` 落到 | 应用反应 | 识屏 |
+     * |---|---|---|---|
+     * | 什么都不盖 | **酷安窗口** | 跳去了帖子详情页 | 照常触发 |
+     * | 盖住之后 | **我们这块浮层** | 零事件 | 照常触发 |
+     *
+     * **识屏是系统侧按输入流识别的**，与触摸最后落到哪个窗口无关 —— 所以把自己的窗口盖上去
+     * 既能挡住应用，又不会把识屏一起挡住。这也是同类第三方实现的做法（它同样有一块全屏可点的浮层）。
+     *
+     * ## 三个不能改的细节
+     *
+     * - **绝不能加 `FLAG_NOT_TOUCHABLE`**：加了触摸会直接穿到应用，这块浮层就白盖了。
+     * - **盖完要等一帧再注入**（[SHIELD_SETTLE_MS]）：`addView` 返回时系统还没把它算进
+     *   「可点窗口」，立刻注入的话触摸仍旧落到应用上 —— 第一版就是这么翻车的（日志里遮罩窗口
+     *   明明在，`input_interaction` 却还是酷安窗口）。
+     * - **按压缩完就立刻撤**（[SHIELD_TAIL_MS]）：它铺满全屏又可点，留着会挡住用户在识屏面板上的
+     *   手势（用户实测反馈「左右滑动被挡到了」）。所以它只在「注入 → 按压结束」这一小段存在。
+     */
+    private var gestureShield: View? = null
+
+    private fun coverGestureShield() {
+        if (gestureShield != null) return
+        val shield = View(this)
+        // 完全透明：它只负责「接住」注入的触摸，不该有任何观感。
+        shield.setBackgroundColor(Color.TRANSPARENT)
+        // 把落上来的触摸消费掉（真正起作用的是「窗口可点」，这一句是顺带）。
+        shield.setOnTouchListener { _, _ -> true }
+        val params =
+            WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                // ← 这里**故意没有** FLAG_NOT_TOUCHABLE，见上面的说明。
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+                gravity = Gravity.FILL
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                title = "FlymeFreeformNoRootGestureShield"
+            }
+        if (!runCatching { windowManager.addView(shield, params) }.isSuccess) {
+            DebugLog.warn("SCREEN_TEXT_SHIELD_FAILED", "遮罩没加上，注入会落到前台应用上")
+            return
+        }
+        gestureShield = shield
+        // 兜底：正常路径都会在按压结束时主动撤（见 [runScreenText]），这里只是保证它不会永远挂着。
+        handler.postDelayed({ uncoverGestureShield() }, SHIELD_SAFETY_MS)
+    }
+
+    /** 撤掉注入遮罩（见 [coverGestureShield]）。 */
+    private fun uncoverGestureShield() {
+        val shield = gestureShield ?: return
+        gestureShield = null
+        runCatching { windowManager.removeView(shield) }
+    }
+
     private fun runScreenText() {
-        // 成功时不弹任何提示：小布识屏的面板本身就是反馈，再压一条 HUD 只会挡住内容。
-        if (NativeScreenText.trigger(this)) return
-        runOwnScreenText()
+        // 注入前先盖上 [gestureShield]：否则那记双指按压会先打到前台应用身上。
+        // 但**盖完不能立刻注入**——`addView` 返回时系统还没把这个窗口登记成「可点窗口」，
+        // 真机实测（平板 / 酷安）立刻注入的话触摸仍旧落到酷安窗口上。隔一帧再注入就稳了。
+        coverGestureShield()
+        handler.postDelayed({
+            // 成功时不弹任何提示：小布识屏的面板本身就是反馈，再压一条 HUD 只会挡住内容。
+            when (NativeScreenText.trigger(this)) {
+                NativeScreenText.Outcome.TRIGGERED ->
+                    // 按压缩完就撤：识屏面板要再过一会儿才出现，撤在它之前就不会挡用户在面板上的
+                    // 左右滑动（[SHIELD_TAIL_MS] 只是让 UP 事件也已经落到遮罩上）。
+                    handler.postDelayed(
+                        { uncoverGestureShield() },
+                        NativeScreenText.PRESS_DURATION_MS + SHIELD_TAIL_MS,
+                    )
+                // 桌面不支持识屏。**必须在这里收住**：双指按压是盲注入、落点在屏幕正中，
+                // 在桌面上正好落在图标上，会触发「长按图标」（用户 2026-10-08 报的正是这个）；
+                // 而退回自研读字也只会读出一屏图标名，同样没意义。
+                //
+                // 这句提示**故意不带 toolId**：`showToolMessage(msg, toolId)` 开头有个 guard，
+                // 只要 toolId 不是手电筒就整句丢弃（那就是「工具提示一律静默」的实现）。带上 id
+                // 等于什么都不显示，用户只会觉得「在桌面点识屏没反应」。
+                NativeScreenText.Outcome.UNSUPPORTED -> {
+                    // 没注入就不该继续挡着屏幕（遮罩本可以撑到 1.5s）。见 [uncoverGestureShield]。
+                    uncoverGestureShield()
+                    showToolMessage("桌面不支持小布识屏")
+                }
+                NativeScreenText.Outcome.FALLBACK -> {
+                    uncoverGestureShield()
+                    runOwnScreenText()
+                }
+            }
+        }, SHIELD_SETTLE_MS)
     }
 
     /** 后备：本项目自己的读字实现（见 [FreeformAccessibilityService.screenText]）。 */
@@ -1800,6 +1975,29 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val CHANNEL_ID = "noroot_corner_gesture"
 
         private const val NOTIFICATION_ID = 1001
+
+        /**
+         * 盖好注入遮罩之后、真正注入之前要等的时间（ms）。见 [coverGestureShield]。
+         *
+         * `addView` 返回 ≠ 系统认得这个窗口：WMS 要走一次 relayout，InputDispatcher 才会把它算进
+         * 「可点窗口」。等太久白让用户多等，等太少触摸又会穿到应用上 —— 200ms 是实测够用的值。
+         */
+        private const val SHIELD_SETTLE_MS = 200L
+
+        /**
+         * 按压缩完之后，遮罩还要多留一会儿（ms）。见 [coverGestureShield]。
+         *
+         * **不能留久**：面板一出来用户就要能在上面左右滑，遮罩是铺满全屏且可点的，留着就挡手
+         * （用户 2026-10-08：「识屏工具的左右滑动也挡到了我滑动」）。所以只在按压那 700ms 上再
+         * 加这么一点点，保证 UP 事件也已经落到遮罩上。
+         */
+        private const val SHIELD_TAIL_MS = 120L
+
+        /**
+         * 遮罩的**兜底**存在上限（ms）。正常路径都会提前主动撤（见 [coverGestureShield] 的调用点），
+         * 这一条只是保证任何异常分支下它都不会一直挂在那儿挡屏。
+         */
+        private const val SHIELD_SAFETY_MS = 2_500L
 
         /**
          * 遮罩要给角落触摸条让开的两块矩形，供 [FreeformAccessibilityService] 抠洞用。

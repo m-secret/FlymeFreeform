@@ -55,7 +55,12 @@ object MenuGeometry {
         )
     }
 
-    /** 某个槽位的图标圆心（屏幕坐标）。 */
+    /**
+     * 某个槽位的图标圆心（屏幕坐标）。
+     *
+     * ⚠️ 这里**只算静止位置**。入场的「摆动」动画是绘制期叠上去的一个**垂直位移**
+     * （见 `RadialMenuView.enterSwingOffsetY`），不参与本函数——否则命中判定会跟着漂。
+     */
     fun centerAt(
         index: Int,
         side: CornerSide,
@@ -65,7 +70,8 @@ object MenuGeometry {
         radiusY: Float,
         layout: Layout,
     ): Pair<Float, Float> {
-        val angle = Math.toRadians((layout.angleStartDeg + layout.stepDeg * index).toDouble())
+        val angle =
+            Math.toRadians((layout.angleStartDeg + layout.stepDeg * index).toDouble())
         val dx = (radiusX * cos(angle)).toFloat()
         val dy = (radiusY * sin(angle)).toFloat()
         return if (side == CornerSide.Left) {

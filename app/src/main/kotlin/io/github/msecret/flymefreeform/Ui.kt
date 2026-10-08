@@ -443,18 +443,29 @@ object Ui {
         }
 
     /**
-     * 把一枚「行内小动作」（[smallAction]）放进**不撑满宽度**的容器里。
+     * 把若干枚「行内小动作」（[smallAction]）放进**不撑满宽度**的容器里。
      *
      * 纵向 `LinearLayout` 直接 `addView(view)`，默认布局参数是 **MATCH_PARENT 宽**
      * （`LinearLayout.generateDefaultLayoutParams()`：竖排 = 整宽 + wrap 高），
      * 于是那枚「小药丸」会被拉成一整条大按钮——用户反馈「太显眼、占用了一大块」就是这个。
      * 横向容器里的默认参数才是 wrap 宽，药丸才是药丸。
+     *
+     * 多枚之间留 8dp 实缝：两颗药丸贴在一起会被看成一颗（`marginStart` 只加在第二颗起，
+     * 第一颗不加，否则整行会向右偏 8dp）。
      */
-    fun actionRow(context: Context, action: View): LinearLayout =
+    fun actionRow(context: Context, vararg actions: View): LinearLayout =
         LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(action)
+            actions.forEachIndexed { index, action ->
+                addView(
+                    action,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { if (index > 0) marginStart = dp(context, 8) },
+                )
+            }
         }
 
     /** `bodyLarge`：行里的主文字。 */
@@ -744,6 +755,10 @@ object Ui {
      *
      * 数值做成**可点的胶囊**：点一下直接输入具体数字，比在滑块上瞄半天准得多。
      *
+     * [unit] 是数值胶囊里跟在数字后面的单位（如 `"°"`）。**只影响显示**，滑块与回调拿到的仍是纯数字：
+     * 光一个「20」在「呼出晃动」这种行上分不清是度、是 dp 还是百分比。默认空串 = 只显示数字
+     * （既有那几条 dp 滑块照旧）。
+     *
      * [onLive] 是**拖动过程中**的回调（每帧都会来），只给那些「需要边拖边看」的场景用——
      * 例如「左右边缘预留」下面那张示意图，拖的时候图要跟着动，用户才看得懂这个值在改什么。
      * 真正的落库仍然走 [onCommit]（抬手才触发一次），别把写设置干的事塞进 [onLive]。
@@ -755,6 +770,7 @@ object Ui {
         min: Int,
         max: Int,
         detail: String? = null,
+        unit: String = "",
         onLive: ((Int) -> Unit)? = null,
         onCommit: (Int) -> Unit,
         onOpenInput: (label: String, current: Int, min: Int, max: Int, apply: (Int) -> Unit) -> Unit,
@@ -773,7 +789,7 @@ object Ui {
                 background =
                     rippleOver { pillShape(context, COLOR_PRIMARY_CONTAINER) }
                 isClickable = true
-                text = value.toString()
+                text = "$value$unit"
             }
         val captionRow =
             LinearLayout(context).apply {
@@ -794,7 +810,7 @@ object Ui {
                     object : SeekBar.OnSeekBarChangeListener {
                         override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                             val current = min + progress
-                            valueView.text = current.toString()
+                            valueView.text = "$current$unit"
                             // 拖动过程中的即时反馈（示意图跟手）。写设置不在这里做。
                             onLive?.invoke(current)
                         }
@@ -810,7 +826,7 @@ object Ui {
         valueView.setOnClickListener {
             onOpenInput(label, min + bar.progress, min, max) { newValue ->
                 bar.progress = newValue - min
-                valueView.text = newValue.toString()
+                valueView.text = "$newValue$unit"
                 onCommit(newValue)
             }
         }

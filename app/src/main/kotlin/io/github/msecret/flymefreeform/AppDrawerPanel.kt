@@ -949,8 +949,30 @@ class AppDrawerPanel(
                 return (paddingTop - child.top).coerceAtLeast(0)
             }
 
-        /** 列表当前滚离顶部的像素数（仅用于回顶部动画）。 */
+        /**
+         * 列表当前滚离顶部的量（仅用于回顶部动画）。
+         *
+         * ⚠️ **别把它当成像素用**。它是 `View` 那套**滚动条三元组**之一
+         * （`computeVerticalScrollOffset()` / `…ScrollRange()` / `…ScrollExtent()`），
+         * 单位由框架自己定（`AbsListView` 里就是「行高的百分之一」，不是 px）。
+         *
+         * 那套单位不影响使用——只要**三个方法用同一套单位**，`offset / range / extent`
+         * 之间的比值就是对的。所以回顶部要用 [maxScrollPx] 当距离（见 [onStar]），
+         * 而不是拿它去乘行高换算成像素。
+         */
         val scrollOffsetPx: Int get() = computeVerticalScrollOffset().coerceAtLeast(0)
+
+        /**
+         * 滚动条量程 = `range − extent`，也就是「最多还能滚多少」。
+         *
+         * ★ 它和 [scrollOffsetPx] **同一套单位**，而且当前偏移**永远 ≤ 它**（滚动条的滑块走不出轨道）。
+         * 所以「按它滚」一定过量、一定到顶——ListView 到顶会自己夹住。这就是 [onStar] 里
+         * 那个 delta 的来源：**不需要知道单位是什么，也不需要估算**。
+         */
+        val maxScrollPx: Int
+            get() =
+                (computeVerticalScrollRange() - computeVerticalScrollExtent())
+                    .coerceAtLeast(0)
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             if (event.actionMasked == MotionEvent.ACTION_DOWN) {
@@ -1461,6 +1483,10 @@ class AppDrawerPanel(
      * 索引条 View 的总宽度 = 字母列 + 气泡直径 + 两侧留白。
      *
      * 气泡比字母列宽得多，View 只有够宽才装得下，否则左侧的气泡会被父容器裁掉一半。
+     *
+     * ⚠️ 这里面每一段都按 [shortEdgePx]（**等效短边**）算，所以 [AlphabetIndexView] 内部也必须
+     * 用同一个值当基准——它自己那份比例一旦换成别的尺子（比如原始短边），这里量出来的宽度就不再
+     * 装得下它画的东西：平板上一度就是「气泡胀成两倍、压住字母列，最宽的 W 被裁掉」。
      */
     private fun indexTotalWidthPx(): Int {
         val bubbleR = shortEdgePx * AlphabetIndexView.BUBBLE_R_FRACTION
@@ -1784,6 +1810,10 @@ class AppDrawerPanel(
                 context,
                 letters,
                 letterColumnWidthPx = dp(INDEX_WIDTH_DP),
+                // ★ 基准必须**和面板同一个值**（[indexTotalWidthPx] 就是用 `shortEdgePx` 算的宽度）。
+                // 早先索引条自己在内部读 `displayMetrics` 的原始短边，平板（原始 2400 / 等效 1207）
+                // 上字样与气泡被放大一倍，字母列装不下字形。见 [AlphabetIndexView] 类注释。
+                shortEdgePx = shortEdgePx,
                 onLetter = { letter ->
                     Haptics.tick(context)
                     queueIndexLetter(letter)
@@ -1808,18 +1838,45 @@ class AppDrawerPanel(
                     // 而「已选」的上滑偏移是跟滚动量 1:1 的，两者同一时长收尾，不会出现
                     // 「已选滑完了、内容还在慢慢爬」的滞涩。
                     val distance = (listView as? DrawerListView)?.scrollOffsetPx ?: 0
+                    // 本次动画实际用的时长；收尾校验按它延后（见下）。
+                    var duration = STAR_SCROLL_MS
                     if (distance <= 0) {
                         listView.setSelection(0)
                         applySelectorScroll(0)
                     } else {
-                        // 多滚半屏当保险：免得估算偏小、停在半路上。
-                        listView.smoothScrollBy(
-                            -(distance + listView.height / 2),
-                            STAR_SCROLL_MS,
+                        // ★ 距离取**滚动条量程**（`range − extent`），而不是「估算偏移 + 保险」。
+                        //
+                        // 为什么：`scrollOffsetPx` 来自 `computeVerticalScrollOffset()`，属于 `View` 的
+                        // **滚动条三元组**，单位并不是 px（`AbsListView` 里是「行高的百分之一」）。
+                        // 早先把它当像素用、再加一个「半屏 / 按比例」的保险——两个量不同量纲，
+                        // 怎么调都对不上：于是停在半路，「已选」只露一半（用户 2026-10-08）。
+                        //
+                        // 而 `range − extent` 与它**同一套单位**，且当前偏移**永远 ≤ 它**，
+                        // 所以按它滚一定过量、一定到顶（ListView 到顶会自己夹住）。
+                        // ⇒ 不需要知道单位是什么，也不需要估算。
+                        val maxScroll = (listView as? DrawerListView)?.maxScrollPx ?: 0
+                        val delta = maxScroll + 1
+                        // 时长按 `delta / distance` 等比放大：这个比值是**无量纲**的，所以与单位无关。
+                        // 多滚出来的那截会让可见动作变快，放大之后才保住「看得出是滚上去的」。
+                        duration =
+                            (STAR_SCROLL_MS.toLong() * delta / distance)
+                                .coerceIn(STAR_SCROLL_MS.toLong(), STAR_SCROLL_MAX_MS.toLong())
+                                .toInt()
+                        DebugLog.info(
+                            "STAR_SCROLL",
+                            "distance=$distance maxScroll=$maxScroll delta=$delta duration=$duration",
                         )
+                        listView.smoothScrollBy(-delta, duration)
                     }
                     // 不在这里直接放回「已选」：滚动会一路回调 onScroll，偏移按纯映射跟着
                     // 一点点放回来，和内容一起「走」回去——比瞬间弹开自然得多。
+                    //
+                    // ★ 上面那套终究是**估算**（距离 + 按比例放的保险），所以动画结束后再确认一次：
+                    // 到顶就是空操作，没到顶才平滑补完。详见 [settleAtTopAfterStarScroll]。
+                    listView.postDelayed(
+                        { settleAtTopAfterStarScroll() },
+                        (duration + STAR_SETTLE_SLACK_MS).toLong(),
+                    )
                 },
             )
         holder.addView(
@@ -1966,6 +2023,48 @@ class AppDrawerPanel(
         // `child.top` 是相对 ListView 顶边的，而列表带一个「已选」那么高的上内边距
         // （见 [headerInsetPx]）——滚到顶时它是 paddingTop 而不是 0，减掉才是真正的滚动量。
         return (view.paddingTop - child.top).coerceAtLeast(0)
+    }
+
+    /**
+     * 「点星星回顶部」的**收尾校验**：动画结束后确认真的在最顶上，没到就补一段。
+     *
+     * ## 为什么留着它（用户 2026-10-08：「手机横屏时滑动索引划到星星，已选只显示一半」）
+     *
+     * 那次事故的根因是 [onStar] 把 `computeVerticalScrollOffset()` 的返回值**当像素用**，
+     * 而它是 `View` **滚动条三元组**里的一个量、单位不是 px（详见 [DrawerListView.scrollOffsetPx]
+     * 与 [DrawerListView.maxScrollPx] 的注释）。现在距离改成 `range − extent`，一定过量、一定到顶，
+     * 所以这条**正常情况下应该什么都不做**。
+     *
+     * 留着的理由：它把「到没到顶」变成**确定性的**——万一哪天又有人改回估算、或者框架行为变了，
+     * 用户最多看到一次平滑补完，而不是停在半路。
+     *
+     * ## 判据为什么是精确的
+     *
+     * [currentScrollOffset] 只在**真正到顶**时才返回 0（到顶 ⟺ 首个可见项的 `top` 正好等于列表的
+     * 上内边距）；只要偏了一点就是正数，滚过一整行则直接是 [OVERSCROLLED]。
+     * 所以「到顶 → 空操作，没到顶 → 补一段」这个判断不会误伤。
+     *
+     * 正在拖 / 惯性滑行时不动手：那时到没到顶由用户的手决定，插一脚就是抢方向盘。
+     */
+    private fun settleAtTopAfterStarScroll() {
+        if (!::listView.isInitialized) return
+        if (activeTab != TAB_APPS) return
+        if (appsListScrolling) return
+        val offset = currentScrollOffset()
+        if (offset == 0) return
+        // 只差**不到一行**：`firstVisiblePosition` 还是 0，所以这个量是**精确的**，
+        // 平滑补完即可。**不能**用 `setSelection(0)` 瞬移——用户 2026-10-08 实测反馈
+        // 「到一半、卡一下、出现全部」，那一刀就是那个「卡一下」。
+        if (offset < OVERSCROLLED) {
+            DebugLog.info("STAR_SCROLL_SETTLE", "还差 ${offset}px（不足一行），平滑补完")
+            listView.smoothScrollBy(-(offset + 1), STAR_SETTLE_MS)
+            return
+        }
+        // 差得远超一行：这时 `currentScrollOffset()` 只会给 [OVERSCROLLED]，**量不到真实距离**，
+        // 只能离散定位。好在此时「已选」本来就整块滑走了，跳一下不容易被察觉。
+        DebugLog.info("STAR_SCROLL_SETTLE", "还差超过一行（off=$offset），离散定位")
+        listView.setSelection(0)
+        applySelectorScroll(0)
     }
 
     /**
@@ -3797,6 +3896,30 @@ class AppDrawerPanel(
          * 「一下就上去了、但仍看得出是滚的」。
          */
         const val STAR_SCROLL_MS = 130
+
+        /**
+         * 「点星星回顶部」那次滚动的**时长上限**。
+         *
+         * 时长按 `delta / distance` 等比放大（见 [onStar]），距离特别长时那一段会拉得很长，
+         * 手感变成「慢慢推上去」。封顶之后长距离也只是稍微快一点，不会变成一次「爬行」。
+         */
+        const val STAR_SCROLL_MAX_MS = 400
+
+        /**
+         * 「点星星回顶部」收尾时、平滑补完那不到一行的距离所用的时长（见 [settleAtTopAfterStarScroll]）。
+         *
+         * 距离不到一行，所以它只是一小段「接着走完」的动画；80ms 够短到不像第二次动作，
+         * 又够长到不是瞬移。
+         */
+        const val STAR_SETTLE_MS = 80
+
+        /**
+         * 「点星星回顶部」动画结束后、再等多久做收尾校验（见 [settleAtTopAfterStarScroll]）。
+         *
+         * 60ms 是给「最后一帧的 `onScroll` 已经派发完」留的余量：校验本身只读一次坐标、
+         * 到顶就返回，早一点晚一点都无所谓，但不能早到动画还没跑完（那会把一次正常的滚动判成「没到位」）。
+         */
+        const val STAR_SETTLE_SLACK_MS = 60
 
         /**
          * 「已选」的高度不再有任何阈值 / 动画常量。
