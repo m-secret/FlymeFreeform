@@ -627,35 +627,6 @@ class SettingsStore(context: Context) {
                 .putInt(KEY_MENU_SPAN_DEG, value.coerceIn(MIN_MENU_SPAN_DEG, MAX_MENU_SPAN_DEG))
                 .apply()
 
-    // ---- 「链接小窗」：别的应用发起的链接，直接用浏览器小窗打开 ----
-    //
-    // 整件事的入口是 [LinkOpenActivity] —— 本应用在清单里注册成 http/https 的处理者之一
-    // （`ACTION_VIEW` + `DEFAULT` + `BROWSABLE`），用户把本应用设成「默认浏览器」之后，
-    // 点链接就会先经过我们，我们再转交给**真正的**浏览器（见 [linkFreeformBrowser]）
-    // 并要求系统按小窗打开（见 `LinkFreeform.open`）。
-    //
-    // ⚠️ 用户**没**把本应用设成默认浏览器时，这两项什么都不影响 —— 只是我们在系统弹出的
-    // 「打开支持的应用」里多了一个候选项，用户不选就不会被走到。
-
-    /**
-     * 「链接用小窗打开」的总开关。默认 **开**。
-     *
-     * 默认开是安全的：这一项**只有在用户把本应用设成默认浏览器之后才会被走到**（见上面那段），
-     * 而用户去做那一步，图的就是小窗 —— 真把链接开成全屏才是他不想要的。
-     * 关掉它也不等于链接打不开：只是退回「交给浏览器、按它自己的方式（全屏）打开」。
-     */
-    var linkFreeformEnabled: Boolean
-        get() = preferences.getBoolean(KEY_LINK_FREEFORM_ENABLED, true)
-        set(value) = preferences.edit().putBoolean(KEY_LINK_FREEFORM_ENABLED, value).apply()
-
-    /**
-     * 转交给哪个浏览器（包名）。空 = 还没选过，由 `LinkFreeform.resolve` 去猜
-     * （只认系统「默认浏览器」那个角色，**且不能是本应用自己** —— 那就是死循环）。
-     */
-    var linkFreeformBrowser: String
-        get() = preferences.getString(KEY_LINK_FREEFORM_BROWSER, "").orEmpty()
-        set(value) = preferences.edit().putString(KEY_LINK_FREEFORM_BROWSER, value).apply()
-
     // ---- 触感（振动）：一处总开关 + 四条行为各自的开关 ----
     //
     // 全都在「功能」tab →「触感」页调（`HapticSettingsActivity`）。**别再往各自主页里塞一份**：
@@ -1528,10 +1499,6 @@ class SettingsStore(context: Context) {
         private const val KEY_ICON_PACK = "icon_pack_package"
         private const val KEY_USE_SYSTEM_ICON_SET = "use_system_icon_set"
 
-        /** 「链接小窗」（见 [SettingsStore.linkFreeformEnabled]）。 */
-        private const val KEY_LINK_FREEFORM_ENABLED = "link_freeform_enabled"
-        private const val KEY_LINK_FREEFORM_BROWSER = "link_freeform_browser"
-
         /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
         private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
 
@@ -1659,8 +1626,6 @@ class SettingsStore(context: Context) {
                 KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX, KEY_HAPTIC_STRENGTH,
                 // 图标
                 KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
-                // 「链接小窗」
-                KEY_LINK_FREEFORM_ENABLED, KEY_LINK_FREEFORM_BROWSER,
                 // 其它
                 KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
                 KEY_AUTO_UPDATE_INTERVAL_HOURS,

@@ -82,9 +82,6 @@ class MainActivity : Activity() {
      */
     private lateinit var iconSourceButton: LinearLayout
 
-    /** 「功能 → 小窗 → 链接用小窗打开」那一行（副标题跟着开关与默认浏览器状态变）。 */
-    private lateinit var linkRow: LinearLayout
-
     private lateinit var serviceButton: TextView
     private lateinit var overlayRow: PermissionRow
     private lateinit var shizukuRow: PermissionRow
@@ -539,15 +536,7 @@ class MainActivity : Activity() {
             freeformState == SystemSupport.FreeformState.OURS ||
                 freeformState == SystemSupport.FreeformState.AOSP,
         )
-        // 「链接小窗」：别的应用点链接时，让浏览器**直接以小窗**出来。
-        // ★ 这一行**不跟着上面那行置灰**：它不依赖 ColorOS 的窗口形态，只要系统里有自由窗
-        //   （本应用认得出的那一套）就能用，而且前提条件（设为默认浏览器）是用户自己在系统里做的。
-        val linkRow =
-            Ui.entryRow(this, "跳转用小窗打开", linkRowDetail()) {
-                openPage(Intent(this, LinkSettingsActivity::class.java))
-            }
-        this.linkRow = linkRow
-        featureTab.addView(CardGroup(this).row(closeModeRow).row(linkRow))
+        featureTab.addView(CardGroup(this).row(closeModeRow))
         when (freeformState) {
             SystemSupport.FreeformState.OURS -> Unit
             // AOSP 形态（vivo / 小米）：**启动**这条路已经按标准参数写好（windowingMode 5），
@@ -598,24 +587,6 @@ class MainActivity : Activity() {
      * `getApplicationLabel` 而已，主线程完全吃得消。要扫全部的是「让用户挑一个」那个场景
      * （`IconPackLoader.findIconPacks`），和这里无关。
      */
-    /**
-     * 「链接用小窗打开」那一行的副标题。
-     *
-     * 三档，**只讲当前状态**（会变的数字一律放副标题，见 [Ui.entryRow]）：
-     * 关着 / 开着但还不是默认浏览器（★ 这一步最容易漏，也是这一行唯一值得提醒的东西）/
-     * 开着且已经就绪（顺手报一下转交给谁）。
-     *
-     * 代价说明：[LinkFreeform.isDefaultBrowser] 只是读一次 RoleManager，[LinkFreeform.resolve]
-     * 会查一次「谁能处理 https」——都是轻查询，放在 [refreshStatus]（`onStart` / `onResume` 各一次）
-     * 里完全吃得消。
-     */
-    private fun linkRowDetail(): String =
-        when {
-            !store.linkFreeformEnabled -> "已关"
-            !LinkFreeform.isDefaultBrowser(this) -> "已开 · 需把本应用设为默认浏览器"
-            else -> "已开 · 转交 ${LinkFreeform.resolve(this, store)?.label ?: "（还没选浏览器）"}"
-        }
-
     private fun updateIconSourceLabel() {
         val texts = iconSourceButton.tag as? Ui.RowTexts ?: return
         val pack = store.iconPackPackage
@@ -1124,9 +1095,6 @@ class MainActivity : Activity() {
             "轮盘 ${store.pinnedComponents.size} / ${SettingsStore.MAX_PINS}"
         // 图标来源可能在别处（以后加别的入口）被改，回页面时对一次。
         updateIconSourceLabel()
-        // 「链接用小窗打开」的副标题跟着「开关 / 是不是默认浏览器」变 —— 用户很可能刚从系统界面
-        // 设完默认浏览器回来，这一行必须自己更新，不能停在旧状态。
-        (linkRow.tag as? Ui.RowTexts)?.detail?.text = linkRowDetail()
         // 「更新与下载」入口的副标题要跟着「有没有新版本」变（自动检查在 [UpdateCenter] 里跑）。
         refreshAboutRows()
     }

@@ -104,40 +104,6 @@
             android:exported="false"
             android:label="图标" />
 
-        <!--
-          链接小窗（见 LinkFreeform / LinkOpenActivity）：
-          本应用在系统里**作为一个 http/https 的处理者**登记 —— 用户把它设成「默认浏览器」之后，
-          点链接就会先到这里，我们再转交给真正的浏览器、并要求系统按小窗打开。
-
-          - `taskAffinity=""` + `excludeFromRecents` + `noHistory`：它只做一次转发就 `finish()`，
-            不该跟调用方的 task 纠缠、也不该在「最近任务」里留一个点不开的空壳；
-          - 透明主题：转发的这一瞬间用户不该看见任何界面。
-        -->
-        <activity
-            android:name=".LinkOpenActivity"
-            android:excludeFromRecents="true"
-            android:exported="true"
-            android:label="@string/app_name"
-            android:noHistory="true"
-            android:taskAffinity=""
-            android:theme="@style/Theme.FlymeFreeformNoRoot.Transparent">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-
-                <data android:scheme="http" />
-                <data android:scheme="https" />
-            </intent-filter>
-        </activity>
-
-        <!-- 链接小窗的设置页（开关 / 默认浏览器 / 转交给哪个浏览器）。 -->
-        <activity
-            android:name=".LinkSettingsActivity"
-            android:exported="false"
-            android:label="跳转小窗" />
-
         <!-- 关于：版本 / 主页 + 更新与下载（自动更新、检查更新、更新日志、下载链接）。 -->
         <activity
             android:name=".AboutActivity"
