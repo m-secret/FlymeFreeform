@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 
@@ -112,10 +113,20 @@ object SystemSupport {
 
     /** 这台机器上「小窗」是个什么局面，给界面一句话用（**别在调用点按品牌写 if**）。 */
     enum class FreeformState {
-        /** 本应用这条链路可用（ColorOS）。 */
+        /** 本应用这条链路完整可用（ColorOS：启动 + 识别 + 关闭都接得上）。 */
         OURS,
 
-        /** **系统自己就带小窗**（Flyme）—— 不是「坏了」，所以界面上不该用警告色。 */
+        /**
+         * **系统自带 AOSP 形态的小窗**（vivo OriginOS / 小米 MIUI·澎湃）。
+         *
+         * 依据：两家官方适配文档都写明自己的小窗**基于 Android 的多窗口 Freeform 方案**
+         * （见 `AospFreeform` 的说明），所以它们会声明
+         * [PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT] 这条公开特性。
+         * ⇒ 启动可以走标准参数；识别 / 关闭是另一套，得真机取证。
+         */
+        AOSP,
+
+        /** **系统自己就带小窗，但形态没适配**（Flyme）—— 不是「坏了」，界面上不该用警告色。 */
         NATIVE,
 
         /** 谁都没有。 */
@@ -125,19 +136,36 @@ object SystemSupport {
     fun freeformState(context: Context): FreeformState =
         when {
             freeformUsable(context) -> FreeformState.OURS
+            hasAospFreeform(context) -> FreeformState.AOSP
             isFlyme(context) -> FreeformState.NATIVE
             else -> FreeformState.NONE
         }
 
     /**
+     * 这台机器声明了 **AOSP 的自由窗**（`android.software.freeform_window_management`）。
+     *
+     * 这是**公开特性**，不用认识品牌就能问出「这台机器有没有 AOSP 形态的小窗」——
+     * vivo / 小米 的官方文档都说明它们的小窗就是基于这套 Freeform 方案实现的。
+     *
+     * ⚠️ 它只回答「**系统有**」，不代表第三方一定发得起来（见 `FreeformProtocol` 的说明）。
+     */
+    private fun hasAospFreeform(context: Context): Boolean =
+        runCatching {
+            context.packageManager.hasSystemFeature(
+                PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT,
+            )
+        }.getOrDefault(false)
+
+    /**
      * [freeformState] 给用户看的那句话。
      *
-     * 三种说法放在这一处，是为了让「功能页那一行」和「运行环境那一行」永远一致 ——
+     * 四种说法放在这一处，是为了让「功能页那一行」和「运行环境那一行」永远一致 ——
      * 它们问的是同一件事，各写一份迟早说岔。
      */
     fun freeformStateLabel(context: Context): String =
         when (freeformState(context)) {
             FreeformState.OURS -> "小窗可用"
+            FreeformState.AOSP -> "系统小窗"
             FreeformState.NATIVE -> "原生小窗"
             FreeformState.NONE -> "小窗不可用"
         }

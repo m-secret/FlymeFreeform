@@ -15,13 +15,20 @@ object MenuGeometry {
     const val CENTER_ANGLE_DEG = 45f
 
     /**
-     * 整条弧的张角（度）——**固定值**。
+     * 整条弧的**默认**张角（度）：**80°**（2026-10-09 用户定稿；此前写死 86°）。
      *
-     * 固定是关键：轮盘的形状与位置不该因为「多加了一项」或「把图标调大」而变。
-     * 项数只决定弧内怎么均分（一步 = 张角 ÷ 间隔数），半径只决定弧离角落多远。
-     * 于是：加应用时只有图标在弧内重新分布，轮的边界纹丝不动。
+     * 2026-10-09 之前它是**写死的常量**（理由：轮的形状不该因为「多加一项」或「把图标调大」而变）——
+     * 现在**开放成设置项** `SettingsStore.menuSpanDeg`。起因：用户报
+     * 「图标离屏幕边太近，但轮盘位置很好」。几何上弧两端那两个图标离屏幕边的距离
+     * **≈ 就是 `menuCornerInsetPercent` 本身**（`originY − radiusY·sin2°`，半径只影响几像素），
+     * 所以**只有把张角收小**才能在「圆心不动、大小不变」的前提下把它们挪离屏幕边。
+     *
+     * ⚠️ **张角仍然不该跟着项数变** —— 项数只决定弧内怎么均分（一步 = 张角 ÷ 间隔数）。
      */
-    const val MAX_SPAN_DEG = 86f
+    const val DEFAULT_SPAN_DEG = 80f
+
+    /** 张角上限：90° 正好是「一条边到另一条边」，再大就越过垂直线、跑到另一侧去了。 */
+    const val SPAN_LIMIT_DEG = 90f
 
     /** 一次布局的几何结果。 */
     data class Layout(
@@ -34,7 +41,8 @@ object MenuGeometry {
     /**
      * 按项数算出图标半径、步进角、张角、起始角。
      *
-     * **张角固定**（[MAX_SPAN_DEG]），项数只影响弧内均分，半径只影响弧的位置。
+     * **不要按项数去改张角**（张角由设置 [DEFAULT_SPAN_DEG] 给出），项数只影响弧内均分，
+     * 半径只影响弧的位置。
      * 图标就用调用方给的 `baseIconRadius`，**不做任何封顶**：项数多、图标又调得大时，
      * 相邻图标会相互重叠——这是有意的取舍（见 [SettingsStore.menuIconDp]），
      * 由用户自己把图标调小或把弧调大，程序不偷偷替他改尺寸。
@@ -42,16 +50,18 @@ object MenuGeometry {
     fun resolve(
         count: Int,
         baseIconRadius: Float,
+        spanDeg: Float = DEFAULT_SPAN_DEG,
     ): Layout {
         if (count <= 1) {
             return Layout(baseIconRadius, 0f, 0f, CENTER_ANGLE_DEG)
         }
-        val stepDeg = MAX_SPAN_DEG / (count - 1)
+        val span = spanDeg.coerceIn(1f, SPAN_LIMIT_DEG)
+        val stepDeg = span / (count - 1)
         return Layout(
             iconRadius = baseIconRadius,
             stepDeg = stepDeg,
-            spanDeg = MAX_SPAN_DEG,
-            angleStartDeg = CENTER_ANGLE_DEG - MAX_SPAN_DEG / 2f,
+            spanDeg = span,
+            angleStartDeg = CENTER_ANGLE_DEG - span / 2f,
         )
     }
 

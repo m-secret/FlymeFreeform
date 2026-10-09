@@ -35,4 +35,19 @@
         <item name="android:colorAccent">@color/m3_primary</item>
         <item name="android:colorControlActivated">@color/m3_primary</item>
     </style>
+
+    <!--
+        「链接小窗」的接收页（LinkOpenActivity）专用：**完全透明、没有任何过渡**。
+
+        那个页面只做一件事——把 URL 转交出去、然后 `finish()`。用户点完链接应该**直接看到浏览器的
+        小窗出来**，中间那一下不能被我们自己的界面（哪怕是启动预览的那块白）打断。
+        所以：透明背景 + 关掉启动预览（`windowDisablePreview`）。
+    -->
+    <style name="Theme.FlymeFreeformNoRoot.Transparent" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+    </style>
 </resources>

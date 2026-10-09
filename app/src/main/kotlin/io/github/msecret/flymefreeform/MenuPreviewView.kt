@@ -8,7 +8,7 @@ import android.view.View
 
 /**
  * 轮盘范围预览：Canvas 在**左右两个屏幕角落**各画一条椭圆弧 + 真实图标大小的占位圆，
- * 用于设置页调整「宽度/高度/离屏幕边距离/图标大小」时可视化看到轮盘的实际大小、位置。
+ * 用于设置页调整「宽度 / 高度 / 张角 / 离角落距离 / 图标大小」时可视化看到轮盘的实际大小、位置。
  *
  * 几何计算与 [RadialMenuView] **共用 [MenuGeometry]**，原点、窗口坐标系也与真实菜单窗口一致，
  * 所以预览里每个圆的位置、直径就是真机呼出时图标的实际位置和直径。
@@ -66,6 +66,7 @@ class MenuPreviewView(context: Context) : View(context) {
         cornerInset: Float,
         widthDp: Int,
         heightDp: Int,
+        spanDeg: Float,
         iconSizeDp: Int,
         itemCount: Int,
         leftEnabled: Boolean = true,
@@ -82,7 +83,7 @@ class MenuPreviewView(context: Context) : View(context) {
         this.rightEnabled = rightEnabled
         // 与真实轮盘同一套几何：同一个图标基准半径 → 同一份布局。
         val baseIconRadius = (iconSizeDp.coerceIn(1, 200) * density) / 2f
-        this.layout = MenuGeometry.resolve(itemCount, baseIconRadius)
+        this.layout = MenuGeometry.resolve(itemCount, baseIconRadius, spanDeg)
         invalidate()
     }
 

@@ -57,6 +57,7 @@ class CornerSettingsActivity : Activity() {
     private var liveBand = 0
     private var liveMenuW = 0
     private var liveMenuH = 0
+    private var liveSpan = 0
     private var liveCornerInset = 0
     private var liveIconDp = 0
 
@@ -128,6 +129,7 @@ class CornerSettingsActivity : Activity() {
             edgeInsetDp = liveBand,
             menuWidthDp = liveMenuW,
             menuHeightDp = liveMenuH,
+            spanDeg = liveSpan,
             cornerInsetPercent = liveCornerInset,
             iconDp = liveIconDp,
         )
@@ -148,7 +150,7 @@ class CornerSettingsActivity : Activity() {
     }
 
     /**
-     * 「轮盘外观」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 图标衬底）。
+     * 「轮盘外观」那一组恢复默认（宽度 / 高度 / 张角 / 离角落距离 / 图标大小 / 图标衬底）。
      *
      * ⚠️ **两组各管各的**（动画那两项见 [resetMenuAnimation]）：用户 2026-10-08 报过
      * 「本组恢复把别组也一起拨回去」，所以每条按钮只碰它紧挨着的那一组。
@@ -156,6 +158,7 @@ class CornerSettingsActivity : Activity() {
     private fun resetMenuAppearance() {
         store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
         store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
+        store.menuSpanDeg = SettingsStore.DEFAULT_MENU_SPAN_DEG
         store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
         store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
         store.menuScrimPercent = SettingsStore.DEFAULT_MENU_SCRIM_PERCENT
@@ -193,6 +196,7 @@ class CornerSettingsActivity : Activity() {
     private fun resetMenuValues() {
         store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
         store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
+        store.menuSpanDeg = SettingsStore.DEFAULT_MENU_SPAN_DEG
         store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
         store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
         store.menuSwingDeg = SettingsStore.DEFAULT_MENU_SWING_DEG
@@ -224,8 +228,18 @@ class CornerSettingsActivity : Activity() {
         liveBand = store.edgeInsetDp
         liveMenuW = store.menuWidthDp
         liveMenuH = store.menuHeightDp
+        liveSpan = store.menuSpanDeg
         liveCornerInset = store.menuCornerInsetPercent
         liveIconDp = store.menuIconDp
+
+        // ---- 预览（**页面级**，不属于下面任何一组）----
+        //
+        // ★★ 不能塞进「触摸区」组里：`setPreview` 既画触摸条绿块、**也画轮盘弧**，
+        // 它同时作用在「触摸区」和下面的「轮盘外观」两组上。
+        // 用户 2026-10-09 的原话：「预览放在触摸区似乎不太合适了，因为现在轮盘外观也会被作用」。
+        // ⇒ 单独一张卡放在所有区块**之前**，**不给区块标题**（只有一条，不需要标题来区分）。
+        root.addView(Ui.spacer(this, Ui.SPACE_SECTION_TOP))
+        root.addView(CardGroup(this).row(previewRow()))
 
         root.addView(Ui.sectionTitle(this, "触摸区"))
         // 触摸区这一组：**除示意图之外的行**只建一次、存在 [touchCoreRows] 里复用，
@@ -233,7 +247,6 @@ class CornerSettingsActivity : Activity() {
         touchGroup = CardGroup(this)
         touchCoreRows =
             listOf(
-                previewRow(),
                 Ui.switchRow(this, "左下角", store.leftCornerEnabled) { checked ->
                     store.leftCornerEnabled = checked
                     OverlayGestureService.reload(this)
@@ -298,7 +311,7 @@ class CornerSettingsActivity : Activity() {
             Ui.hint(
                 this,
                 "**绿** = 本应用接管触摸的部分，**橙** = 让给系统「侧滑返回」的边带" +
-                    "（由「左右边缘预留」决定，不改变触摸区大小）。打开上面的「显示触摸区预览」，" +
+                    "（由「左右边缘预留」决定，不改变触摸区大小）。打开最上面的「在屏幕上预览」，" +
                     "屏幕上就会画出同样的两色，照着核即可。",
             ),
         )
@@ -348,15 +361,39 @@ class CornerSettingsActivity : Activity() {
                 )
                 .row(
                     seekRow(
-                        // ★ 名字随**行为**走。这个旋钮现在做的是「圆心往里挪多少、半径就往外撑多少」
-                        // = 轮盘整体离屏幕边更远、同时更大，所以叫「离屏幕边距离」是自洽的。
-                        // ⚠️ 2026-10-09 中途改成过「轮盘内缩」（反向），用户实机看过之后否掉：
-                        // 「功能别改啊，没①好用了」—— 别再往那个方向改。
-                        label = "轮盘离屏幕边距离",
+                        // ★ 2026-10-09 新增（用户：「5% 时位置很好，但图标离屏幕边太近」）。
+                        //   几何上弧两端那两个图标离屏幕边的距离 **≈ 就是「离角落距离」本身**
+                        //   （`originY − radiusY·sin2°`，半径只影响几像素）⇒ 调宽度/高度几乎没用，
+                        //   只有**收小张角**能在「圆心不动、大小不变」的前提下把它们挪离屏幕边。
+                        label = "轮盘张角",
+                        value = store.menuSpanDeg,
+                        min = SettingsStore.MIN_MENU_SPAN_DEG,
+                        max = SettingsStore.MAX_MENU_SPAN_DEG,
+                        detail = "扇面张开多少度。越小两端越往中间收、图标离屏幕边越远",
+                        unit = "°",
+                        onLive = {
+                            liveSpan = it
+                            syncPreview()
+                        },
+                    ) { value ->
+                        store.menuSpanDeg = value
+                        refreshPreview()
+                    },
+                )
+                .row(
+                    seekRow(
+                        // ★ 名字随**行为**走。这个旋钮做的是「圆心往里挪多少、半径就往外撑多少」
+                        // = 轮盘整体离角落更远、同时更大 —— 名字必须同时装下这两层，
+                        // 不然用户会以为「只挪位置、不改大小」（2026-10-09 他就是这么问的：
+                        // 「一边把距离调整，一边把高度宽度都调整了，我觉得是不是不对的」）。
+                        // ⚠️ 中途改成过「轮盘内缩」（反向），用户实机看过之后否掉：
+                        // 「功能别改啊，没①好用了」—— 别再往那个方向改（详见 MENU-UI.md）。
+                        label = "轮盘离角落距离",
                         value = store.menuCornerInsetPercent,
                         min = SettingsStore.MIN_MENU_CORNER_INSET_PERCENT,
                         max = SettingsStore.MAX_MENU_CORNER_INSET_PERCENT,
-                        detail = "占屏幕短边 %，越大轮盘越大、离屏幕边越远",
+                        detail = "越大：整个轮盘离角落越远，并跟着一起变大。只想改大小就调上面两行",
+                        unit = "%",
                         onLive = {
                             liveCornerInset = it
                             syncPreview()
@@ -419,9 +456,10 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "「宽度 / 高度」一起构成椭圆弧的长短轴；「离屏幕边距离」决定整条弧离角落多远" +
-                    "（越大越往外撑，图标间距也跟着变宽）。「图标大小」与轮盘几何**完全解耦**：" +
-                    "只改图标本身，调得比弧上的格子大会相互重叠。",
+                "「宽度 / 高度」是椭圆弧的长短轴；「张角」决定这条弧张开多大——收小它两端就往" +
+                    "中间收、图标离屏幕边更远，而弧的位置和大小都不变。「离角落距离」会同时挪位置**并**" +
+                    "把弧撑大（越大越往外、图标间距也跟着变宽）。⚠️ 上面这五个都会作用在屏幕预览上。" +
+                    "「图标大小」与轮盘几何**完全解耦**：只改图标本身，调得比弧上的格子大会相互重叠。",
             ),
         )
 
@@ -544,16 +582,23 @@ class CornerSettingsActivity : Activity() {
     /**
      * 触摸区预览那一行。
      *
-     * 做成卡片组里的**第一行**而不是独立一张卡：它和下面的「左下角 / 右下角」同属「触摸区」，
-     * 分成两张卡就要在组内留缝，反而破坏了分组感。
+     * ★★ **放在所有区块之前的单独一张卡**，不属于任何一组 —— 因为它同时作用在「触摸区」
+     * （触摸条绿块/橙带）与「轮盘外观」（轮盘弧的位置、大小、张角）**两组**上。
+     * 早先它被摆进「触摸区」组当第一行，用户 2026-10-09 指出「预览放在触摸区似乎不太合适了，
+     * 因为现在轮盘外观也会被作用」⇒ 已挪到页面级。
      */
     private fun previewRow(): View =
         Ui.row(this).apply {
             val texts =
                 LinearLayout(this@CornerSettingsActivity).apply {
                     orientation = LinearLayout.VERTICAL
-                    addView(Ui.rowTitle(this@CornerSettingsActivity, "显示触摸区预览"))
-                    addView(Ui.rowDetail(this@CornerSettingsActivity, "把触摸区涂成半透明色，直接看见它在哪"))
+                    addView(Ui.rowTitle(this@CornerSettingsActivity, "在屏幕上预览"))
+                    addView(
+                        Ui.rowDetail(
+                            this@CornerSettingsActivity,
+                            "把触摸区涂色、把轮盘画出来，改下面任意一项都直接看得到",
+                        ),
+                    )
                 }
             addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             val toggle =

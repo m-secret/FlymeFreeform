@@ -160,6 +160,44 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 handler.postDelayed(this, TRIGGER_WATCHDOG_MS)
             }
         }
+
+    /**
+     * 无障碍健康巡检（间隔见 [A11Y_WATCHDOG_MS]）。
+     *
+     * 解决的是「**开机之外**无障碍被系统关掉，就再也没人把它拉回来」：
+     *
+     * - ColorOS 会在**开机 / 解锁后**把「侧载」应用的无障碍服务强制关掉（`OplusRiskAccessibility
+     *   Controller`，adb 安装与点 APK 安装都算 sideload），这条 [BootReceiver] 已经补了；
+     * - 但它**不止那一次**——那条反诈弹框（「检测到 X 获取无障碍权限」）被点掉之后，系统同样会
+     *   把服务从名单里摘掉。此时应用侧没有任何人在听，用户看到的就是「点小窗外关不掉」。
+     *
+     * 判定与冷却都在 [AccessibilityGrant.restoreIfMissing] 里（它自带「已连上 / 系统认定已启用」
+     * 短路 + 10 分钟写回冷却），所以这里只管按点叫它，不做任何自己的判断。
+     *
+     * 只有在用户确实开着需要无障碍的功能时才动，见 [needsAccessibility]。
+     */
+    private val a11yWatchdog =
+        object : Runnable {
+            override fun run() {
+                if (needsAccessibility()) {
+                    runCatching { AccessibilityGrant.restoreIfMissing(this@OverlayGestureService) }
+                }
+                // 无条件续期：本判断可能抛/为假，但链子不能断（同 [triggerWatchdog]）。
+                handler.postDelayed(this, A11Y_WATCHDOG_MS)
+            }
+        }
+
+    /**
+     * 用户还需要无障碍吗？
+     *
+     * 挂在无障碍上的功能有两处：**窗外点击关闭**（[SettingsStore.outsideTapCloseEnabled]）、
+     * 以及主动呼出服务里那一刀（[SettingsStore.enabled]，触摸条与轮盘同属它）。
+     *
+     * **都关了就别去动系统权限** —— 他要是自己把功能都关了，我们不该偷偷把无障碍开回来。
+     */
+    private fun needsAccessibility(): Boolean =
+        store.enabled || store.outsideTapCloseEnabled
+
     private var menuView: RadialMenuView? = null
 
     /**
@@ -319,6 +357,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 系统性自愈手段，不能挂在任何一次性的路径上。`onDestroy` 的
         // `removeCallbacksAndMessages(null)` 会把它一并停掉。
         handler.postDelayed(triggerWatchdog, TRIGGER_WATCHDOG_MS)
+        // 无障碍巡检同样随服务常驻：ColorOS 除了开机，还会在反诈弹框被点掉之后把本服务摘出
+        // 系统名单，而开机那一次补写回只覆盖「开机 / 更新」这一种情况。见 [a11yWatchdog]。
+        handler.postDelayed(a11yWatchdog, A11Y_WATCHDOG_MS)
         // 服务随开机/更新后重新拉起时会走这里：顺手把 Shizuku 重连监听挂上，授权能自动恢复。
         ShizukuShell.startAutoReconnect()
         // 「窗内关闭」的常驻监听挂在**本服务**上（它是本应用唯一的常驻前台服务）。
@@ -417,6 +458,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val edgeInsetDp: Int,
         val menuWidthDp: Int,
         val menuHeightDp: Int,
+        val spanDeg: Int,
         val cornerInsetPercent: Int,
         val iconDp: Int,
     )
@@ -440,6 +482,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     private val effectiveMenuWidthDp: Int get() = livePreview?.menuWidthDp ?: store.menuWidthDp
     private val effectiveMenuHeightDp: Int get() = livePreview?.menuHeightDp ?: store.menuHeightDp
+    private val effectiveSpanDeg: Int get() = livePreview?.spanDeg ?: store.menuSpanDeg
     private val effectiveCornerInsetPercent: Int
         get() = livePreview?.cornerInsetPercent ?: store.menuCornerInsetPercent
     private val effectiveIconDp: Int get() = livePreview?.iconDp ?: store.menuIconDp
@@ -451,7 +494,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      * 用户先要「根据当前的位置，自适应间距」，中途试过反向的「内缩」（圆心往内挪、半径反而减），
      * 实机看过之后被否掉 —— 原话「**功能别改啊，没 ① 好用了**」（① = 「往里挪 + 撑大」这一版）。
      *
-     * 做法是把「离屏幕边距离」这一段**同时加到半径上**：往里挪多少就往外撑多少，于是图标之间的
+     * 做法是把「轮盘离角落距离」这一段**同时加到半径上**：往里挪多少就往外撑多少，于是图标之间的
      * 间距跟着变大，轮盘仍然占满它该占的那一片。贴角（这个值是 0）时撑开量也是 0，
      * 与最早那版**逐像素相同**。
      *
@@ -493,6 +536,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 edgeInsetDp = intent.getIntExtra(EXTRA_EDGE_INSET, store.edgeInsetDp),
                 menuWidthDp = intent.getIntExtra(EXTRA_MENU_W, store.menuWidthDp),
                 menuHeightDp = intent.getIntExtra(EXTRA_MENU_H, store.menuHeightDp),
+                spanDeg = intent.getIntExtra(EXTRA_MENU_SPAN, store.menuSpanDeg),
                 cornerInsetPercent = intent.getIntExtra(EXTRA_CORNER_INSET, store.menuCornerInsetPercent),
                 iconDp = intent.getIntExtra(EXTRA_ICON, store.menuIconDp),
             )
@@ -563,8 +607,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             screenRight = screen.right.toFloat(),
             screenBottom = screen.bottom.toFloat(),
             cornerInset = CornerGeometry.menuCornerInset(effectiveCornerInsetPercent, shortEdge).toFloat(),
-            widthDp = effectiveMenuWidthDp,
-            heightDp = effectiveMenuHeightDp,
+            // ★★ **必须走 spread*（撑开后的半径）**，与真机 [showMenu] 和 [showMenuPreview] 同口径。
+            // 2026-10-09 修：这里原先写的是 `effectiveMenuWidthDp/HeightDp`（**没加撑开量**），
+            // 于是「预览刚打开是对的、一改任何值就变小」——用户报的「预览有时候和真实的不一样」
+            // 就是它（预览开着的瞬间走 [showMenuPreview]，那条是对的）。
+            widthDp = spreadMenuWidthDp,
+            heightDp = spreadMenuHeightDp,
+            spanDeg = effectiveSpanDeg.toFloat(),
             iconSizeDp = effectiveIconDp,
             itemCount = (radialApps.size + if (menuHasMore) 1 else 0).coerceAtLeast(1),
             leftEnabled = store.leftCornerEnabled,
@@ -608,6 +657,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 // 走 effective*：预览刚开启时草稿多半是空的（等于 store），但拖动中重开也取得到。
                 widthDp = spreadMenuWidthDp,
                 heightDp = spreadMenuHeightDp,
+                spanDeg = effectiveSpanDeg.toFloat(),
                 iconSizeDp = effectiveIconDp,
                 itemCount = (radialApps.size + if (menuHasMore) 1 else 0).coerceAtLeast(1),
                 leftEnabled = store.leftCornerEnabled,
@@ -996,6 +1046,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 widthDp = spreadMenuWidthDp,
                 heightDp = spreadMenuHeightDp,
                 iconSizeDp = store.menuIconDp,
+                // 轮盘张角（度）：那条弧张开多大。**位置与大小都不动**，只把弧两端往里收/往外放
+                // —— 这是唯一能「圆心不动、图标离屏幕边变远」的旋钮（见 SettingsStore.menuSpanDeg）。
+                spanDeg = store.menuSpanDeg,
                 haptic = store.menuHapticEnabled,
                 // 呼出时图标**绕自身圆心**转一下再回正的角度（度，0 = 不转）。见 RadialMenuView.enterSwingAngleDeg。
                 swingDeg = store.menuSwingDeg,
@@ -2559,6 +2612,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val TRIGGER_WATCHDOG_MS = 5_000L
 
         /**
+         * 无障碍健康巡检的间隔（ms）。
+         *
+         * 见 [a11yWatchdog]。取 60 秒是「用户能忍多久的失效」与「巡检开销」的折中：巡检本身
+         * 只是两次轻量查询（`isConnected` / 问无障碍管理器），**真正写回那一步还有 10 分钟
+         * 冷却兜着**（见 [AccessibilityGrant.restoreIfMissing]），所以密一点也不会反复折腾系统设置。
+         */
+        private const val A11Y_WATCHDOG_MS = 60_000L
+
+        /**
          * 「手势进行中」最多能信多久（ms）。超过就当那次手势的收尾丢了，按残留处理。
          *
          * 用户按住手指慢慢挑图标有可能拖上好一会儿，所以不能取太小；但也不能太久——这个判据
@@ -2646,6 +2708,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         const val EXTRA_EDGE_INSET = "edge_inset"
         const val EXTRA_MENU_W = "menu_w"
         const val EXTRA_MENU_H = "menu_h"
+        const val EXTRA_MENU_SPAN = "menu_span"
         const val EXTRA_CORNER_INSET = "corner_inset"
         const val EXTRA_ICON = "icon"
 
@@ -2748,6 +2811,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             edgeInsetDp: Int,
             menuWidthDp: Int,
             menuHeightDp: Int,
+            spanDeg: Int,
             cornerInsetPercent: Int,
             iconDp: Int,
         ) {
@@ -2760,6 +2824,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     .putExtra(EXTRA_EDGE_INSET, edgeInsetDp)
                     .putExtra(EXTRA_MENU_W, menuWidthDp)
                     .putExtra(EXTRA_MENU_H, menuHeightDp)
+                    .putExtra(EXTRA_MENU_SPAN, spanDeg)
                     .putExtra(EXTRA_CORNER_INSET, cornerInsetPercent)
                     .putExtra(EXTRA_ICON, iconDp),
             )

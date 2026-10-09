@@ -122,6 +122,9 @@ class RadialMenuView(context: Context) : View(context) {
     /** 相邻两项之间的角度步进（度），由 [resolveGeometry] 按项数与半径算出。 */
     private var stepDeg = 0f
 
+    /** 轮盘张角（度），由设置给出，经 [resolveGeometry] 落到 [spanDeg]。 */
+    private var spanDegSetting = MenuGeometry.DEFAULT_SPAN_DEG
+
     /** 轮盘张角（度）。 */
     private var spanDeg = 0f
 
@@ -219,6 +222,7 @@ class RadialMenuView(context: Context) : View(context) {
         widthDp: Int,
         heightDp: Int,
         iconSizeDp: Int,
+        spanDeg: Int,
         haptic: Boolean,
         swingDeg: Int,
         launchMs: Float,
@@ -230,6 +234,7 @@ class RadialMenuView(context: Context) : View(context) {
         this.hasMore = hasMore
         this.hapticEnabled = haptic
         this.swingDeg = swingDeg
+        this.spanDegSetting = spanDeg.toFloat()
         this.launchMs = launchMs
         this.launchTravel = launchTravel.coerceIn(0f, 1f)
         this.scrimAlphaTarget = (scrimPercent.coerceIn(0, 100) * 255 / 100)
@@ -665,12 +670,13 @@ class RadialMenuView(context: Context) : View(context) {
     /**
      * 按项数算出步进角与图标尺寸。
      *
-     * 张角固定（[MenuGeometry.MAX_SPAN_DEG]），项数只决定弧内怎么均分；半径只决定弧离角落多远。
+     * 张角由设置给出（[MenuGeometry.DEFAULT_SPAN_DEG] 是默认值），项数只决定弧内怎么均分；
+     * 半径只决定弧离角落多远。
      * 图标尺寸**完全按设置来，不做封顶**——调得比弧上的格子大时会相互重叠，由用户自己调。
      */
     private fun resolveGeometry(count: Int) {
         // 与设置页预览共用 [MenuGeometry]，保证预览的位置/大小和真机一致。
-        val layout = MenuGeometry.resolve(count, baseIconRadius)
+        val layout = MenuGeometry.resolve(count, baseIconRadius, spanDegSetting)
         iconRadius = layout.iconRadius
         stepDeg = layout.stepDeg
         spanDeg = layout.spanDeg

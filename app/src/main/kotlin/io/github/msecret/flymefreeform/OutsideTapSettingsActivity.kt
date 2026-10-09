@@ -63,6 +63,16 @@ class OutsideTapSettingsActivity : Activity() {
 
     private fun buildContent(): View {
         val root = Ui.pageRoot(this)
+        // ★ 这一页在**两种形态**下装的不是同一批东西（2026-10-09）：
+        //   - ColorOS：全套关闭方式（下面那些）；
+        //   - AOSP 形态（vivo / 小米）：只有「小窗尺寸」一个旋钮 —— 关闭方式那一批是照
+        //     ColorOS 的窗口形态做的，在那边一个都用不了，**摆出来比不摆更糟**（用户会一个个试）。
+        //   所以按形态整页分岔，而不是把一堆行置灰。
+        if (SystemSupport.freeformState(this) == SystemSupport.FreeformState.AOSP) {
+            root.addView(Ui.title(this, "小窗"))
+            renderAospPage(root)
+            return Ui.scrollPage(this, root)
+        }
         root.addView(Ui.title(this, "小窗关闭方式"))
         root.addView(
             Ui.hint(
@@ -211,6 +221,70 @@ class OutsideTapSettingsActivity : Activity() {
         )
 
         return Ui.scrollPage(this, root)
+    }
+
+    /**
+     * AOSP 形态（vivo OriginOS / 小米 MIUI·澎湃）这一页的**全部内容**。
+     *
+     * 只有一项能调：**小窗尺寸**。理由写在 [SettingsStore.aospFreeformScalePercent] 的注释里 ——
+     * 系统给的默认窗口小得离谱（HyperOS 实测占屏 31%×28%），应用在里面仍按整屏密度排版，
+     * 于是「窗口很小、字还是大的」；我们补一记 `am task resize` 把它调到合适大小
+     * （见 `AospFreeformWindow`），比例就是这一行。
+     *
+     * ⚠️ **关闭方式那一整套不在这里出现**：点窗外 / 小横条上滑 / 落点校准都依赖 ColorOS
+     * 那种「伴生装饰窗 + 日志 tag」的窗口形态，AOSP 自由窗的标题栏画在应用自己的窗口里、
+     * 关闭按钮是右上角那个 `close_window` —— 完全是另一套，还没取证。与其摆一排用不了的
+     * 开关让人一个个试，不如一句话说清。
+     */
+    private fun renderAospPage(root: LinearLayout) {
+        val connected = ShizukuShell.hasPermission
+        root.addView(
+            Ui.hint(
+                this,
+                if (connected) {
+                    "当前系统的小窗走**标准自由窗（AOSP Freeform）**，本应用用 Shizuku 的 shell 身份" +
+                        "把它拉起来，再补一记尺寸。"
+                } else {
+                    "当前系统的小窗走**标准自由窗（AOSP Freeform）**，但它必须由 **Shizuku** 的 shell " +
+                        "身份发起 —— 现在 Shizuku 没连上，应用会退成**全屏**打开，系统还会弹一次" +
+                        "「想要打开 XX，是否允许？」的确认框。去首页把 Shizuku 授权了就正常了。"
+                },
+            ),
+        )
+
+        root.addView(Ui.sectionTitle(this, "小窗尺寸"))
+        root.addView(
+            CardGroup(this)
+                .row(
+                    seekRow(
+                        label = "小窗占屏比例",
+                        value = store.aospFreeformScalePercent,
+                        min = SettingsStore.MIN_AOSP_FREEFORM_SCALE,
+                        max = SettingsStore.MAX_AOSP_FREEFORM_SCALE,
+                        detail = "%，两个方向等比缩放，居中摆放",
+                    ) { value ->
+                        store.aospFreeformScalePercent = value
+                    },
+                ),
+        )
+        root.addView(
+            Ui.hint(
+                this,
+                "系统给的默认窗口只有屏幕的三成左右，应用在里面还是按整屏排版，所以看着" +
+                    "「窗口很小、字很大」。这里设的是**下一次打开**用的尺寸（默认 " +
+                    "${SettingsStore.DEFAULT_AOSP_FREEFORM_SCALE}%，约等于等比缩到六成）。",
+            ),
+        )
+
+        root.addView(Ui.sectionTitle(this, "关闭方式"))
+        root.addView(
+            Ui.hint(
+                this,
+                "**还没适配**：点窗外关闭、点小横条关闭、落点校准，都是照 ColorOS 的窗口形态做的。" +
+                    "AOSP 自由窗的标题栏画在应用自己的窗口里（右上角有最大化 / 关闭按钮），" +
+                    "要另找判据，得先在真机上取证。在那之前先用系统自己的方式关（点窗外或点关闭按钮）。",
+            ),
+        )
     }
 
     /**

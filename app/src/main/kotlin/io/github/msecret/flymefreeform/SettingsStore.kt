@@ -558,6 +558,33 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_OUTSIDE_TAP_FORCE, value).apply()
 
     /**
+     * **AOSP 形态小窗**的尺寸：占屏幕的百分比，两个方向同一个比例（等比缩放）。
+     *
+     * ## 为什么有这个设置（2026-10-09 真机反馈）
+     *
+     * 小米 HyperOS / vivo OriginOS 上，`am start --windowingMode 5` 起的自由窗用的是
+     * **系统默认尺寸** —— 测试者录屏里那扇窗只占屏幕 **31% 宽 × 28% 高**，
+     * 而应用在这么小的窗口里仍按整屏的密度排版，于是「窗口很小、字还是大的」。
+     * 我们补一记 `am task resize` 把它调到合适的大小（见 `AospFreeformWindow`）。
+     *
+     * 默认 **62%**：等比缩到 62% 时窗口形状与整屏一致，应用排版不用重排。
+     * 调小 = 更「迷你」，调大 = 更接近全屏。范围 40%~95%（100% 就是全屏，没意义）。
+     *
+     * ⚠️ **只对 AOSP 形态生效**：ColorOS 那条路由系统自己决定窗口尺寸，一个像素都不碰。
+     */
+    var aospFreeformScalePercent: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_SCALE, DEFAULT_AOSP_FREEFORM_SCALE)
+                .coerceIn(MIN_AOSP_FREEFORM_SCALE, MAX_AOSP_FREEFORM_SCALE)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_SCALE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_SCALE, MAX_AOSP_FREEFORM_SCALE),
+                )
+                .apply()
+
+    /**
      * 轮盘横向半径（宽度），单位 dp。
      *
      * 与 [menuHeightDp] 一起构成椭圆弧——分别控制轮盘横向、纵向伸展多少。
@@ -578,6 +605,56 @@ class SettingsStore(context: Context) {
             preferences.edit()
                 .putInt(KEY_MENU_HEIGHT_DP, value.coerceIn(MIN_MENU_DIM_DP, MAX_MENU_DIM_DP))
                 .apply()
+
+    /**
+     * 轮盘**张角**（度）：那条弧张开多大。默认 86°。
+     *
+     * ## 它是干什么用的（2026-10-09 用户提的）
+     *
+     * 用户：「5% 时位置很好，但图标离屏幕边太近」。几何上弧两端那两个图标离屏幕边的距离
+     * **≈ 就是 [menuCornerInsetPercent] 本身**（`originY − radiusY·sin2°`，半径只影响几像素）
+     * ⇒ 调半径（宽/高）几乎没用，**只有把张角收小、让弧两端往里收**才有效，
+     * 而且**圆心与大小都不用动**。实测口径见 `MenuGeometry.DEFAULT_SPAN_DEG` 的注释。
+     *
+     * ⚠️ 张角收太小、项数又多的槽位会挤在一起（相邻圆心距 = 半径 × 步进角）。程序**不替你改图标大小**，
+     * 排不下就自己调大半径或调小图标 —— 与 [menuIconDp] 同一条取舍。
+     */
+    var menuSpanDeg: Int
+        get() = preferences.getInt(KEY_MENU_SPAN_DEG, DEFAULT_MENU_SPAN_DEG)
+            .coerceIn(MIN_MENU_SPAN_DEG, MAX_MENU_SPAN_DEG)
+        set(value) =
+            preferences.edit()
+                .putInt(KEY_MENU_SPAN_DEG, value.coerceIn(MIN_MENU_SPAN_DEG, MAX_MENU_SPAN_DEG))
+                .apply()
+
+    // ---- 「链接小窗」：别的应用发起的链接，直接用浏览器小窗打开 ----
+    //
+    // 整件事的入口是 [LinkOpenActivity] —— 本应用在清单里注册成 http/https 的处理者之一
+    // （`ACTION_VIEW` + `DEFAULT` + `BROWSABLE`），用户把本应用设成「默认浏览器」之后，
+    // 点链接就会先经过我们，我们再转交给**真正的**浏览器（见 [linkFreeformBrowser]）
+    // 并要求系统按小窗打开（见 `LinkFreeform.open`）。
+    //
+    // ⚠️ 用户**没**把本应用设成默认浏览器时，这两项什么都不影响 —— 只是我们在系统弹出的
+    // 「打开支持的应用」里多了一个候选项，用户不选就不会被走到。
+
+    /**
+     * 「链接用小窗打开」的总开关。默认 **开**。
+     *
+     * 默认开是安全的：这一项**只有在用户把本应用设成默认浏览器之后才会被走到**（见上面那段），
+     * 而用户去做那一步，图的就是小窗 —— 真把链接开成全屏才是他不想要的。
+     * 关掉它也不等于链接打不开：只是退回「交给浏览器、按它自己的方式（全屏）打开」。
+     */
+    var linkFreeformEnabled: Boolean
+        get() = preferences.getBoolean(KEY_LINK_FREEFORM_ENABLED, true)
+        set(value) = preferences.edit().putBoolean(KEY_LINK_FREEFORM_ENABLED, value).apply()
+
+    /**
+     * 转交给哪个浏览器（包名）。空 = 还没选过，由 `LinkFreeform.resolve` 去猜
+     * （只认系统「默认浏览器」那个角色，**且不能是本应用自己** —— 那就是死循环）。
+     */
+    var linkFreeformBrowser: String
+        get() = preferences.getString(KEY_LINK_FREEFORM_BROWSER, "").orEmpty()
+        set(value) = preferences.edit().putString(KEY_LINK_FREEFORM_BROWSER, value).apply()
 
     // ---- 触感（振动）：一处总开关 + 四条行为各自的开关 ----
     //
@@ -659,7 +736,7 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_HIDE_MORE_ENTRY, value).apply()
 
     /**
-     * 「轮盘离屏幕边距离」：轮盘极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
+     * 「轮盘离角落距离」：轮盘极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
      *
      * 它和半径是**同向**的（见 `OverlayGestureService.menuSpreadDp`）：圆心往里挪多少、
      * 半径就往外撑多少，于是整个轮盘离屏幕边更远、同时更大、图标间距跟着变宽。
@@ -1197,6 +1274,12 @@ class SettingsStore(context: Context) {
             )
         private const val KEY_TOOL_ORDER = "tool_order"
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
+        private const val KEY_AOSP_FREEFORM_SCALE = "aosp_freeform_scale_percent"
+
+        /** AOSP 形态小窗的尺寸档位，见 [aospFreeformScalePercent]。 */
+        const val MIN_AOSP_FREEFORM_SCALE = 40
+        const val MAX_AOSP_FREEFORM_SCALE = 95
+        const val DEFAULT_AOSP_FREEFORM_SCALE = 62
         const val CLICK_MODE_SINGLE = "single"
         const val CLICK_MODE_DOUBLE = "double"
         const val TAB_APPS = "apps"
@@ -1437,12 +1520,17 @@ class SettingsStore(context: Context) {
         private const val KEY_MENU_LAUNCH_TRAVEL = "menu_launch_travel_percent"
         private const val KEY_MENU_SCRIM_PERCENT = "menu_scrim_percent"
         private const val KEY_MENU_WIDTH_DP = "menu_width_dp"
+        private const val KEY_MENU_SPAN_DEG = "menu_span_deg"
         private const val KEY_MENU_HEIGHT_DP = "menu_height_dp"
         private const val KEY_MENU_CORNER_INSET_PERCENT = "menu_corner_inset_percent"
         private const val KEY_LEGACY_MENU_CORNER_INSET_DP = "menu_corner_inset_dp"
         private const val KEY_DEBUG_LOG = "debug_log_enabled"
         private const val KEY_ICON_PACK = "icon_pack_package"
         private const val KEY_USE_SYSTEM_ICON_SET = "use_system_icon_set"
+
+        /** 「链接小窗」（见 [SettingsStore.linkFreeformEnabled]）。 */
+        private const val KEY_LINK_FREEFORM_ENABLED = "link_freeform_enabled"
+        private const val KEY_LINK_FREEFORM_BROWSER = "link_freeform_browser"
 
         /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
         private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
@@ -1505,6 +1593,16 @@ class SettingsStore(context: Context) {
         const val DEFAULT_MENU_WIDTH_DP = 170
         const val DEFAULT_MENU_HEIGHT_DP = 170
 
+        /**
+         * 轮盘张角（度）区间。默认 **80°**（2026-10-09 用户定稿；此前写死 86°）。
+         *
+         * 上限 90：正好是「一条边到另一条边」，再大就越过垂直线了（见 `MenuGeometry.SPAN_LIMIT_DEG`）。
+         * 下限 40：再小的话项数一多，相邻图标就叠在一起了。
+         */
+        const val MIN_MENU_SPAN_DEG = 40
+        const val MAX_MENU_SPAN_DEG = 90
+        const val DEFAULT_MENU_SPAN_DEG = 80
+
         /** 轮盘宽高的旧默认（300），迁移到 170 时用来识别「没改过」。 */
         private const val LEGACY_DEFAULT_MENU_DIM_DP = 300
         private const val KEY_MENU_DIM_MIGRATED_170 = "menu_dim_migrated_to_170"
@@ -1546,19 +1644,23 @@ class SettingsStore(context: Context) {
                 KEY_CLOSE_BAR_X_PERCENT, KEY_CLOSE_BAR_Y_DP, KEY_CLOSE_ANCHOR_MARKER,
                 KEY_CLOSE_SWIPE_DISTANCE, KEY_CLOSE_SWIPE_DURATION, KEY_LEGACY_CLOSE_ANCHOR_X_DP,
                 KEY_CLOSE_ANCHOR_Y_DP,
+                // AOSP 形态（vivo / 小米）小窗尺寸
+                KEY_AOSP_FREEFORM_SCALE,
                 // 「更多」面板
                 KEY_DRAWER_DEFAULT_TAB, KEY_LANDSCAPE_PANEL_SIDE, KEY_DOCK, KEY_RECENT,
                 KEY_TOOL_ORDER, KEY_HIDE_MORE_ENTRY,
                 // 轮盘几何与观感
                 KEY_MENU_RADIUS_PERCENT, KEY_MENU_HAPTIC, KEY_MENU_ICON_DP, KEY_MENU_SWING_DEG,
                 KEY_MENU_LAUNCH_MS, KEY_MENU_LAUNCH_TRAVEL,
-                KEY_MENU_SCRIM_PERCENT, KEY_MENU_WIDTH_DP, KEY_MENU_HEIGHT_DP,
+                KEY_MENU_SCRIM_PERCENT, KEY_MENU_WIDTH_DP, KEY_MENU_HEIGHT_DP, KEY_MENU_SPAN_DEG,
                 KEY_MENU_CORNER_INSET_PERCENT, KEY_LEGACY_MENU_CORNER_INSET_DP,
                 // 触感（总开关 + 面板三种行为 + 强度档位）
                 KEY_HAPTIC_ENABLED, KEY_PANEL_HAPTIC_TAB_SWITCH,
                 KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX, KEY_HAPTIC_STRENGTH,
                 // 图标
                 KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
+                // 「链接小窗」
+                KEY_LINK_FREEFORM_ENABLED, KEY_LINK_FREEFORM_BROWSER,
                 // 其它
                 KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
                 KEY_AUTO_UPDATE_INTERVAL_HOURS,
