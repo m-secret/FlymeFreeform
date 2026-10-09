@@ -3096,7 +3096,7 @@ class AppDrawerPanel(
             TextView(context).apply {
                 text =
                     buildString {
-                        SystemTools.specOf(entry.component)?.let { append(it.description).append('\n') }
+                        SystemTools.specOf(entry.component)?.let { append(SystemTools.describe(context, it)).append('\n') }
                         append("轮盘：")
                         append(
                             if (pinned) {

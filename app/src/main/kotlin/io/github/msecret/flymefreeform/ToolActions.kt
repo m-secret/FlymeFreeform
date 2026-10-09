@@ -44,6 +44,16 @@ object ToolActions {
     /** 支付宝深链要求的 flags（NEW_TASK | RESET_TASK_IF_NEEDED）。 */
     private const val ALIPAY_DEEP_LINK_FLAGS = 0x10200000
 
+    /**
+     * 手电筒开 / 关的结果文案。
+     *
+     * ★ **这两句是跨文件的契约**：服务铺提示条那条路（`OverlayGestureService.showToolMessage`）
+     * 默认把工具结果**静默**掉，只对白名单放行，而它认的就是这两句原文（见那边的
+     * `toolMessageIsVisible`）。所以文案提在这里共用 —— 谁改字都会一眼看到还有另一端。
+     */
+    const val FLASHLIGHT_ON = "手电筒已打开"
+    const val FLASHLIGHT_OFF = "手电筒已关闭"
+
     /** 微信扫一扫在 scheme 被关掉之后仍然可用的「短链分发」入口。 */
     private const val WECHAT_SHORTCUT_CLASS = "com.tencent.mm.ui.ShortCutDispatchActivity"
     private const val WECHAT_SHORTCUT_ACTION = "com.tencent.mm.ui.ShortCutDispatchAction"
@@ -88,7 +98,7 @@ object ToolActions {
         when (id) {
             SystemTools.TOOL_FLASHLIGHT -> {
                 val error = Flashlight.toggle(context)
-                error ?: if (Flashlight.isOn) "手电筒已打开" else "手电筒已关闭"
+                error ?: if (Flashlight.isOn) FLASHLIGHT_ON else FLASHLIGHT_OFF
             }
 
             SystemTools.TOOL_WECHAT_SCAN ->

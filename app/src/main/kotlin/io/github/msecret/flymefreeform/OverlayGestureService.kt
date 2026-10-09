@@ -236,6 +236,15 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /** 应用目录是什么时候读的（elapsedRealtime）。用来判断打开面板前要不要重读。 */
     private var catalogLoadedAt = 0L
 
+    /**
+     * [appEntries] 是**在哪个图标来源下**读出来的（见 [AppCatalog.sourceSignature]）。
+     *
+     * ★★ 这是「改完图标来源要呼出两次才生效」的判据：目录是快照，改完设置后那次重读在 worker
+     * 上跑（几百毫秒），期间呼出面板就会先看到一眼旧图标。打开面板前比一下这个签名，
+     * 不一致就**当场同步重读**（见 [openDrawer]），一次到位。
+     */
+    private var catalogIconSource: String = ""
+
     /** 后台是不是已经有一次目录重读在跑（避免连点几次「更多」叠出好几趟）。 */
     private var catalogRefreshing = false
 
@@ -435,6 +444,46 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         get() = livePreview?.cornerInsetPercent ?: store.menuCornerInsetPercent
     private val effectiveIconDp: Int get() = livePreview?.iconDp ?: store.menuIconDp
 
+    /**
+     * 轮盘半径的**自适应撑开量**（dp）。
+     *
+     * ★★ 方向是**两轮来回之后**才定的，别再往反方向改：
+     * 用户先要「根据当前的位置，自适应间距」，中途试过反向的「内缩」（圆心往内挪、半径反而减），
+     * 实机看过之后被否掉 —— 原话「**功能别改啊，没 ① 好用了**」（① = 「往里挪 + 撑大」这一版）。
+     *
+     * 做法是把「离屏幕边距离」这一段**同时加到半径上**：往里挪多少就往外撑多少，于是图标之间的
+     * 间距跟着变大，轮盘仍然占满它该占的那一片。贴角（这个值是 0）时撑开量也是 0，
+     * 与最早那版**逐像素相同**。
+     *
+     * 两头都要夹住：
+     * - **不许撑出屏幕**：弧的两端各在自己那一侧伸出去 `inset + 半径`（再加图标自己的半径），
+     *   所以半径最多到「短边 − inset − 一个图标半径 − 基准半径」；
+     * - **不许顶破设置上限**：[RadialMenuView.begin] 会把半径夹到 460dp，而预览
+     *   （[MenuPreviewView]）**不夹** —— 不一起管住就会变成「预览和真机对不上」。
+     */
+    private val menuSpreadDp: Int
+        get() {
+            val screen = realScreenBounds()
+            val shortEdge = minOf(screen.width(), screen.height())
+            val insetPx = CornerGeometry.menuCornerInset(effectiveCornerInsetPercent, shortEdge)
+            if (insetPx <= 0) return 0
+            val density = resources.displayMetrics.density
+            val iconRadiusPx = CornerGeometry.dp(this, effectiveIconDp) / 2
+            // 半径取两个方向里**较大**的那个：加的是同一个撑开量，得保证两边都不出屏。
+            val basePx = (maxOf(effectiveMenuWidthDp, effectiveMenuHeightDp) * density).toInt()
+            val roomByScreenPx = (shortEdge - insetPx - iconRadiusPx - basePx).coerceAtLeast(0)
+            val roomByLimitPx =
+                ((SettingsStore.MAX_MENU_DIM_DP * density).toInt() - basePx).coerceAtLeast(0)
+            return (insetPx.coerceAtMost(minOf(roomByScreenPx, roomByLimitPx)) / density).toInt()
+        }
+
+    /**
+     * 撑开之后的轮盘半径（dp）——**真机呼出与两处预览都走这两个值**，预览才真的「即所见」。
+     */
+    private val spreadMenuWidthDp: Int get() = effectiveMenuWidthDp + menuSpreadDp
+
+    private val spreadMenuHeightDp: Int get() = effectiveMenuHeightDp + menuSpreadDp
+
     /** 收到拖滑块的实时参数：只重画预览与触摸条几何，不落库、不重枚举应用。 */
     private fun applyLivePreview(intent: Intent) {
         livePreview =
@@ -557,8 +606,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 screenBottom = screen.bottom.toFloat(),
                 cornerInset = cornerInset.toFloat(),
                 // 走 effective*：预览刚开启时草稿多半是空的（等于 store），但拖动中重开也取得到。
-                widthDp = effectiveMenuWidthDp,
-                heightDp = effectiveMenuHeightDp,
+                widthDp = spreadMenuWidthDp,
+                heightDp = spreadMenuHeightDp,
                 iconSizeDp = effectiveIconDp,
                 itemCount = (radialApps.size + if (menuHasMore) 1 else 0).coerceAtLeast(1),
                 leftEnabled = store.leftCornerEnabled,
@@ -865,6 +914,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     private fun showMenu(side: CornerSide) {
         // 重新呼出前的清理：新窗口马上要盖上来，旧的那层不能留（淡出会把两层叠在一起）。
         removeMenu(MenuExit.NONE)
+        // 图标来源刚改过就当场重读一次 —— 否则这一下呼出看到的还是旧图标，
+        // 要再呼出一次才变（用户报的「滑两次轮盘才看到图标更新」）。见该函数注释。
+        reloadCatalogIfIconSourceChanged()
         if (allApps.isEmpty()) {
             DebugLog.warn("MENU_EMPTY", "应用列表尚未就绪")
             return
@@ -941,12 +993,18 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 hasMore = menuHasMore,
                 cornerX = cornerX,
                 cornerY = cornerY,
-                widthDp = store.menuWidthDp,
-                heightDp = store.menuHeightDp,
+                widthDp = spreadMenuWidthDp,
+                heightDp = spreadMenuHeightDp,
                 iconSizeDp = store.menuIconDp,
                 haptic = store.menuHapticEnabled,
                 // 呼出时图标**绕自身圆心**转一下再回正的角度（度，0 = 不转）。见 RadialMenuView.enterSwingAngleDeg。
                 swingDeg = store.menuSwingDeg,
+                // 入场动画的单程时长（ms，0 = 不做动画、图标直接现位）：图标从角落出场到位要多久。
+                // **设置页那一行叫「呼出动画时长」**（用户 2026-10-09 改名 + 默认降到 100ms）。
+                // 见 RadialMenuView.enterLaunchProgress / SettingsStore.menuLaunchMs。
+                launchMs = store.menuLaunchMs.toFloat(),
+                // 出场行程（0~1）：1 = 从角落长出来；0 = 原地出现（没有"轨迹"）。
+                launchTravel = store.menuLaunchTravelPercent / 100f,
                 // 图标下面那层灰色衬底的不透明度（%，0 = 不垫）。**画在图标之前**，只暗背景不暗图标，
                 // 见 RadialMenuView.onDraw 的 ①。它是每次呼出时现读的，改完下次呼出即生效。
                 scrimPercent = store.menuScrimPercent,
@@ -1081,11 +1139,49 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 现在改成两步走：**先用手头这份目录立刻把面板显示出来**（打开是即时的），
         // 过期的话同时在后台重读一次，读回来再用 [AppDrawerPanel.updateApps] 就地换掉。
         // 于是既不慢，新装的应用也会在面板里自己冒出来。
-        if (android.os.SystemClock.elapsedRealtime() - catalogLoadedAt > CATALOG_TTL_MS) {
+        // ★★ 图标来源刚改过就当场重读一次（否则这一下呼出看到的还是旧图标）。
+        // 没改过才走「过期就后台重读」那条老路。
+        if (!reloadCatalogIfIconSourceChanged() &&
+            android.os.SystemClock.elapsedRealtime() - catalogLoadedAt > CATALOG_TTL_MS
+        ) {
             DebugLog.info("DRAWER_CATALOG_STALE", "应用目录已过期，先开面板再后台重读")
             refreshCatalogInBackground()
         }
         showDrawerNow()
+    }
+
+    /**
+     * 图标来源（图标包 / 跟随系统图标集）**刚改过**就把应用目录重读一遍，否则什么都不做。
+     *
+     * ★★ 这是「改完图标来源要呼出两次才生效」的根治。
+     *
+     * [appEntries] 是**一份快照**：改完设置后那次重读（[refreshApps]，由 ACTION_START 触发）
+     * 在 worker 上跑，几百毫秒才回来；这期间呼出**轮盘**或「更多」面板，看到的还是旧图标，
+     * 要再呼出一次才变新的 —— 用户报的就是这个。
+     *
+     * 所以打开前比一下 [catalogIconSource] 与当前设置：不一致就**当场同步重读**。
+     * 图标来源是低频操作，这一次几百毫秒可以接受。
+     *
+     * ⚠️ **轮盘（[showMenu]）与「更多」面板（[openDrawer]）两条路都要调**——只接一条，
+     * 另一条照样「两次才生效」（这正是上一版漏掉的）。
+     *
+     * @return 真的重读了没有（调用方据此决定要不要再走「过期就后台重读」那条路）
+     */
+    private fun reloadCatalogIfIconSourceChanged(): Boolean {
+        val sourceNow = AppCatalog.sourceSignature(this)
+        // ⚠️ 签名还空着 = 服务刚起、[refreshApps] 那次异步读还没回来。这时**不要**同步读：
+        //    实测一次 `AppCatalog.load` 要 ~2s（139 个应用逐个解析图标），会把轮盘卡住
+        //    （真机日志：`Trigger-Left spent 2045ms processing MotionEvent`）。目录本来就是空的，
+        //    交给异步那条路就好。
+        if (catalogIconSource.isEmpty() || catalogIconSource == sourceNow) return false
+        DebugLog.info("CATALOG_ICON_SOURCE_CHANGED", "图标来源变了，同步重读应用目录")
+        val catalog = AppCatalog.load(this)
+        appEntries = catalog
+        allApps = toolEntries + catalog
+        catalogIconSource = sourceNow
+        catalogLoadedAt = android.os.SystemClock.elapsedRealtime()
+        applyPins()
+        return true
     }
 
     /**
@@ -1113,14 +1209,19 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             {
                 worker.execute {
                     val catalog = AppCatalog.load(this)
+                    val source = AppCatalog.sourceSignature(this)
                     handler.post {
                         catalogRefreshing = false
                         catalogLoadedAt = android.os.SystemClock.elapsedRealtime()
-                        if (sameCatalog(catalog, appEntries)) {
+                        // ⚠️ 签名也要比：`sameCatalog` 只看 component/label，**图标来源换了它看不出来**
+                        //    （图标是 Bitmap，每次都是新对象、又不好比），照着旧逻辑会把刚读到的
+                        //    新图标当成「没变」直接丢掉。
+                        if (source == catalogIconSource && sameCatalog(catalog, appEntries)) {
                             DebugLog.info("DRAWER_CATALOG_SAME", "应用目录没变，跳过重画")
                             return@post
                         }
                         appEntries = catalog
+                        catalogIconSource = source
                         allApps = toolEntries + catalog
                         // 固定的应用可能已被卸载：重算一次，免得轮盘里留一个点不动的格子。
                         applyPins()
@@ -1821,6 +1922,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         worker.execute {
             val catalog = AppCatalog.load(this)
             val tools = SystemTools.load(this)
+            val source = AppCatalog.sourceSignature(this)
             // 不再「没固定就默认塞前几个」：轮盘只显示用户显式固定的应用（与工具），
             // 其余全部走「更多」面板，避免一上来就是一排不明所以的图标。
             handler.post {
@@ -1828,6 +1930,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 toolEntries = tools
                 allApps = tools + catalog
                 catalogLoadedAt = android.os.SystemClock.elapsedRealtime()
+                catalogIconSource = source
                 applyPins()
                 DebugLog.info("APPS_READY", "已安装=${catalog.size} 工具=${tools.size}")
             }
@@ -2053,10 +2156,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     private fun runScreenText() {
-        // ★ 非 ColorOS：**连遮罩都不盖、一步都不注入**，直接走自研读字。
-        // 识屏的注入路是为 ColorOS 的「小布识屏」准备的（见 [NativeScreenText.trigger]）；
-        // 别家没有东西会接这记盲注入的双指长按，盖遮罩 + 按一下只是白走一趟，还会误伤前台应用。
-        if (!SystemSupport.isColorOs(this)) {
+        // ★ 没有任何**系统原生**识屏实现时：**连遮罩都不盖、一步都不注入**，直接走自研读字。
+        // 那记双指按压是**盲注入**，只有系统自己有识屏时才会被接走；否则只会打到前台应用身上
+        // （长按选中一段字 / 弹上下文菜单 / 拖走列表项），白误伤一次再退回来。判据问
+        // [NativeScreenText.nativeLabel]，由各家的实现自己回答（见 `NativeScreenText.Source`）。
+        if (NativeScreenText.nativeLabel(this) == null) {
             runOwnScreenText()
             return
         }
@@ -2112,7 +2216,46 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         showScreenTextPanel(report)
     }
 
+    /**
+     * 截屏。
+     *
+     * ★★ **必须先把自己的浮层收干净，再隔一拍抓帧**（用户 2026-10-09：「截图会把轮盘也截进去」）。
+     *
+     * `AccessibilityService.takeScreenshot()` 抓的是**整屏的合成结果**，谁在屏上就截谁 ——
+     * 我们那些 `TYPE_APPLICATION_OVERLAY` 窗口（轮盘、更多面板、校验预览、提示条）全都算数。
+     * 而这条工具的入口**只有轮盘和面板**，所以点下去的那一刻，轮盘正处在退场淡出里
+     * （[MENU_SCRIM_FADE_MS] 那 200ms 窗口还挂在屏上，见 [removeMenu]），截出来就是一张
+     * 「带着半透明轮盘的桌面」。
+     *
+     * 两步都要有：
+     * 1. [purgeOverlaysForScreenshot] 用**立即摘窗**（不能走淡出 —— 淡出期间窗口仍在合成队列里）；
+     * 2. 摘完还要等 [SCREENSHOT_OVERLAY_SETTLE_MS] 才提交，因为窗口从 WindowManager 摘除到
+     *    SurfaceFlinger 真把它合成掉之间隔着若干帧。
+     */
     private fun runScreenshot() {
+        purgeOverlaysForScreenshot()
+        handler.postDelayed({ submitScreenshot() }, SCREENSHOT_OVERLAY_SETTLE_MS)
+    }
+
+    /**
+     * 抓帧前把本应用所有可能被截进去的浮层收掉。
+     *
+     * ⚠️ **角落触摸条不用管**：它平时一个像素都不画（`CornerTriggerView.onDraw` 只在
+     * 校验预览时画那块预留色带），窗口虽然挂在屏上，截出来是透明的。
+     */
+    private fun purgeOverlaysForScreenshot() {
+        // 面板与轮盘都要走「立即撤」那一档：`fade = false` / `MenuExit.NONE`，
+        // 它们内部会先把**正在淡出的那一批**就地收掉（`flushFadingDrawers` /
+        // `removeMenu` 开头那段），所以正在退场的也一并干净。
+        hideDrawer(fade = false)
+        removeMenu(MenuExit.NONE)
+        removeMenuPreview()
+        // 上一次工具提示的卡片：可能还停在屏上（1.8s），别让它印进这张截图。
+        removeToolMessage()
+        DebugLog.info("SCREENSHOT_OVERLAYS_PURGED", "已收掉轮盘/面板/预览/提示条，${SCREENSHOT_OVERLAY_SETTLE_MS}ms 后抓帧")
+    }
+
+    private fun submitScreenshot() {
         // 回调在无障碍服务的主线程上触发，这里再 post 一次，保证弹提示一定在主线程。
         val submitted =
             FreeformAccessibilityService.takeScreenshot(this) { ok, message ->
@@ -2181,12 +2324,13 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      *
      * 不用 `Toast`：Android 12 起后台应用（含仅靠前台服务活着的应用）弹 Toast 会被系统丢弃，
      * 而这里本来就有悬浮窗能力，自己画一块最稳。
+     *
+     * **带 `toolId` 调的会被 [toolMessageIsVisible] 过一遍**：工具提示默认静默，只有白名单
+     * （手电筒 / 截屏）能出去。不带 `toolId` 则一律显示 —— 「说不出话就等于什么都没发生」的
+     * 那类提示（面板构造失败、桌面不认识屏）就是靠不传 `toolId` 强行说出来。
      */
     private fun showToolMessage(message: String, toolId: String? = null) {
-        if (toolId != null &&
-            (toolId != SystemTools.TOOL_FLASHLIGHT ||
-                (message != "手电筒已打开" && message != "手电筒已关闭"))
-        ) return
+        if (toolId != null && !toolMessageIsVisible(toolId, message)) return
         removeToolMessage()
         val view =
             TextView(this).apply {
@@ -2242,6 +2386,32 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         toolMessageView = null
         runCatching { windowManager.removeViewImmediate(view) }
     }
+
+    /**
+     * 一条工具结果该不该飘给用户看。
+     *
+     * 工具提示**默认静默**：点工具本身就是用户的意图，屏幕上多数时候已经能看到结果，
+     * 再飘一句话反而挡事。只放行两类例外 —— 它们的共同点是「结果在屏幕上看不出来，
+     * 不说用户就没法确认」：
+     *
+     * - **手电筒**：灯在机身背面，开没开只能靠这一句；
+     * - **截屏**：用户要知道存到哪儿（相册 `Pictures/FlymeFreeform`），失败时更要知道
+     *   为什么 —— 否则点了截屏一件东西都不出现，跟没点一样；
+     * - **识屏**：成了是系统自己弹面板，**不成的时候必须说**（「没读到文字」「先开无障碍」），
+     *   否则按下去就是「没反应」（用户 2026-10-09 在 Flyme 上正是这么描述的）。
+     *
+     * 普通的「拉起别的 App」仍然静默：那些成了就是应用自己跳出来了，用户看得见。
+     */
+    private fun toolMessageIsVisible(toolId: String, message: String): Boolean =
+        when (toolId) {
+            // ⚠️ 这两句原文出自 [ToolActions]（常量，同一份字符串），别在这里另写一份。
+            SystemTools.TOOL_FLASHLIGHT ->
+                message == ToolActions.FLASHLIGHT_ON || message == ToolActions.FLASHLIGHT_OFF
+
+            SystemTools.TOOL_SCREENSHOT -> true
+            SystemTools.TOOL_SCREEN_TEXT -> true
+            else -> false
+        }
 
     private fun launch(entry: AppEntry) {
         // 内置工具：伪组件，不查 PackageManager，也不套小窗参数，直接在主线程执行。
@@ -2404,6 +2574,16 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
         /** 提示条底色：半透明深色，白字在任何页面背景上都读得清。 */
         private const val HUD_BACKGROUND = 0xE6222222.toInt()
+
+        /**
+         * 截屏前「收掉自己浮层」到「提交抓帧」之间的等待（ms）。
+         *
+         * 窗口用 `removeViewImmediate` 摘除是**同步**的，但屏幕上的像素要等 SurfaceFlinger
+         * 重合成一帧才真的消失，`takeScreenshot` 抓的正是合成结果。取 60ms ≈ 4~7 帧
+         * （60Hz/120Hz）：足够让 detach 事务落地并换上「没有浮层」的画面，又不至于让
+         * 用户觉得按下快门后有一下迟滞。
+         */
+        private const val SCREENSHOT_OVERLAY_SETTLE_MS = 60L
 
         /** 让开触摸条到注入按压之间的等待。约两帧，够窗口标志生效又感觉不到延迟。 */
         private const val TAP_THROUGH_HANDOFF_MS = 40L

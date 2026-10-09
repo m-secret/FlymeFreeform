@@ -625,6 +625,29 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_PANEL_HAPTIC_INDEX, value).apply()
 
     /**
+     * 触感**强度**档位，**0..4 五档**，与系统自己的强度档位一一对应（很弱 / 弱 / 标准 / 强 / 很强）。
+     * 默认 [HAPTIC_STRENGTH_STANDARD] = 标准档。
+     *
+     * 存的是**下标**，档位本身的定义（倍率、文案）在 `Haptics.Strength` 里 —— 那边有个
+     * `values()[下标]` 的翻法，越界会退回默认档，所以手改 prefs 或老备份都不会崩。
+     *
+     * ★★ **约定：标准档 = 每一个数都不动。** ColorOS 那条已验路径的通道顺序、`16/34ms`、`255`
+     * 全都原样，只有非标准档才另走一条路（见 `Haptics.channelsFor`）。这样「默认手感」在任何一台
+     * 机器上都和加这个功能之前**一模一样** —— 强度是个加法，不是替换。改这个功能时别破坏它。
+     */
+    var hapticStrength: Int
+        get() =
+            preferences.getInt(KEY_HAPTIC_STRENGTH, HAPTIC_STRENGTH_STANDARD)
+                .coerceIn(HAPTIC_STRENGTH_MIN, HAPTIC_STRENGTH_MAX)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_HAPTIC_STRENGTH,
+                    value.coerceIn(HAPTIC_STRENGTH_MIN, HAPTIC_STRENGTH_MAX),
+                )
+                .apply()
+
+    /**
      * 隐藏轮盘里的「更多」入口。默认 **false**（保留，行为不变）。
      *
      * 打开后轮盘不再有「更多」那一格，而「更多」面板**只能**从那一格进（见 `OverlayGestureService`
@@ -636,9 +659,15 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putBoolean(KEY_HIDE_MORE_ENTRY, value).apply()
 
     /**
-     * 轮盘极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
+     * 「轮盘离屏幕边距离」：轮盘极坐标原点离屏幕角落的距离，单位是**屏幕短边的百分比**。
      *
-     * 决定整个轮盘「离屏幕边多远」——调大则弧整体往屏幕中心收，调小则更贴角落。
+     * 它和半径是**同向**的（见 `OverlayGestureService.menuSpreadDp`）：圆心往里挪多少、
+     * 半径就往外撑多少，于是整个轮盘离屏幕边更远、同时更大、图标间距跟着变宽。
+     * 调小（0）就完全贴角，等于早先那版的行为。
+     *
+     * ⚠️ 2026-10-09 中途试过反向的「内缩」（圆心挪、半径减），用户实机看过之后否掉
+     * （「功能别改啊，没①好用了」）—— 别再往那个方向改。
+     *
      * 用百分比而不是 dp，是为了在不同屏幕尺寸上观感一致。
      */
     var menuCornerInsetPercent: Int
@@ -812,6 +841,45 @@ class SettingsStore(context: Context) {
         set(value) =
             preferences.edit()
                 .putInt(KEY_MENU_SWING_DEG, value.coerceIn(MIN_MENU_SWING_DEG, MAX_MENU_SWING_DEG))
+                .apply()
+
+    /**
+     * 入场动画的时长（ms）：整个轮盘从角落**长到满尺寸**要多久。**0 = 不做入场动画**（直接出现）。
+     *
+     * 用户 2026-10-09：先问「魅族那套像发射一下，很干净利落，能模拟出来吗」→ 做出来之后
+     * 「很像了」，随后自己一路调：140 → 100 → **220**（「现在效果很好了」）。
+     *
+     * ⚠️ 动画本体是**整盘刚性缩放**（位置与大小由同一个进度驱动，见 `RadialMenuView.onDraw`），
+     * 不是"每颗图标各自射出去"——那个版本会被看成残影。
+     * 还想少走点路就调 [menuLaunchTravelPercent]。
+     *
+     * 与 [menuSwingDeg] 一样是「下次呼出即生效」——
+     * 轮盘每次呼出都按当时设置现建（见 `OverlayGestureService` 里那个 `view.begin`）。
+     */
+    var menuLaunchMs: Int
+        get() = preferences.getInt(KEY_MENU_LAUNCH_MS, DEFAULT_MENU_LAUNCH_MS)
+            .coerceIn(MIN_MENU_LAUNCH_MS, MAX_MENU_LAUNCH_MS)
+        set(value) =
+            preferences.edit()
+                .putInt(KEY_MENU_LAUNCH_MS, value.coerceIn(MIN_MENU_LAUNCH_MS, MAX_MENU_LAUNCH_MS))
+                .apply()
+
+    /**
+     * 出场**行程**（0~100，百分比）：图标从「离槽位多远」的地方开始长出来。
+     *
+     * - **20（默认）= 只走两成**（从离槽位 80% 的地方冒出来）；
+     * - **100 = 从角落原点出发**，整条半径都走（**会被看成"图标在屏幕上划过去"**）；
+     * - **0 = 原地出现**，位置一动不动（只有大小变）⇒ **完全不会有"轨迹"**。
+     *
+     * ★ 用户 2026-10-09 报「还是能看到图标的轨迹」后加的。注意那条"轨迹"是**图标真的在屏幕上划过去**，
+     * 不是帧缓冲拖影（录屏逐帧已排除：每帧单个连通块、路径与终点都没有残留）。嫌有轨迹就往下调。
+     */
+    var menuLaunchTravelPercent: Int
+        get() = preferences.getInt(KEY_MENU_LAUNCH_TRAVEL, DEFAULT_MENU_LAUNCH_TRAVEL)
+            .coerceIn(0, 100)
+        set(value) =
+            preferences.edit()
+                .putInt(KEY_MENU_LAUNCH_TRAVEL, value.coerceIn(0, 100))
                 .apply()
 
     /**
@@ -1135,6 +1203,16 @@ class SettingsStore(context: Context) {
         const val TAB_TOOLS = "tools"
 
         /**
+         * 触感强度的档位下标范围与默认档，见 [hapticStrength]。
+         *
+         * 这三个数与 `Haptics.Strength` 的下标**必须对齐**（那边是 `values()` 的顺序：
+         * 很弱 / 弱 / 标准 / 强 / 很强）—— 加档位时两边一起改，别只改一边。
+         */
+        const val HAPTIC_STRENGTH_MIN = 0
+        const val HAPTIC_STRENGTH_STANDARD = 2
+        const val HAPTIC_STRENGTH_MAX = 4
+
+        /**
          * 横屏面板位置：**跟随呼出边**（默认）。
          *
          * 左边角落呼出贴左、右边呼出贴右。老版本默认是「居中」，存量配置由
@@ -1347,10 +1425,16 @@ class SettingsStore(context: Context) {
         /** 见 [panelIndexHapticEnabled]：「更多」面板索引条的触感。 */
         private const val KEY_PANEL_HAPTIC_INDEX = "panel_haptic_index"
 
+        /** 见 [hapticStrength]：触感强度档位（下标 0..4）。 */
+        private const val KEY_HAPTIC_STRENGTH = "haptic_strength"
+
         /** 见 [hideMoreEntry]：轮盘里不再有「更多」入口。 */
         private const val KEY_HIDE_MORE_ENTRY = "hide_more_entry"
         private const val KEY_MENU_ICON_DP = "menu_icon_dp"
         private const val KEY_MENU_SWING_DEG = "menu_swing_deg"
+
+        private const val KEY_MENU_LAUNCH_MS = "menu_launch_ms"
+        private const val KEY_MENU_LAUNCH_TRAVEL = "menu_launch_travel_percent"
         private const val KEY_MENU_SCRIM_PERCENT = "menu_scrim_percent"
         private const val KEY_MENU_WIDTH_DP = "menu_width_dp"
         private const val KEY_MENU_HEIGHT_DP = "menu_height_dp"
@@ -1383,6 +1467,27 @@ class SettingsStore(context: Context) {
         const val MIN_MENU_SWING_DEG = 0
         const val MAX_MENU_SWING_DEG = 60
         const val DEFAULT_MENU_SWING_DEG = 30
+
+        /**
+         * 入场动画的时长区间（ms）。**0 = 不做入场动画**，图标直接现位（此时走 `enterScale` 那一下轻弹）。
+         *
+         * ★ 动画本体是**整盘刚性缩放**（位置与大小由同一个进度驱动，见 `RadialMenuView.onDraw`），
+         * 不是"每颗图标各自射出去"——那个版本会看起来像残影。
+         *
+         * 上限 400：再长就成「飘」了。
+         * 默认 **220ms**（2026-10-09 用户真机试到 220 定稿：「现在效果很好了」；此前 140 → 100 → 220）。
+         */
+        const val MIN_MENU_LAUNCH_MS = 0
+        const val MAX_MENU_LAUNCH_MS = 400
+        const val DEFAULT_MENU_LAUNCH_MS = 220
+
+        /**
+         * 出场行程（0~100，百分比）的默认值：**20 = 只走两成**（从离槽位 80% 的地方冒出来）。
+         *
+         * 用户 2026-10-09 真机定稿：100 会被看成"图标在屏幕上划过去有轨迹"，**20 才干净**；
+         * 想一点都不走就调 0（原地出现）。见 [menuLaunchTravelPercent]。
+         */
+        const val DEFAULT_MENU_LAUNCH_TRAVEL = 20
 
         /**
          * 图标衬底（灰色层）的不透明度区间，百分比。**0 = 不垫**，与「呼出晃动 0 = 不晃」同口径。
@@ -1446,11 +1551,12 @@ class SettingsStore(context: Context) {
                 KEY_TOOL_ORDER, KEY_HIDE_MORE_ENTRY,
                 // 轮盘几何与观感
                 KEY_MENU_RADIUS_PERCENT, KEY_MENU_HAPTIC, KEY_MENU_ICON_DP, KEY_MENU_SWING_DEG,
+                KEY_MENU_LAUNCH_MS, KEY_MENU_LAUNCH_TRAVEL,
                 KEY_MENU_SCRIM_PERCENT, KEY_MENU_WIDTH_DP, KEY_MENU_HEIGHT_DP,
                 KEY_MENU_CORNER_INSET_PERCENT, KEY_LEGACY_MENU_CORNER_INSET_DP,
-                // 触感（总开关 + 面板三种行为）
+                // 触感（总开关 + 面板三种行为 + 强度档位）
                 KEY_HAPTIC_ENABLED, KEY_PANEL_HAPTIC_TAB_SWITCH,
-                KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX,
+                KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX, KEY_HAPTIC_STRENGTH,
                 // 图标
                 KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
                 // 其它

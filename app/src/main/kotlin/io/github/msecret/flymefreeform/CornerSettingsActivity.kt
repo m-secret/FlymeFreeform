@@ -25,13 +25,14 @@ import android.widget.TextView
  *
  * ## 版面
  *
- * 触摸区（开关与尺寸）→ 轮盘设置 → 角落点击。每一组是一张 [CardGroup]，
+ * 触摸区（开关与尺寸）→ 轮盘外观 → 轮盘动画 → 角落点击。每一组是一张 [CardGroup]，
  * 组内行之间只有一条内缩分隔线，组与组之间留实缝——不会出现相邻圆角相切造成的凹陷。
  *
- * ⚠️ 页面有**三个**恢复默认按钮，语义严格分开（用户 2026-10-08 先报「点触摸区的恢复，把轮盘设置
- * 也一起恢复了」，随后要求「轮盘设置也加入恢复默认」）：紧贴「触摸区」那一组的只管那三条
- * （[resetTouchDefaults]）、紧贴「轮盘设置」那一组的只管那五个值（[resetMenuDefaults]）、
- * 全部恢复在**页面最底部**（[resetToDefaults]）。三者别合并、也别换位置。
+ * ⚠️ 页面有**四个**恢复默认按钮，语义严格分开（用户 2026-10-08 先报「点触摸区的恢复，把轮盘设置
+ * 也一起恢复了」，随后要求「轮盘设置也加入恢复默认」；2026-10-09 轮盘那组拆成「外观 / 动画」两节，
+ * 按钮也跟着拆成两条）：紧贴哪一组就只管哪一组 —— [resetTouchDefaults] /
+ * [resetMenuAppearance] / [resetMenuAnimation]，全部恢复在**页面最底部**（[resetToDefaults]）。
+ * 谁都别合并、也别换位置。
  *
  * 「图标来源」那一组 2026-10-08 搬到了主界面「功能」tab 卡片上（见 `MainActivity` 的
  * `iconSourceButton`）：它管的是全局观感，不属于「呼出」这一套参数。
@@ -135,7 +136,8 @@ class CornerSettingsActivity : Activity() {
     /**
      * 「触摸区」那一组恢复默认（宽度 / 高度 / 边缘预留）。
      *
-     * ⚠️ **别把它和 [resetMenuDefaults] / [resetToDefaults] 合并**：页面里每个按钮都紧贴它自己那一组，
+     * ⚠️ **别把它和轮盘那两组（[resetMenuAppearance] / [resetMenuAnimation]）或 [resetToDefaults]
+     * 合并**：页面里每个按钮都紧贴它自己那一组，
      * 用户 2026-10-08 点「触摸区」下面那个按钮时的预期是「只把上面这三条拨回去」，结果连轮盘设置的
      * 宽度 / 高度 / 离角距离 / 图标大小 / 呼出晃动也一起被重置了——他报的就是这条。
      * 现在**每组各管各的**，全量恢复单独放在**页面最底部**。
@@ -145,9 +147,26 @@ class CornerSettingsActivity : Activity() {
         afterReset()
     }
 
-    /** 「轮盘设置」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动）。 */
-    private fun resetMenuDefaults() {
-        resetMenuValues()
+    /**
+     * 「轮盘外观」那一组恢复默认（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 图标衬底）。
+     *
+     * ⚠️ **两组各管各的**（动画那两项见 [resetMenuAnimation]）：用户 2026-10-08 报过
+     * 「本组恢复把别组也一起拨回去」，所以每条按钮只碰它紧挨着的那一组。
+     */
+    private fun resetMenuAppearance() {
+        store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
+        store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
+        store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
+        store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
+        store.menuScrimPercent = SettingsStore.DEFAULT_MENU_SCRIM_PERCENT
+        afterReset()
+    }
+
+    /** 「轮盘动画」那一组恢复默认（呼出晃动 / 呼出动画时长）。 */
+    private fun resetMenuAnimation() {
+        store.menuSwingDeg = SettingsStore.DEFAULT_MENU_SWING_DEG
+        store.menuLaunchMs = SettingsStore.DEFAULT_MENU_LAUNCH_MS
+        store.menuLaunchTravelPercent = SettingsStore.DEFAULT_MENU_LAUNCH_TRAVEL
         afterReset()
     }
 
@@ -165,13 +184,20 @@ class CornerSettingsActivity : Activity() {
         store.edgeInsetDp = SettingsStore.DEFAULT_EDGE_INSET_DP
     }
 
-    /** 轮盘设置六个值写回默认。呼出晃动（30°）与图标衬底（35%）也算这一组的。 */
+    /**
+     * 轮盘**全部**值写回默认（= 外观五项 + 动画两项）。
+     *
+     * 只给页面最底部的 [resetToDefaults] 用 —— 两个分组各自的重置见
+     * [resetMenuAppearance] / [resetMenuAnimation]。
+     */
     private fun resetMenuValues() {
         store.menuWidthDp = SettingsStore.DEFAULT_MENU_WIDTH_DP
         store.menuHeightDp = SettingsStore.DEFAULT_MENU_HEIGHT_DP
         store.menuCornerInsetPercent = SettingsStore.DEFAULT_MENU_CORNER_INSET_PERCENT
         store.menuIconDp = SettingsStore.DEFAULT_MENU_ICON_DP
         store.menuSwingDeg = SettingsStore.DEFAULT_MENU_SWING_DEG
+        store.menuLaunchMs = SettingsStore.DEFAULT_MENU_LAUNCH_MS
+        store.menuLaunchTravelPercent = SettingsStore.DEFAULT_MENU_LAUNCH_TRAVEL
         store.menuScrimPercent = SettingsStore.DEFAULT_MENU_SCRIM_PERCENT
     }
 
@@ -282,8 +308,12 @@ class CornerSettingsActivity : Activity() {
         // 它紧贴「触摸区」这一组，用户对它的预期就是「把这一组拨回去」，见 [resetTouchDefaults]。
         root.addView(Ui.outlinedButton(this, "触摸区恢复默认") { resetTouchDefaults() })
 
-        // ---- 轮盘设置 ----
-        root.addView(Ui.sectionTitle(this, "轮盘设置"))
+        // ---- 轮盘外观 ----
+        //
+        // ★ 名字从「轮盘设置」改过来（用户 2026-10-09：「轮盘设置改名轮盘页面（或者你觉得更合适的）」）：
+        // 这一组管的都是**轮盘长什么样**（尺寸 / 位置 / 图标 / 衬底），下面新分出去的那组管**它怎么动**，
+        // 两组并列时「设置」这个词就没法区分了，所以按内容叫「外观」。
+        root.addView(Ui.sectionTitle(this, "轮盘外观"))
         root.addView(
             CardGroup(this)
                 .row(
@@ -318,11 +348,15 @@ class CornerSettingsActivity : Activity() {
                 )
                 .row(
                     seekRow(
+                        // ★ 名字随**行为**走。这个旋钮现在做的是「圆心往里挪多少、半径就往外撑多少」
+                        // = 轮盘整体离屏幕边更远、同时更大，所以叫「离屏幕边距离」是自洽的。
+                        // ⚠️ 2026-10-09 中途改成过「轮盘内缩」（反向），用户实机看过之后否掉：
+                        // 「功能别改啊，没①好用了」—— 别再往那个方向改。
                         label = "轮盘离屏幕边距离",
                         value = store.menuCornerInsetPercent,
                         min = SettingsStore.MIN_MENU_CORNER_INSET_PERCENT,
                         max = SettingsStore.MAX_MENU_CORNER_INSET_PERCENT,
-                        detail = "占屏幕短边 %",
+                        detail = "占屏幕短边 %，越大轮盘越大、离屏幕边越远",
                         onLive = {
                             liveCornerInset = it
                             syncPreview()
@@ -345,21 +379,6 @@ class CornerSettingsActivity : Activity() {
                     ) { value ->
                         store.menuIconDp = value
                         refreshPreview()
-                    },
-                )
-                .row(
-                    seekRow(
-                        label = "呼出晃动",
-                        value = store.menuSwingDeg,
-                        min = SettingsStore.MIN_MENU_SWING_DEG,
-                        max = SettingsStore.MAX_MENU_SWING_DEG,
-                        detail = "呼出时转一下再回正的角度（右下角顺时针、左下角相反）。0 = 不转",
-                        unit = "°",
-                    ) { value ->
-                        // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
-                        // 下次呼出就生效，不用重建服务、也不用刷新预览——预览画的是静止几何，
-                        // 而且画的是圆点，转多少度都看不出来。
-                        store.menuSwingDeg = value
                     },
                 )
                 .row(
@@ -400,15 +419,75 @@ class CornerSettingsActivity : Activity() {
         root.addView(
             Ui.hint(
                 this,
-                "「宽度 / 高度」一起构成椭圆弧，「离屏幕边距离」决定弧离角落多远。" +
-                    "「图标大小」与轮盘几何**完全解耦**：只改图标本身，调得比弧上的格子大会相互重叠。",
+                "「宽度 / 高度」一起构成椭圆弧的长短轴；「离屏幕边距离」决定整条弧离角落多远" +
+                    "（越大越往外撑，图标间距也跟着变宽）。「图标大小」与轮盘几何**完全解耦**：" +
+                    "只改图标本身，调得比弧上的格子大会相互重叠。",
             ),
         )
 
         root.addView(Ui.spacer(this))
-        // 只管「轮盘设置」这一组（宽度 / 高度 / 离屏幕边距离 / 图标大小 / 呼出晃动 / 图标衬底）。
-        // 与上面那个「触摸区恢复默认」**对称**：每个按钮只碰它紧挨着的那一组，全量恢复在页面最底部。
-        root.addView(Ui.outlinedButton(this, "轮盘设置恢复默认") { resetMenuDefaults() })
+        // 每个按钮只碰它**紧挨着的那一组**（与上面那个「触摸区恢复默认」对称；全量恢复在页面最底部）。
+        root.addView(Ui.outlinedButton(this, "轮盘外观恢复默认") { resetMenuAppearance() })
+
+        // ---- 轮盘动画 ----
+        //
+        // ★ 单独成组（用户 2026-10-09：「晃动和呼出放到下面新增的轮盘动画」）：这两行**不改几何**，
+        // 只管「呼出那一刻图标怎么动」，与上面那组「长什么样」是两件事 —— 混在一张卡里容易被看漏。
+        root.addView(Ui.sectionTitle(this, "轮盘动画"))
+        root.addView(
+            CardGroup(this)
+                .row(
+                    seekRow(
+                        label = "呼出晃动",
+                        value = store.menuSwingDeg,
+                        min = SettingsStore.MIN_MENU_SWING_DEG,
+                        max = SettingsStore.MAX_MENU_SWING_DEG,
+                        detail = "呼出时转一下再回正的角度（右下角顺时针、左下角相反）。0 = 不转",
+                        unit = "°",
+                    ) { value ->
+                        // 轮盘是**每次呼出时**按设置现建的（见 OverlayGestureService 里那个 view.begin），
+                        // 下次呼出就生效，不用重建服务、也不用刷新预览——预览画的是静止几何，
+                        // 而且画的是圆点，转多少度都看不出来。
+                        store.menuSwingDeg = value
+                    },
+                )
+                .row(
+                    seekRow(
+                        // ★ 用户 2026-10-09 真机试到 220 定稿（「现在效果很好了」）：
+                        // 默认值 140 → 100 → **220**，见 SettingsStore.DEFAULT_MENU_LAUNCH_MS。
+                        // 名字用用户自己的说法「呼出动画时长」。
+                        label = "呼出动画时长",
+                        value = store.menuLaunchMs,
+                        min = SettingsStore.MIN_MENU_LAUNCH_MS,
+                        max = SettingsStore.MAX_MENU_LAUNCH_MS,
+                        // 文案跟着动画改：现在是**整个轮盘从角落刚性长大**（位置与大小同一个进度），
+                        // 不再是"每颗图标各自射出去"。别写回"图标从角落出场"。
+                        detail = "整个轮盘从角落长大的时长。越短越干脆，0 = 直接出现",
+                        unit = "ms",
+                    ) { value ->
+                        // 与「呼出晃动」同理：轮盘每次呼出都按当时的设置现建，下次呼出即生效；
+                        // 预览画的是静止几何，看不出动画，所以不用 refreshPreview()。
+                        store.menuLaunchMs = value
+                    },
+                )
+                .row(
+                    seekRow(
+                        // ★ 用户 2026-10-09 报「还是能看到图标的轨迹」后加的旋钮。
+                        //   那条"轨迹"是**图标真的在屏幕上划过去**（不是帧缓冲拖影，录屏逐帧已排除），
+                        //   所以直接给一个"走多远"的旋钮：**0 = 原地出现，完全没轨迹**。
+                        label = "出场行程",
+                        value = store.menuLaunchTravelPercent,
+                        min = 0,
+                        max = 100,
+                        detail = "图标从多远的地方长出来。100% = 从角落；0% = 原地出现（没有轨迹）",
+                        unit = "%",
+                    ) { value ->
+                        store.menuLaunchTravelPercent = value
+                    },
+                ),
+        )
+        root.addView(Ui.spacer(this))
+        root.addView(Ui.outlinedButton(this, "轮盘动画恢复默认") { resetMenuAnimation() })
 
         // ---- 角落点击 ----
         root.addView(Ui.sectionTitle(this, "角落点击"))

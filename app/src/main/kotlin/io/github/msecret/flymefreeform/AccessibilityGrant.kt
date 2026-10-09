@@ -165,4 +165,50 @@ object AccessibilityGrant {
         DebugLog.info("A11Y_GRANT_REVOKE", "摘掉本服务 发出=$ok")
         return ok
     }
+
+    // ---- 给用户看的系统相关说明（2026-10-09） ----
+
+    /**
+     * 「补回无障碍之后那个系统弹框」的说明 —— [systemNote] 与 [restoreToastSuffix] 共用一份，
+     * 两处说法不会各自漂。
+     */
+    private const val SYSTEM_DIALOG_NOTE = "约 30 秒后系统会弹一次「检测到…获取无障碍权限」，忽略即可"
+
+    /**
+     * 首页那段常驻说明：**本机为什么会把无障碍关掉、补回后那个系统框是什么**。
+     *
+     * ★ 这是**按系统分家**的文案，返回**空串**表示这台机器上没有可说的 —— 调用方此时
+     * **一个字都不显示**（别硬凑一句通用的：那会变成人人都看、人人都不需要的噪音）。
+     *
+     * 目前只有 ColorOS 有这一段：它的反诈策略（`OplusRiskAccessibilityController`）
+     * 会在开机把「侧载」的第三方无障碍服务强制关掉；别的系统不掉、也没有那个框。
+     *
+     * ★ 判据写在**条目自己身上**（见 [SYSTEM_NOTES]），调用点按顺序取第一个非空的 ——
+     * **不要**在调用点按品牌分派。这条规矩和「系统图标集」（`AppCatalog.ThemedIcons`）、
+     * 「识屏实现」（`NativeScreenText.SOURCES`）是同一个：品牌名会骗人，能力/现象不会。
+     */
+    fun systemNote(context: Context): String =
+        SYSTEM_NOTES.firstNotNullOfOrNull { runCatching { it(context) }.getOrNull() }.orEmpty()
+
+    /**
+     * 「已写回系统名单」之后要不要再补一句（toast 用）。空串 = 别家，不用补。
+     *
+     * 单独一个入口而不是让调用方拼 [systemNote]：首页那段带 markdown 粗体（Toast 不渲染，
+     * 会露出 `**`），而且 toast 要的是短句。
+     */
+    fun restoreToastSuffix(context: Context): String =
+        if (SystemSupport.isColorOs(context)) "；$SYSTEM_DIALOG_NOTE" else ""
+
+    /** 各家的常驻说明，**按顺序取第一个非空的**。加一家就往这里加一条。 */
+    private val SYSTEM_NOTES: List<(Context) -> String?> =
+        listOf(
+            { context ->
+                if (SystemSupport.isColorOs(context)) {
+                    "**无障碍每次开机会被 ColorOS 关掉**（反诈策略），本应用会自动补回；" +
+                        SYSTEM_DIALOG_NOTE + "。"
+                } else {
+                    null
+                }
+            },
+        )
 }

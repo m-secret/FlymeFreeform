@@ -133,7 +133,10 @@ class IconSettingsActivity : Activity() {
             Ui.choiceRow(
                 context = this,
                 title = "跟随系统图标集",
-                detail = "用 ColorOS 主题里那套图标，和桌面一致",
+                // ⚠️ 这里**不能写「ColorOS」**：除了 ColorOS 的 /data/theme/icons，Flyme 还有
+                // 一套自己的（/system/customizecenter/theme，底板+前景+遮罩），两边都是自动识别的
+                // （见 `AppCatalog.ThemedIcons`）。点名一家会让另一家的用户以为这功能与他无关。
+                detail = "用系统主题那套图标，和桌面一致",
                 selected = current == SYSTEM_SET,
             ) {
                 applySource(SYSTEM_SET)
@@ -142,7 +145,11 @@ class IconSettingsActivity : Activity() {
             Ui.choiceRow(
                 context = this,
                 title = "默认",
-                detail = "不替换，用应用自带的图标",
+                // ⚠️ 别写「不替换 / 用应用自带的图标」——**这是假的**：两条路其实都经过我们重绘。
+                // 这一支给的是**我们画的那套**（ColorOS = 原图套圆形裁剪；Flyme = 从主题包
+                // 合成的「底板 + 前景 + 遮罩」，见 `AppCatalog.ThemedIcons`），**和桌面不一定一致**。
+                // 用户 2026-10-09 原话：「其实不管 coloros 还是 flyme，我们都重绘了」。
+                detail = "我们重绘的图标，可能和桌面不同",
                 selected = current == NONE_SET,
             ) {
                 applySource(NONE_SET)

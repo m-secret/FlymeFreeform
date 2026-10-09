@@ -8,16 +8,16 @@ import android.net.Uri
 /**
  * ColorOS 原生「小布识屏」的调用桥。
  *
- * ## 两条路，按顺序试
+ * ## 各家实现，按顺序试
  *
- * 1. **侧边栏功能 URI**（首选，**不需要任何权限**）——把智能侧边栏那一下「点小布识屏」
- *    换成一条 Intent：`ACTION_VIEW` + `oppo.sidebar.feature:小布识屏`。**只在注册了这个 scheme
- *    的 ROM 上**生效（见第 5 条：实测 ColorOS 16.0.10 与 17 都不注册它，所以真实生效范围是
- *    更早的系统；在那之前它会安静地退到第 2 条）。
- * 2. **重放双指长按手势**（兜底，需要无障碍）——把用户自己按下去的那两下原样注入一次，
- *    系统认出后就自己把面板画出来。侧边栏 scheme 已被 ColorOS 撤掉（16.0.10 / 17 实测都没有），只剩这条。
+ * 每次唤起都是「**把 [SOURCES] 里第一个可用的实现交出去**」，谁都不行才由调用方退回本项目自研的
+ * 「遍历无障碍节点树读字」。实现**按 ROM 分家，判据写在实现自己身上**（见 [Source.isAvailable]）
+ * —— 加别家就是从「改 trigger()」变成「加一个实现 + 注册一行」。
  *
- * 两条都不成时才由调用方退回本项目自研的「遍历无障碍节点树读字」。
+ * 1. **侧边栏功能 URI** —— ColorOS，老 ROM 才注册那个 scheme；免权限、副作用最小，所以排第一。
+ * 2. **重放双指长按手势** —— ColorOS，17 上唯一还通的；需要无障碍，而且它是**盲注入**。
+ *
+ * （Flyme / 小米等各家都有自己的识屏，但入口形态与权限门槛必须逐台真机取证才能写，见 `SCREEN-TEXT.md`。）
  *
  * ## 逐条盘点：哪些路通、哪些路已经排除
  *
@@ -164,39 +164,168 @@ object NativeScreenText {
         /** **当前界面系统不支持识屏**（桌面）。什么都没做，调用方给一句可读提示即可，别退回读字。 */
         UNSUPPORTED,
 
-        /** 两条路都没走成（非 ColorOS / 无障碍没连上），调用方应退回自研读字。 */
+        /** [SOURCES] 里没有一个走成（没有可用实现 / 无障碍没连上 / 注入没提交出去），调用方退回自研读字。 */
         FALLBACK,
     }
 
     /**
+     * 唤起系统识屏的**一种实现**。
+     *
+     * 一家一套，一家也可以有两条（按 [SOURCES] 的顺序试）。★ **判据留在实现自己身上**：
+     * [isAvailable] 要问的是「我这套入口在这台机器上在不在」（那个 scheme 解析得到吗 / 那套框架在吗），
+     * **不是**在调用方按 ROM 名字分派 —— 这条规矩本工程在「系统图标集」那边已经立过
+     * （见 `AppCatalog.ThemedIcons`：判据是「文件能不能读」，不是 ROM 名）。
+     * 理由：刷了第三方 ROM 的同品牌机、移植 ROM，品牌名都会骗人，而「入口在不在」永远说实话；
+     * 而且这样天然吃得下「一家多路」和「移植 ROM 撞车」。
+     *
+     * ⚠️ 加一家 = **加一个实现 + 在 [SOURCES] 里注册一行**，工具文案与调用方都不用动。
+     * 目前只有 ColorOS（两条路）。Flyme / 小米等各家的识屏入口**必须真机取证**才能写
+     * （入口是 Activity / Service / scheme / 手势，还各有权限门槛），见 `SCREEN-TEXT.md`。
+     */
+    private interface Source {
+        /** 日志与排查用，例 `coloros.two-finger`。 */
+        val id: String
+
+        /** 用户可见的称呼（例「小布识屏」）—— 也是工具文案的依据，见 [nativeLabel]。 */
+        val label: String
+
+        /** 这套入口在这台机器上**在不在**。纯本地探测，**别做有副作用的动作**。 */
+        fun isAvailable(context: Context): Boolean
+
+        /**
+         * 真去唤起。
+         *
+         * 返回值只有三种，和 [Outcome] 一一对应：交出去了 → [Outcome.TRIGGERED]；
+         * **当前界面系统不支持**（桌面）→ [Outcome.UNSUPPORTED]；我这条路走不通 → [Outcome.FALLBACK]。
+         */
+        fun invoke(context: Context): Outcome
+    }
+
+    /**
+     * 已知的实现，**按顺序试第一个可用的**。
+     *
+     * 现役两条都是 ColorOS 的；顺序有讲究：老 ROM 上那条 URI 免权限、副作用最小，所以排前。
+     */
+    private val SOURCES: List<Source> = listOf(ColorOsSidebarUri, ColorOsTwoFingerPress)
+
+    /**
      * 唤起系统识屏。
      *
-     * 顺序：**非 ColorOS 直接收手**（见下）→ **先走侧边栏功能 URI**（免权限，但只在还注册着该
-     * scheme 的老 ROM 上生效）→ 前台是桌面就直接收手（见 [isDesktopForeground]）→ 否则
-     * **重放双指长按**。
-     *
-     * ★ **非 ColorOS 上必须一开始就返回 [Outcome.FALLBACK]**，一条注入路都不要走：
-     * 「小布识屏」是 ColorOS 的功能，别家系统上没有东西会接这记双指长按，而我们的注入是
-     * **盲注入**（落点是屏幕正中）—— 那一按只会打到前台应用身上：长按选中一段文字、弹出
-     * 上下文菜单、把列表项拖走……白误伤一次，然后照样退回自研读字。既然结果一样，
-     * 就别先按那一下（判据见 [SystemSupport]）。
+     * 顺序：**按 [SOURCES] 试第一个「可用」的实现**；谁交出去了就收手，谁都不行则返回
+     * [Outcome.FALLBACK]，由调用方退回自研读字（遍历无障碍节点树）。加了别家的实现之后，
+     * 这里的顺序不用动 —— 不可用的那些自己在 [Source.isAvailable] 就被跳过了。
      *
      * **调用方必须在调它之前把注入遮罩盖上**（`OverlayGestureService.coverGestureShield`）：
-     * 不盖的话这记按压会先打到前台应用身上。盖的动作要在**调这个函数之前**完成、
-     * 并且留出一帧让系统登记那个窗口，所以调用方是「先盖 → 稍等 → 再调本函数」。
+     * 不盖的话双指按压会先打到前台应用身上。盖的动作要在**调这个函数之前**完成、
+     * 并且留出一帧让系统登记那个窗口 —— 所以调用方现在先问 [nativeLabel]：
+     * **没有原生实现时连遮罩都不盖**（别家没有东西接那记盲注入，按下去只会误伤）。
      */
     fun trigger(context: Context): Outcome {
-        if (!SystemSupport.isColorOs(context)) {
-            DebugLog.info(
-                "TOOL_SCREEN_TEXT_NOT_COLOROS",
-                "非 ColorOS：没有小布识屏，跳过双指长按注入（盲注入会误伤前台应用），直接读无障碍文字",
-            )
-            return Outcome.FALLBACK
+        for (source in SOURCES) {
+            if (!source.isAvailable(context)) continue
+            DebugLog.info("TOOL_SCREEN_TEXT_STRATEGY", "试 ${source.id}（${source.label}）")
+            when (val outcome = source.invoke(context)) {
+                // 交出去了、或当前界面根本不支持（桌面）—— 两种都**收手**，别往下试。
+                Outcome.TRIGGERED, Outcome.UNSUPPORTED -> return outcome
+                // 这条走不通（无障碍没连上、注入没提交出去……），试下一条。
+                Outcome.FALLBACK -> Unit
+            }
         }
-        if (triggerViaSidebarFeature(context)) return Outcome.TRIGGERED
-        if (isDesktopForeground(context)) return Outcome.UNSUPPORTED
-        if (replayTwoFingerLongPress(context)) return Outcome.TRIGGERED
+        DebugLog.info("TOOL_SCREEN_TEXT_STRATEGY", "没有任何可用实现，退回自研读字")
         return Outcome.FALLBACK
+    }
+
+    /**
+     * 这台机器上有没有**系统原生**的识屏实现：有则返回它的称呼（例「小布识屏」），没有则 null。
+     *
+     * 两个用途都在别处：
+     * - 调用方 `OverlayGestureService.runScreenText` 据此决定**要不要盖注入遮罩**；
+     * - 工具说明 `SystemTools.describe` 据此说实话（有原生那套就说唤起它，没有就说读屏幕文字）。
+     */
+    fun nativeLabel(context: Context): String? =
+        SOURCES.firstOrNull { it.isAvailable(context) }?.label
+
+    /**
+     * ① 侧边栏「功能」URI —— 老 ROM 上那条免权限的路。
+     *
+     * 判据就是**这个 scheme 解析得到吗**：实测 ColorOS 16.0.10 / 17 都解析不到
+     * （OPPO 已经把侧边栏的功能 scheme 撤了），所以它在现役机器上永远是「不可用」被跳过；
+     * 留着是为了对更老的 ROM 自动生效。
+     */
+    private object ColorOsSidebarUri : Source {
+        override val id = "coloros.sidebar-uri"
+        override val label = "小布识屏"
+
+        /**
+         * 解析出「该由哪个 Activity 接这条功能 URI」，解析不到返回 null。
+         *
+         * 之所以要先 `resolveActivity` 而不是直接 `startActivity`：
+         * - 没有包注册这个 scheme 时直接 start 会弹「无法解析」的崩溃风险；
+         * - 解析到之后 `setComponent` 固定到那一个 Activity，避免出现选择器弹窗。
+         *
+         * `CATEGORY_BROWSABLE` 是有意留的两个候选：这类 Intent 常带它，但不确定侧边栏的
+         * intent-filter 到底声明没声明这个 category —— 带了、对方没声明，解析就会失败。
+         * 所以「先带、解析不到再去掉」各试一次，谁成算谁。
+         */
+        private fun resolve(context: Context): Intent? {
+            val uri =
+                runCatching { Uri.parse("$SIDEBAR_SCHEME:$SIDEBAR_OCR_FEATURE") }.getOrNull()
+                    ?: return null
+            val candidates =
+                listOf(
+                    Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE),
+                    Intent(Intent.ACTION_VIEW, uri),
+                )
+            for (intent in candidates) {
+                val activity =
+                    runCatching { context.packageManager.resolveActivity(intent, 0) }.getOrNull()
+                        ?.activityInfo
+                        ?: continue
+                return intent
+                    .setComponent(ComponentName(activity.packageName, activity.name))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            return null
+        }
+
+        override fun isAvailable(context: Context): Boolean = resolve(context) != null
+
+        override fun invoke(context: Context): Outcome {
+            val intent = resolve(context) ?: return Outcome.FALLBACK
+            val started =
+                runCatching { context.startActivity(intent) }
+                    .onFailure {
+                        DebugLog.warn("TOOL_SCREEN_TEXT_SIDEBAR_FAILED", intent.toString(), it)
+                    }
+                    .isSuccess
+            DebugLog.info(
+                "TOOL_SCREEN_TEXT_SIDEBAR",
+                "${intent.component?.flattenToString()} 启动=$started",
+            )
+            return if (started) Outcome.TRIGGERED else Outcome.FALLBACK
+        }
+    }
+
+    /**
+     * ② 重放「双指长按」—— ColorOS 17 上唯一还通的那条。
+     *
+     * 判据 = 这台机器有 ColorOS 的小布识屏框架（[SystemSupport.isColorOs]）。这一条**必须**问 ROM：
+     * 双指按压是**盲注入**，别家没有东西接它，按下去只会误伤前台应用 ——
+     * 所以别的实现（将来 Flyme 那套）摆在前面也没关系，它自己会在这里被跳过。
+     */
+    private object ColorOsTwoFingerPress : Source {
+        override val id = "coloros.two-finger"
+        override val label = "小布识屏"
+
+        override fun isAvailable(context: Context): Boolean = SystemSupport.isColorOs(context)
+
+        override fun invoke(context: Context): Outcome {
+            // 桌面**本地就能判**：系统在桌面上不出识屏面板，而这记按压落点在屏幕正中，
+            // 在桌面上正好按住图标。这种「没有意义却会命中别人手势」的注入必须先拦掉，
+            // 而且**不要**退回读字（那只会读出一屏图标名）。见 [isDesktopForeground]。
+            if (isDesktopForeground(context)) return Outcome.UNSUPPORTED
+            return if (replayTwoFingerLongPress(context)) Outcome.TRIGGERED else Outcome.FALLBACK
+        }
     }
 
     /**
@@ -251,53 +380,6 @@ object NativeScreenText {
                 ?.activityInfo
                 ?.packageName
         }.getOrNull()
-
-    /**
-     * 走侧边栏功能 URI 那条路：把「小布识屏」的 function URI 发过去。
-     *
-     * 之所以要先 `resolveActivity` 而不是直接 `startActivity`：
-     *
-     * - **ColorOS 17 上没有包注册这个 scheme**，直接 start 会弹「无法解析」的崩溃风险；
-     *   解析不到就干净地返回 false，让调用方退回双指长按。这也是本方法在 17 上的正常路径。
-     * - 解析到之后 `setComponent` 固定到那一个 Activity，避免出现选择器弹窗。
-     *
-     * `CATEGORY_BROWSABLE` 是有意留的两个候选：这类 Intent 常带它，但不确定
-     * ColorOS 16 侧边栏的 intent-filter 到底声明没声明这个 category —— 带了、对方没声明，
-     * 解析就会失败。所以「先带、解析不到再去掉」各试一次，谁成算谁。
-     */
-    private fun triggerViaSidebarFeature(context: Context): Boolean {
-        val uri =
-            runCatching { Uri.parse("$SIDEBAR_SCHEME:$SIDEBAR_OCR_FEATURE") }.getOrNull()
-                ?: return false
-        val packageManager = context.packageManager
-        val candidates =
-            listOf(
-                Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE),
-                Intent(Intent.ACTION_VIEW, uri),
-            )
-        for (intent in candidates) {
-            val resolved =
-                runCatching { packageManager.resolveActivity(intent, 0) }.getOrNull()
-                    ?: continue
-            val activity = resolved.activityInfo ?: continue
-            intent.component = ComponentName(activity.packageName, activity.name)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            val started =
-                runCatching { context.startActivity(intent) }
-                    .onFailure { DebugLog.warn("TOOL_SCREEN_TEXT_SIDEBAR_FAILED", intent.toString(), it) }
-                    .isSuccess
-            DebugLog.info(
-                "TOOL_SCREEN_TEXT_SIDEBAR",
-                "有解析结果 -> ${activity.packageName}/${activity.name} 启动=$started",
-            )
-            if (started) return true
-        }
-        DebugLog.info(
-            "TOOL_SCREEN_TEXT_SIDEBAR_ABSENT",
-            "没有组件认 $SIDEBAR_SCHEME（实测 ColorOS 16.0.10 / 17 都没有，或非 ColorOS），改走双指长按",
-        )
-        return false
-    }
 
     /**
      * 重放「双指长按」，由系统层识别后自己弹面板。

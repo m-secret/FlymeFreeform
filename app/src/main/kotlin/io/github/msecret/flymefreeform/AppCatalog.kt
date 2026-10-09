@@ -13,6 +13,7 @@ import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Process
+import java.io.Closeable
 import java.text.Collator
 import java.util.Locale
 import kotlin.math.min
@@ -88,6 +89,67 @@ object AppCatalog {
     /** [resolveIcon] 的结果。`themed` = 来自图标包 / 系统图标集（**别再套默认的圆形裁剪**）。 */
     private class ResolvedIcon(val bitmap: Bitmap, val themed: Boolean)
 
+    /**
+     * 「系统图标集」的统一出口。
+     *
+     * 各家的实现**互不相同**（ColorOS 是 `allApps.xml` 映射 + 按实测占比归一化；Flyme 是
+     * 底板 + 前景 + 形状遮罩三层合成），但对调用方只有一件事：**给我这个包在桌面上那个样子的图标**。
+     *
+     * ★ 判据是「**文件能不能读**」，不是 ROM 名字：两家的路径都只有自己才有。
+     * 所以这里就是「ColorOS 试一次，不行再 Flyme」，谁先开出来就用谁 —— 不需要引 ROM 判断，
+     * 也就不会出现「识别错了导致图标整块失效」。
+     */
+    private class ThemedIcons(
+        private val colorOs: SystemIconSet.Session?,
+        private val flyme: FlymeIconSet.Session?,
+    ) : Closeable {
+
+        /**
+         * @param fraction 该应用**默认图标实测出来的视觉内容占比**（[defaultIconFraction]）。
+         *   ColorOS 那一套用它把主题图标拉到和原图一样大；Flyme 用它把**没被主题覆盖**的应用原图
+         *   放大到内容铺满遮罩（否则遮罩裁不到、出来还是原图那块圆角方形）。
+         * @param fallback 该应用自带图标。只有 Flyme 用得到（主题没覆盖的应用），
+         *   而且是**懒求值**——主题两层都在就一次都不会调。
+         */
+        fun load(
+            packageName: String,
+            targetPx: Int,
+            fraction: Float,
+            fallback: () -> Drawable?,
+        ): Bitmap? =
+            colorOs?.loadIcon(packageName, targetPx, fraction)
+                ?: flyme?.loadIcon(packageName, targetPx, fraction, fallback)
+
+        override fun close() {
+            runCatching { colorOs?.close() }
+            runCatching { flyme?.close() }
+        }
+
+        companion object {
+            /**
+             * 两套都开不出来（非 ColorOS / 非 Flyme，或资源读不到）时返回 null。
+             *
+             * ★★ Flyme 这一支**要接**（2026-10-09 用户实测三轮后定）：
+             * 用户要的是**两个选项给出两套不同的图标**，而且：
+             *
+             * - **默认** = 系统给什么就是什么、**原样不裁**（Flyme 的 `pm.getApplicationIcon`
+             *   返回的已经是用户装的那套主题图标，我们别去动它——见 [load] 里那段裁剪说明）；
+             * - **跟随系统图标集** = 我们从 `/system/customizecenter/theme` 那套
+             *   「底板 + 前景 + 遮罩」**自己合成**的一份（见 [FlymeIconSet]）。
+             *
+             * ⚠️ 两者**必须都能给**，否则「默认」与「跟随系统图标集」就变成同一个东西
+             * （用户报的「你这默认和跟随系统一样了啊」）。
+             */
+            fun open(context: Context): ThemedIcons? {
+                val colorOs = runCatching { SystemIconSet.open() }.getOrNull()
+                // ColorOS 开出来了就不用再试 Flyme：两套不可能同时存在，省一次文件探测。
+                val flyme = if (colorOs == null) runCatching { FlymeIconSet.open(context) }.getOrNull() else null
+                if (colorOs == null && flyme == null) return null
+                return ThemedIcons(colorOs, flyme)
+            }
+        }
+    }
+
     /** 取「现在真正生效的图标包」。
      *
      * **存量脏值自愈**：老版本按「有没有 appfilter 资源」判图标包，把 `com.oplus.safecenter`
@@ -101,6 +163,49 @@ object AppCatalog {
         DebugLog.info("ICON_PACK_STALE_CLEARED", "$stored 已不是可用的图标包（多半是旧版误报），清空")
         store.iconPackPackage = ""
         return ""
+    }
+
+    /**
+     * 「本机到底走不走系统图标集」—— 唯一判定点（[load]、[compareIcons] 与 [sourceSignature] 都问它）。
+     *
+     * `||` 而不是只看偏好：只要选了图标包，图标集就必须参与兜底（见 [load] 里那段说明）。
+     *
+     * ## ★★ Flyme 上这个开关要**取反**（2026-10-09 用户三轮实测后拍板）
+     *
+     * 用户要的对应关系是：
+     *
+     * | 选项 | Flyme 上给出什么 |
+     * | --- | --- |
+     * | **跟随系统图标集** | **桌面现在用的那套**（= `pm.getApplicationIcon` 原样，Flyme 已主题化） |
+     * | **默认** | **我们自己从主题包合成**的那个（[FlymeIconSet]，带形状遮罩） |
+     *
+     * 也就是说：魅族上「系统图标集」= 系统自己给的，「默认」= 我们画的 —— 与 ColorOS 正好相反，
+     * 所以这里把开关取反。⚠️ **别以为这是写错了**：不改这个，两个选项会给出同一个东西
+     * （用户报的「你这默认和跟随系统一样了啊」）。
+     *
+     * ColorOS / 其他机器：`FlymeIconSet.available()` 为 false ⇒ 原样直读偏好，**行为不变**。
+     */
+    private fun systemIconSetEnabled(store: SettingsStore, iconPackPkg: String): Boolean {
+        val chosen = store.useSystemIconSet || iconPackPkg.isNotBlank()
+        // 选了图标包就照常：图标包是独立的一套，与这个取反无关。
+        if (iconPackPkg.isNotBlank()) return chosen
+        return if (FlymeIconSet.available()) !chosen else chosen
+    }
+
+    /**
+     * **当前图标来源的签名**（图标包 + 是否走系统图标集）。
+     *
+     * 用来判断「手里那份应用目录，是不是在**当前这套图标来源**下读出来的」——
+     * 图标来源一变，旧目录里的图标就全是过期的。
+     *
+     * ⚠️ 这是「改完图标来源要呼出两次才生效」的根因所在：目录是服务启动/后台刷新时读的**快照**，
+     * 改完设置后那次重读在 worker 上跑（几百毫秒），期间呼出面板就会先看到一眼旧图标。
+     * 调用方见 `OverlayGestureService` 里拿它做的那次同步重读。
+     */
+    fun sourceSignature(context: Context): String {
+        val store = SettingsStore(context)
+        val pack = usableIconPack(context, store)
+        return "$pack|${systemIconSetEnabled(store, pack)}"
     }
 
     private fun cachedIcon(key: String): Bitmap? = synchronized(iconCacheLock) { iconCache[key] }
@@ -134,8 +239,11 @@ object AppCatalog {
         // 所以这里是 **`||` 而不是只看偏好**：只要选了图标包，图标集就必须参与兜底（这是规则，
         // 不是偏好）。也正好顺手治好存量状态——老版本在选图标包时把 `useSystemIconSet` 置成了 false，
         // 只看偏好那批用户会一直落到原图。
-        val useSystemIconSet = store.useSystemIconSet || iconPackPkg.isNotBlank()
-        val systemIcons = if (useSystemIconSet) SystemIconSet.open() else null
+        val useSystemIconSet = systemIconSetEnabled(store, iconPackPkg)
+        val systemIcons = if (useSystemIconSet) ThemedIcons.open(context) else null
+        // ★★ Flyme 上图标一律**原样**，连形状都不裁（见下面那段）。判据用「本机有没有 Flyme
+        // 主题图标集」这个能力信号，而不是 ROM 名字。
+        val flymeDesktop = FlymeIconSet.available()
         val targetPx = iconTargetPx(context, densityDpi)
         var systemHits = 0
         // 这一批用到的图标，读完整体替换缓存（见 [iconKey]）。
@@ -161,13 +269,19 @@ object AppCatalog {
                                                 iconPackPkg,
                                                 iconMapping,
                                             ) { packageName, fraction ->
-                                                systemIcons?.loadIcon(packageName, targetPx, fraction)
-                                                    ?.also { systemHits++ }
+                                                systemIcons?.load(packageName, targetPx, fraction) {
+                                                    runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
+                                                }?.also { systemHits++ }
                                             }
                                         // 图标包 / 系统图标集来的图标**保留原形**——用户 2026-10-08 明确要求：
-                                        // 既然用了图标集，就不要再套默认那个圆形裁剪。只有 ApplicationInfo 的
-                                        // 原图标才裁圆（那是本项目一直以来的观感）。
-                                        if (resolved.themed) resolved.bitmap
+                                        // 既然用了图标集，就不要再套默认那个圆形裁剪。
+                                        //
+                                        // ★★ Flyme 上**连原图标也不裁**（2026-10-09 用户两次实测）：
+                                        // Flyme 的 `pm.getApplicationIcon` 返回的已经是用户装的那套主题图标
+                                        // （支付宝是**圆角矩形**），我们一裁圆，它的四个角就被切掉、变成
+                                        // 「八边形」—— 用户原话「支付宝被遮罩了」。⇒ Flyme 一律原样。
+                                        // ColorOS 保持老观感不变。
+                                        if (resolved.themed || flymeDesktop) resolved.bitmap
                                         else resolved.bitmap.circleCrop()
                                     }
                             icons[key] = icon
@@ -300,8 +414,8 @@ object AppCatalog {
         val iconPackPkg = usableIconPack(context, store)
         val iconMapping =
             if (iconPackPkg.isNotBlank()) IconPackLoader.loadMapping(context, iconPackPkg) else emptyMap()
-        val useSystemIconSet = store.useSystemIconSet || iconPackPkg.isNotBlank()
-        val systemIcons = if (useSystemIconSet) SystemIconSet.open() else null
+        val useSystemIconSet = systemIconSetEnabled(store, iconPackPkg)
+        val systemIcons = if (useSystemIconSet) ThemedIcons.open(context) else null
         val densityDpi =
             context.resources.displayMetrics.densityDpi.takeIf { it > 0 } ?: FALLBACK_DENSITY_DPI
         val targetPx = iconTargetPx(context, densityDpi)
@@ -314,7 +428,9 @@ object AppCatalog {
                     runCatching {
                         val resolved =
                             resolveIcon(context, pm, info, targetPx, iconPackPkg, iconMapping) { pkg, fraction ->
-                                systemIcons?.loadIcon(pkg, targetPx, fraction)
+                                systemIcons?.load(pkg, targetPx, fraction) {
+                                    runCatching { pm.getApplicationIcon(pkg) }.getOrNull()
+                                }
                             }
                         if (!resolved.themed) return@runCatching null
                         val defaultDrawable = pm.getApplicationIcon(info.componentName.packageName)

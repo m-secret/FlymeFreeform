@@ -125,6 +125,14 @@ object SystemTools {
         val iconRes: Int,
         val needsAccessibility: Boolean,
         val requiredPackage: String? = null,
+        /**
+         * 这个工具要求**系统自己带识屏**（[NativeScreenText.nativeLabel] 解析得到才列出来）。
+         *
+         * 判据不在这里、也不看品牌：**这台机器有没有原生识屏实现**，问的是
+         * [NativeScreenText] 自己那张 `SOURCES` 表（10-09 定下的「判据留在能力所在对象上」）。
+         * 于是将来真给别家补上实现，这个工具会自动重新出现，这里一行都不用动。
+         */
+        val needsNativeScreenText: Boolean = false,
     )
 
     /**
@@ -182,6 +190,10 @@ object SystemTools {
                 colors = listOf(0xFF2DD4BF.toInt(), 0xFF22D3EE.toInt(), 0xFF3B82F6.toInt()), // 青绿 → 青 → 蓝
                 iconRes = R.drawable.ic_tool_screen_text,
                 needsAccessibility = true,
+                // 没有原生识屏的系统上**直接不列出来**（用户 2026-10-09：「识屏 flyme 按了没反应，
+                // 不支持的系统就隐藏」）。它原来会退化成「自研读无障碍文字」，但那条在 Flyme 上
+                // 要么读不到、要么只读到零星几个词，用户看到的就是「按了没反应」——比不摆出来更糟。
+                needsNativeScreenText = true,
             ),
             Spec(
                 id = TOOL_SCREENSHOT,
@@ -322,6 +334,24 @@ object SystemTools {
     }
 
     fun componentFor(id: String): ComponentName = ComponentName(PACKAGE, id)
+
+    /**
+     * 工具的**实际说明**（「更多」面板里长按工具弹出的操作卡用）。
+     *
+     * 多数工具一句话到底，直接返回 [Spec.description]；**识屏不一样** —— 它有两套实现
+     * （系统原生的「小布识屏」/ 本项目自研的读无障碍文字），该说哪一套取决于**这台机器上有没有
+     * 原生那套**（见 [NativeScreenText.nativeLabel]）。写死一句会让别家的用户以为这功能与他无关，
+     * 也会让 ColorOS 的用户以为别家也有。
+     */
+    fun describe(context: Context, spec: Spec): String =
+        when (spec.id) {
+            TOOL_SCREEN_TEXT ->
+                NativeScreenText.nativeLabel(context)
+                    ?.let { "模拟双指长按，唤起 $it" }
+                    ?: "读取屏幕上的文字（图片与画布里的字读不到）"
+
+            else -> spec.description
+        }
 
     /** 这个组件是不是一个内置工具。 */
     fun isTool(component: ComponentName?): Boolean = component != null && component.packageName == PACKAGE

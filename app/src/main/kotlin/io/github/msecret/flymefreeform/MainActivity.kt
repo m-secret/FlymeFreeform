@@ -388,13 +388,14 @@ class MainActivity : Activity() {
         // 按 [Ui.hint] 的约定，说明文字放卡片**外面**（不进 [CardGroup] 的行），所以它排在卡片之后。
         // 文案只讲「为什么被关」和「弹框是什么」，**不讲**怎么办——怎么办由下面那两条药丸负责，
         // 免得和 [renderPermissionHints] 里的兜底提示重复。
-        callTab.addView(
-            Ui.hint(
-                this,
-                "**无障碍每次开机会被 ColorOS 关掉**（反诈策略），本应用会自动补回；" +
-                    "约 30 秒后系统会弹一次权限提示，忽略即可。",
-            ),
-        )
+        //
+        // ★ **这段文案按系统分家**（[AccessibilityGrant.systemNote]）：ColorOS 上才有「反诈会关掉
+        // 无障碍 + 补回后弹一次框」这回事，别的系统返回空串 ⇒ **一个字都不加**（用户 2026-10-09：
+        // 「非 ColorOS 就不用提示 ColorOS 无障碍关闭的那个了」）。⚠️ 别为了「这地方别空着」
+        // 硬凑一句通用的 —— 那是人人都看、人人都不需要的噪音。
+        AccessibilityGrant.systemNote(this).takeIf { it.isNotBlank() }?.let { note ->
+            callTab.addView(Ui.hint(this, note))
+        }
         permissionHintBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         callTab.addView(permissionHintBox)
         // 「用 Shizuku 写回无障碍」**不常显**了（见 [renderPermissionHints]）：它只在无障碍
@@ -486,6 +487,10 @@ class MainActivity : Activity() {
                 )
                 .row(hapticRow),
         )
+        // 「呼出」这一块的**按系统分家**提醒（空串就不加这一行，见 [SystemSupport.overlayGestureNote]）。
+        SystemSupport.overlayGestureNote(this).takeIf { it.isNotEmpty() }?.let { note ->
+            featureTab.addView(Ui.hint(this, note))
+        }
 
         // ---- 应用与图标：内容与素材 ----
         featureTab.addView(Ui.sectionTitle(this, "应用与图标"))
@@ -497,28 +502,47 @@ class MainActivity : Activity() {
 
         // ---- 小窗 ----
         featureTab.addView(Ui.sectionTitle(this, "小窗"))
-        // 小窗这一整条链路（启动协议、识别、关闭动作）都依赖 ColorOS 的小窗框架，
+        // 小窗这一整条链路（启动协议、识别、关闭动作）都要接**系统自己的**小窗框架，
         // 别的系统上**不会报错、只会点了没反应**。所以先问一句（[SystemSupport]）：
-        // 不支持就把这一行压暗、去掉点击，并在下面写明为什么，别让用户点进去一个个试。
-        val freeformUsable = SystemSupport.freeformUsable(this)
+        // 不是本应用接得上的那一套，就把这一行压暗、去掉点击，并在下面写明为什么，
+        // 别让用户点进去一个个试。
+        //
+        // ★ 文案按**系统画像**分三档（用户 2026-10-09：「flyme 原生就支持小窗，所以那块禁用，
+        //   但是说明魅族已经支持，因为我们就是仿的 flyme」）：Flyme 上**不能说「不支持」**——
+        //   人家系统本来就带小窗，这套交互还是照它做的。
+        val freeformState = SystemSupport.freeformState(this)
         val closeModeRow =
             Ui.entryRow(
                 this,
                 "小窗关闭方式",
-                if (freeformUsable) "窗外点击 / 窗内小横条" else "当前系统不支持",
+                when (freeformState) {
+                    SystemSupport.FreeformState.OURS -> "窗外点击 / 窗内小横条"
+                    SystemSupport.FreeformState.NATIVE -> "Flyme 原生小窗，无需启用"
+                    SystemSupport.FreeformState.NONE -> "当前系统不支持"
+                },
             ) {
                 openPage(Intent(this, OutsideTapSettingsActivity::class.java))
             }
-        Ui.setRowEnabled(closeModeRow, freeformUsable)
+        Ui.setRowEnabled(closeModeRow, freeformState == SystemSupport.FreeformState.OURS)
         featureTab.addView(CardGroup(this).row(closeModeRow))
-        if (!freeformUsable) {
-            featureTab.addView(
-                Ui.hint(
-                    this,
-                    "**小窗功能在当前系统不可用**：启动 / 识别 / 关闭小窗都依赖 ColorOS 的小窗框架。" +
-                        "主动呼出、轮盘、更多面板不受影响。",
-                ),
-            )
+        when (freeformState) {
+            SystemSupport.FreeformState.OURS -> Unit
+            SystemSupport.FreeformState.NATIVE ->
+                featureTab.addView(
+                    Ui.hint(
+                        this,
+                        "**Flyme 自带小窗**（下拉悬停、侧边呼出），本应用这一套就是把它的交互搬过来的" +
+                            "——在魅族机型上直接用系统的就行，所以这块不用开。",
+                    ),
+                )
+            SystemSupport.FreeformState.NONE ->
+                featureTab.addView(
+                    Ui.hint(
+                        this,
+                        "**小窗在这里还用不了**：启动 / 识别 / 关闭都得接系统自己的小窗框架，" +
+                            "当前系统的形态还没适配。主动呼出、轮盘、更多面板不受影响。",
+                    ),
+                )
         }
 
     }
@@ -864,7 +888,7 @@ class MainActivity : Activity() {
     // ---- 呼出晃动角度 ----
     //
     // 设置项 2026-10-08 已从这里的「调试」节挪进正式设置：
-    // 「功能」tab → 主动呼出与轮盘 → 轮盘设置 → 「呼出晃动」（滑块，0~60°）。
+    // 「功能」tab → 主动呼出与轮盘 → 「轮盘动画」→ 「呼出晃动」（滑块，0~60°）。
     // 数据仍是同一个 [SettingsStore.menuSwingDeg]，这里不再留任何入口。
 
     /**
@@ -876,29 +900,38 @@ class MainActivity : Activity() {
      * 本应用只在 ColorOS 上验证过，别的系统上小窗会静默失效（见 [SystemSupport]）。
      *
      * 右侧给的是**状态文字**，不是无障碍那几行那种「去授权」药丸 —— 这一条没有可去的地方，
-     * 只回答「能不能用」。不可用时用错误色，因为那意味着这一页的大半功能都是灰的。
+     * 只回答「小窗是个什么局面」（[SystemSupport.freeformStateLabel]）。
+     * ★ 只有「谁都没有」才用错误色；**「系统自带」不是错**（Flyme），走普通次要色。
      */
     private fun runtimeRow(): View {
-        val usable = SystemSupport.freeformUsable(this)
+        val state = SystemSupport.freeformState(this)
         val texts =
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(Ui.rowTitle(this@MainActivity, "运行环境"))
                 addView(Ui.rowDetail(this@MainActivity, SystemSupport.romLabel(this@MainActivity)))
             }
-        val state =
+        val stateView =
             TextView(this).apply {
-                text = if (usable) "小窗可用" else "小窗不可用"
+                text = SystemSupport.freeformStateLabel(this@MainActivity)
                 setTextSize(TypedValue.COMPLEX_UNIT_PX, scaledSp(12f))
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                setTextColor(if (usable) Ui.COLOR_ACCENT else Ui.COLOR_DANGER)
+                // ★ **只有「谁都没有」才是警告**。Flyme 上小窗是系统自带的（2026-10-09 用户：
+                // 「魅族就写 flyme 原生小窗」）—— 那报红等于说人家系统不行，所以走普通次要色。
+                setTextColor(
+                    when (state) {
+                        SystemSupport.FreeformState.OURS -> Ui.COLOR_ACCENT
+                        SystemSupport.FreeformState.NATIVE -> Ui.COLOR_TEXT_SECONDARY
+                        SystemSupport.FreeformState.NONE -> Ui.COLOR_DANGER
+                    },
+                )
                 gravity = Gravity.CENTER
                 // 左边留一点，免得系统名太长时顶到状态文字上（和权限行一个做法）。
                 setPadding(scaledSp(12f).toInt(), 0, 0, 0)
             }
         return Ui.row(this).apply {
             addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(state)
+            addView(stateView)
         }
     }
 
@@ -1092,7 +1125,9 @@ class MainActivity : Activity() {
                         Toast.makeText(
                             this,
                             if (ok) {
-                                "已写回系统名单；约 30 秒后系统会弹一次「检测到…获取无障碍权限」，那是 ColorOS 的提示，忽略即可"
+                                // 尾注**按系统分家**：那个「检测到…获取无障碍权限」的系统框只有 ColorOS 有
+                                // （见 [AccessibilityGrant.restoreToastSuffix]）；别家只报「已写回」。
+                                "已写回系统名单" + AccessibilityGrant.restoreToastSuffix(this)
                             } else {
                                 "写回失败，请手动去无障碍设置里打开"
                             },
@@ -1118,10 +1153,15 @@ class MainActivity : Activity() {
      *
      * ## 为什么要给这个入口（2026-10-08 用户要求「在授权时加一个添加状态栏磁贴」）
      *
-     * 我们已经**不再开机自动写回无障碍**了（ColorOS 反诈会把侧载应用的无障碍每次开机关掉，
-     * 而自动补会招来一条系统弹框，用户手动补同样会弹）。于是「每次开机后怎么把无障碍弄回来」
-     * 就成了高频动作——磁贴就是为它准备的：下拉通知栏点一下，走 [AccessibilityGrant.restore]
-     * 一键写回，不必先打开本应用。
+     * 无障碍被系统清掉之后，**开机时会自动补一次**（`BootReceiver` →
+     * [AccessibilityGrant.restoreIfMissing]，带 10 分钟冷却），但**补不回来的时候不少**：
+     * 没装 / 没授权 Shizuku、用户自己关过功能、或那一次恰好落在冷却窗口里。
+     * 于是「怎么把无障碍弄回来」成了高频动作 —— 磁贴就是给这些时候准备的**手动入口**：
+     * 下拉通知栏点一下，走 [AccessibilityGrant.restore] 一键写回，不必先打开本应用。
+     *
+     * ⚠️ （2026-10-09 更正：这段原先写「我们已经**不再开机自动写回**」—— **是错的**，
+     * `BootReceiver` 一直在调 `restoreIfMissing`，首页那句「本应用会自动补回」才是实情。
+     * 别再照那句旧话去删开机自动补回。）
      *
      * ⚠️ **它不等于「无障碍保活」**：磁贴是**手动一键恢复**，并不能阻止 ColorOS 的反诈策略
      * 把无障碍关掉（那是直接改 `Settings.Secure`，与本应用进程活不活无关）。详见

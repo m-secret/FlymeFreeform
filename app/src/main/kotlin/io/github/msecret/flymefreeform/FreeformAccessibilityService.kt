@@ -1071,27 +1071,42 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * 截屏的**编码与落盘**线程。
+     *
+     * 一张全屏截图（真机 1200×2670）要走：`ARGB_8888` 整幅拷贝 → PNG 无损编码 → MediaStore 写入。
+     * 光 PNG 编码就是**几百毫秒**，而它原来跑在 `mainExecutor`（`takeScreenshot` 的回调线程）上，
+     * 也就是无障碍服务的**主线程**——期间我们的悬浮窗画不出来、无障碍事件也在排队，
+     * 用户看到的就是「点完截屏要卡一下才出提示」（用户 2026-10-09：「截完图要等的时间有点久」）。
+     * 交给它之后主线程当场空出来，界面一点不卡。
+     */
+    private val screenshotWorker = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "screenshot-save")
+    }
+
+    /**
      * 截屏并存进相册。
      *
      * 走的是 `AccessibilityService.takeScreenshot`（API 30+），**不需要 `READ/WRITE` 存储权限、
      * 也不需要 MediaProjection 的授权弹窗**——代价是必须在无障碍服务的配置里声明
      * `canTakeScreenshot`。返回 false 表示服务未连接或系统直接拒绝。
+     *
+     * ★★ **回调跑在 [screenshotWorker] 上，不是主线程**：抓帧回调里紧接着就是编码 + 落盘。
+     * 调用方拿到的消息要自己回主线程（`OverlayGestureService.runScreenshot` 里已有 `handler.post`）。
      */
     private fun captureScreenshot(context: Context, callback: (Boolean, String) -> Unit): Boolean =
         runCatching {
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
-                mainExecutor,
+                screenshotWorker,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
+                        // ★ **先报成功、再慢慢存**：图已经在手里了，用户按下快门那一刻事就成了，
+                        //   没必要让他等 PNG 编码与写盘（真机几百毫秒）——那是「等得久」的真凶。
+                        //   写失败时下面那条会**盖掉**这条提示，所以「已保存」不会变成一句谎话。
+                        callback(true, SCREENSHOT_SAVED_MESSAGE)
                         val saved = runCatching { persistScreenshot(context, screenshot) }
                         saved
-                            .onSuccess { ok ->
-                                callback(
-                                    ok,
-                                    if (ok) "已保存到相册 Pictures/FlymeFreeform" else "写入相册失败",
-                                )
-                            }
+                            .onSuccess { ok -> if (!ok) callback(false, "写入相册失败") }
                             .onFailure { error ->
                                 DebugLog.error("TOOL_SCREENSHOT_SAVE_FAILED", null, error)
                                 callback(false, "保存截屏失败：${error.javaClass.simpleName}")
@@ -2254,6 +2269,15 @@ class FreeformAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val FULLSCREEN_RATIO_PERCENT = 92L
+
+        /**
+         * 截屏成功时给用户看的那句话。
+         *
+         * 提到常量，是因为它被两条路共用：[captureScreenshot] 抓帧成功时报它，
+         * 而 `OverlayGestureService` 的提示白名单按 `TOOL_SCREENSHOT` 放行截屏这一切消息
+         * （见那边的 `toolMessageIsVisible`）。
+         */
+        private const val SCREENSHOT_SAVED_MESSAGE = "已保存到相册 Pictures/FlymeFreeform"
 
         /**
          * 小窗刚被拉起后的「落定探测」：间隔与次数。

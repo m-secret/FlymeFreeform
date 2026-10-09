@@ -146,12 +146,40 @@ class RadialMenuView(context: Context) : View(context) {
     private var swingTotalMs = 0f
 
     /**
+     * 晃动**开始的延迟**（ms）。见 [enterSwingAngleDeg] 里那段：摆动被特意推迟到
+     * **轮盘长到接近满尺寸之后**才做——否则"时间调长 → 图标还很小 → 转了也看不见"。
+     */
+    private var swingOffsetMs = 0f
+
+    /**
      * 最大摆角（度）。0 = 不晃。由设置给出，见 `SettingsStore.menuSwingDeg`。
      *
      * 它**直接就是旋转角**（15° = 左右各转 15°），不需要任何换算——早先那版把它换算成垂直位移，
      * 结果做成了上下平移，被用户否掉了。
      */
     private var swingDeg = DEFAULT_SWING_DEG
+
+    /**
+     * 入场动画的单程时长（ms），由设置给出（见 `SettingsStore.menuLaunchMs` ——
+     * **设置页那一行叫「呼出动画时长」**，用户 2026-10-09 定的名）。**0 = 不做入场动画**，图标直接现位。
+     *
+     * 代码里一直管它叫「发射」（图标从角落射到槽位），两个说法指的是同一件事。
+     * 默认值只是兜底；真机路径上每次 [begin] 都会用设置里的值覆盖它。
+     */
+    private var launchMs = LAUNCH_ITEM_MS
+
+    /**
+     * 出场**行程**（0~1）：图标从「离槽位多远」的地方开始长出来。
+     *
+     * - `1`（默认）= 从**角落原点**长出来（整条半径都走）；
+     * - `0` = **原地**出现（位置一动不动，只有大小变），也就是"完全看不到轨迹"；
+     * - 中间值 = 走一部分。
+     *
+     * ★ 用户 2026-10-09 报「还是能看到图标的轨迹」后加的旋钮 —— 他看得到的是**图标真的在屏幕上
+     * 划过去**，而不是帧缓冲拖影（这一点已在录屏里排除：帧间是单个连通块，路径和终点都没有残留）。
+     * 想彻底不要轨迹就把它调到 0。由 `SettingsStore.menuLaunchTravelPercent` 给出。
+     */
+    private var launchTravel = 1f
 
     /** 入场晃动动画。松手（[settle]）或重新呼出时要能掐掉，见那两处的注释。 */
     private var swingAnimator: android.animation.ValueAnimator? = null
@@ -193,6 +221,8 @@ class RadialMenuView(context: Context) : View(context) {
         iconSizeDp: Int,
         haptic: Boolean,
         swingDeg: Int,
+        launchMs: Float,
+        launchTravel: Float,
         scrimPercent: Int,
     ) {
         this.side = side
@@ -200,6 +230,8 @@ class RadialMenuView(context: Context) : View(context) {
         this.hasMore = hasMore
         this.hapticEnabled = haptic
         this.swingDeg = swingDeg
+        this.launchMs = launchMs
+        this.launchTravel = launchTravel.coerceIn(0f, 1f)
         this.scrimAlphaTarget = (scrimPercent.coerceIn(0, 100) * 255 / 100)
         this.originX = cornerX
         this.originY = cornerY
@@ -293,7 +325,11 @@ class RadialMenuView(context: Context) : View(context) {
      */
     private fun playEnterAnimation() {
         alpha = 1f
-        enterScale = ENTER_SCALE_FROM
+        // ★ 有「发射」时**大小由发射进度 s 驱动**（整盘刚性缩放，见 [onDraw]）——
+        //   这条独立的缩放时钟就不该再跑了：**两条时钟正是之前"不像一个整体"的原因**。
+        //   只有「发射」关掉（`launchMs = 0`）时才用它做那个"出现时弹一下"。
+        val bounce = launchMs <= 0f
+        enterScale = if (bounce) ENTER_SCALE_FROM else 1f
         val animator =
             android.animation.ValueAnimator.ofFloat(ENTER_SCALE_FROM, 1f).apply {
                 duration = BOUNCE_ANIM_MS
@@ -314,14 +350,33 @@ class RadialMenuView(context: Context) : View(context) {
                     },
                 )
             }
-        animator.start()
+        if (bounce) animator.start()
 
-        // 摆动：只推进一条 0 → 总时长的**时间轴**，每个图标在自己的窗口里算偏移
-        // （见 [enterSwingAngleDeg]）。线性推进，减速交给曲线本身。
+        // 「发射」+ 摆动**共用**一条 0 → 总时长的时间轴，每个图标在自己的窗口里算进度
+        // （见 [enterLaunchProgress] / [enterSwingAngleDeg]）。线性推进，减速交给曲线本身。
+        //
+        // ⚠️ 这里**不能**因为 `swingDeg <= 0` 就整个跳过：**发射是常驻的入场动画**，
+        // 摆动只是叠在上面的可选装饰（角度调 0 就只剩发射）。
         swingAnimator?.cancel()
-        val total = SWING_ITEM_MS + (itemCount - 1).coerceAtLeast(0) * SWING_STAGGER_MS
+        // ★★ 摆动的**窗口**（2026-10-09 修「时间调长了就不左右晃了」）
+        //
+        // 症状的成因：入场现在是**整盘刚性缩放**，图标大小 = `iconRadius · s`，
+        // 而 `s` 是 easeOutBack（**在时长的一半处就长到满尺寸**）。摆动的时长却是**写死的
+        // [SWING_ITEM_MS]（180ms）**、从 0 开始 —— 于是把「呼出动画时长」调大之后，
+        // 摆动的**最大摆角恰好落在图标还很小的时候**（220ms 时只有 0.78 倍），越调大越看不见。
+        //
+        // 修法：**把摆动的峰值对齐到「轮盘长到满尺寸」的那一刻**（= launchMs/2）——
+        // 摆动窗口 = `[launchMs/2 − SWING_OUT_PORTION·SWING_ITEM_MS, + SWING_ITEM_MS]`。
+        //   · 长时长（220/400）：峰值正好落在 s=1 上，看得见；
+        //   · 短时长（≤ 126ms）：算出来是负数 ⇒ 退回「从 0 开始」，与老行为一致。
+        // ⇒ **摆动的可见度不再随时长漂移**，这是这条规矩的目的，别再把它挪回 0 起。
+        val swingStart = maxOf(0f, launchMs * 0.5f - SWING_OUT_PORTION * SWING_ITEM_MS)
+        swingOffsetMs = swingStart
+        val total =
+            maxOf(launchMs, swingStart + SWING_ITEM_MS) +
+                (itemCount - 1).coerceAtLeast(0) * SWING_STAGGER_MS
         swingTotalMs = total
-        if (swingDeg <= 0 || total <= 0f) {
+        if (total <= 0f) {
             swingElapsedMs = Float.MAX_VALUE
             return
         }
@@ -361,16 +416,67 @@ class RadialMenuView(context: Context) : View(context) {
      *   （见 [swingDirectionSign]）。
      * - **只影响绘制**：命中判定（[selectionFor]）仍按静止的 [positions] 算；自转本来就不动圆心。
      * - **逐个错峰**：第 n 个槽位比第 0 个晚 [SWING_STAGGER_MS] 启动，各晃各的，不是整盘一起动。
+     * - ★ **整体被推迟 [swingOffsetMs]**，让**最大摆角落在「轮盘长到满尺寸」那一刻**。
+     *   不推迟的话，把「呼出动画时长」调大之后，摆动会在图标还很小的时候转完 ⇒ 看不见
+     *   （用户 2026-10-09：「时间调长了之后就不左右晃了」）。
      * - **首末帧都归位**：启动前（q≤0）与结束后（q≥1）都返回 0，正好与静止姿态重合。
      */
     private fun enterSwingAngleDeg(slot: Int): Float {
         if (swingDeg <= 0 || slot !in positions.indices) return 0f
         if (swingElapsedMs >= swingTotalMs) return 0f
+        // ⚠️ **一定要减 [swingOffsetMs]**：摆动被推迟到"轮盘长到接近满尺寸"之后才开始，
+        //    不减的话它会在图标还很小的时候转完 —— 那就是「时间调长了就不左右晃了」的原因。
         val q =
-            ((swingElapsedMs - slot * SWING_STAGGER_MS) / SWING_ITEM_MS).coerceIn(0f, 1f)
+            ((swingElapsedMs - swingOffsetMs - slot * SWING_STAGGER_MS) / SWING_ITEM_MS)
+                .coerceIn(0f, 1f)
         if (q <= 0f || q >= 1f) return 0f
         // 幅度就是设置里那个角度本身（当成**最大摆角**：15° 表示转出去 15°），不再换算成位移。
         return swingDirectionSign * swingDeg * swingShape(q)
+    }
+
+    /**
+     * ★★ 入场「**发射**」：图标从**角落原点**沿自己的半径射到槽位（0 = 还在角落，1 = 到位）。
+     *
+     * 用户 2026-10-09：「魅族的小窗轮盘动画像是发射一下，很干净利落，我们能模拟出来吗」。
+     *
+     * ## 为什么这次是**位移**（而 [enterSwingAngleDeg] 明确写着「不是位移」）
+     *
+     * 那两版被否掉的位移是「**整盘一起**水平平移」和「沿弧**前后摆**」——它们错在**方向**：
+     * 整盘平移看起来是轮盘在滑动；沿弧摆则让弧顶那几个图标看起来在左右横移。
+     * 这一版走的是**每个图标各自的半径方向**（角落 → 自己那个槽位），所以观感是
+     * 「从角落射出去、扇形展开」，不是「整体滑动」。
+     *
+     * ## 手感
+     *
+     * - **三次方减速**（`1-(1-q)³`）：起步最快、落位最稳，**不弹** —— 「干净利落」就该这样；
+     * - **逐个错峰**（[SWING_STAGGER_MS]）：一个接一个射出去，才有「发射」的连发感；
+     * - **起点在角落**：原点就在屏幕角落（+ `menuCornerInset`），所以图标是从角落里冒出来的。
+     *
+     * ⚠️ 只影响**绘制**：命中判定仍按静止的 [positions] 算（和 [enterSwingAngleDeg] 同规矩）。
+     */
+    private fun enterLaunchProgress(slot: Int): Float {
+        if (launchMs <= 0f) return 1f // 设置里调成 0 = 不发射，图标直接出现在槽位上
+        if (slot !in positions.indices) return 1f
+        if (swingElapsedMs >= swingTotalMs) return 1f
+        // ★ **不错峰**：整盘必须同时出发，否则就不是一个刚体（见 [onDraw] 里那段）。
+        //   （系统的 5 颗图标实测是**同时**出现的。）
+        val q = (swingElapsedMs / launchMs).coerceIn(0f, 1f)
+        if (q <= 0f) return 0f
+        if (q >= 1f) return 1f
+        // ---- 缓动：`easeOutBack`（约 +4% 过冲后回弹落定）----
+        //
+        // ★ 形状是**照着 Flyme 系统轮盘量出来的**（2026-10-09 用户录屏，120fps 逐帧）：
+        //   系统那颗图标在总时长 ~40% 处**就到了终点**，再冲出去 ~4%（5 颗图标一致，实测
+        //   过冲 7~11px / 行程 246px），然后用剩下 ~60% 的时间回弹落定。
+        //   之前这里是 `1-(1-q)³`（纯减速、**单调不过冲**），落位是"停住"而不是"落定"——
+        //   观感上就是用户说的"没有系统那么行云流水"。
+        //
+        // `p(q) = 1 + 2·r³ + r²`（r = q-1）—— 标准 easeOutBack 取 c1=1.0/c3=2.0：
+        //   p(0)=0、p(1)=1、p'(1)=0（落位速度为零，不顿）；
+        //   峰值在 q≈0.667 处 +3.7%，与系统的 ~4% 对得上；`p(q)=1` 恰在 q=0.5。
+        // ⚠️ 想让过冲更大/更小，只动那两个系数（要同步满足 `p(1)=1`、`p'(1)=0`）。
+        val r = q - 1f
+        return 1f + 2f * r * r * r + r * r
     }
 
     /**
@@ -654,11 +760,33 @@ class RadialMenuView(context: Context) : View(context) {
             return
         }
         val layout = MenuGeometry.Layout(iconRadius, stepDeg, spanDeg, angleStartDeg)
-        positions.forEachIndexed { slot, (cx, cy) ->
+        positions.forEachIndexed { slot, (staticCx, staticCy) ->
             val selected = slot == selectedIndex
             val appIndex = appIndexForSlot(slot)
-            // 大小统一：所有图标共用入场缩放 enterScale，只有选中图标额外乘 selectedScale。
-            val r = iconRadius * enterScale * (if (selected) selectedScale else 1f)
+            // ★★ 入场 = **整盘刚性缩放**（2026-10-09 照 Flyme 系统轮盘逐帧量出来的）。
+            //
+            // 一条进度 `s`（0→1，easeOutBack 带 +3.7% 过冲）**同时**决定：
+            //   位置 = 角落原点 + s·(槽位 − 原点)；大小 = iconRadius · s。
+            // 也就是「整个轮盘作为一个刚体，从角落原点等比长大」——这正是系统在做的事：
+            // 实测系统那一盘图标能被「缩放+平移」相似变换完美拟合（残差 **0.85~2.6px**，5 颗一起）。
+            //
+            // ⚠️⚠️ **别再拆成多条时钟**（这是本次修复的正主）。改之前这里是三套独立的时间线：
+            //   位置（launchMs）+ 大小（`enterScale` 0.6→1，`BOUNCE_ANIM_MS`，Overshoot）
+            //   + 自转（`enterSwingAngleDeg`），外加每颗 8ms 的**错峰**。
+            //   结果：前半段图标**不是一个整体**（同一拟合残差炸到 **25~44px**），
+            //   看上去就是每颗图标各自从角落慢慢爬出来 = 用户报的「残影很明显」。
+            //   ⇒ 位置与大小必须**由同一个 s 驱动**，且**不错峰**（系统 5 颗同时出发）。
+            val s = enterLaunchProgress(slot)
+            // ★ 再乘上**行程** [launchTravel]：把「从原点到槽位」这条线只走其中一段。
+            //   `k` = 图标当前落在「原点(0) → 槽位(1)」线上的比例：
+            //     travel = 1 ⇒ k 从 0 到 1（走满，从角落长出来）；
+            //     travel = 0 ⇒ k 恒为 1（**原地**出现，位置一点不动 ⇒ 根本不存在"轨迹"）。
+            //   ⚠️ 位置和大小**必须用同一个 k**（整盘刚性缩放），否则又变回"各自为政"。
+            val k = if (launchMs > 0f) 1f - launchTravel + launchTravel * s else 1f
+            val scale = if (launchMs > 0f) k else enterScale
+            val r = iconRadius * scale * (if (selected) selectedScale else 1f)
+            val cx = originX + (staticCx - originX) * k
+            val cy = originY + (staticCy - originY) * k
             // 入场摆动：**圆心不动**，只是绕圆心左右转一点（静止时角度为 0，绘制结果与静止逐像素一致）。
             // 用 canvas 旋转而不是搬坐标，所以位置永远不漂。
             val swing = enterSwingAngleDeg(slot)
@@ -719,6 +847,14 @@ class RadialMenuView(context: Context) : View(context) {
          * 嫌快/嫌慢直接调这一个数。
          */
         const val SWING_ITEM_MS = 180f
+
+        /**
+         * 「发射」时长的**兜底值**（ms）。
+         *
+         * ⚠️ 真机路径上**不用这个数**：每次 [begin] 都会用设置里的值覆盖（`SettingsStore.menuLaunchMs`，
+         * 默认 [SettingsStore.DEFAULT_MENU_LAUNCH_MS]）。这里只是「构造后还没 begin」时的初值。
+         */
+        const val LAUNCH_ITEM_MS = 100f
 
         /**
          * 相邻槽位之间**错开启动**的时间（ms）。

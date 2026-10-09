@@ -1130,7 +1130,6 @@ class TabStrip(
                 maxOf(
                     insets.getInsets(WindowInsets.Type.systemBars()).bottom,
                     insets.getInsets(WindowInsets.Type.tappableElement()).bottom,
-                    insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
                 )
             setGap(maxOf(fromWindow, fromInsets))
             insets
@@ -1139,17 +1138,30 @@ class TabStrip(
     }
 
     /**
-     * 窗口底部的系统栏高度（px）。
+     * 窗口底部的**系统栏**高度（px）。
      *
-     * 三个来源取最大：报得出底栏的那一个跟 ROM / 导航方式走——手势模式下 `systemBars` 可能给 0，
-     * 而 `tappableElement` / `mandatorySystemGestures` 有值，只信一个会漏。
+     * 只信 `systemBars` / `tappableElement`：这两个才是「真的被系统占掉、画不到」的那一段。
+     *
+     * ## ★★ 别把 `mandatorySystemGestures` 算进来（2026-10-09 真机实测）
+     *
+     * 早先这里取了三者最大值，理由是「手势模式下 `systemBars` 可能给 0，只信一个会漏」。
+     * 但在 Flyme 上量到的实际值是这样的（`dumpsys window displays`）：
+     *
+     * ```
+     * type=navigationBars        frame=[0,0][0,0]          → 0px
+     * type=tappableElement       frame=[0,0][0,0]          → 0px
+     * type=mandatorySystemGestures frame=[0,2566][1200,2670] → 104px   ← 只有这个是 104
+     * ```
+     *
+     * `mandatorySystemGestures` 是**手势区**，不是系统栏：它那块地方我们照样能画、也照样能点，
+     * 只是从屏幕最底边上滑会被系统抢走。把它当成「系统栏高度」来留白，就会**凭空多留 104px**——
+     * 用户报的「底栏太高、不居中、比 ColorOS 高一大截」就是它（ColorOS 上三者全 0，所以没露出来）。
      */
     private fun windowBottomInset(): Int {
         val insets = rootWindowInsets ?: return 0
         return maxOf(
             insets.getInsets(WindowInsets.Type.systemBars()).bottom,
             insets.getInsets(WindowInsets.Type.tappableElement()).bottom,
-            insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom,
         )
     }
 

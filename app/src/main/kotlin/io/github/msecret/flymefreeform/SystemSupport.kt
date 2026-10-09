@@ -55,6 +55,9 @@ object SystemSupport {
     /** 只在 Oplus ROM 上出现的系统特性前缀（见类注释第 2 条）。 */
     private val OPLUS_FEATURE_PREFIXES = listOf("oplus.", "com.oplus.", "com.coloros.", "com.oppo.")
 
+    /** Flyme 独有的系统属性（魅族）。有值 = 这台机器跑的是 Flyme。 */
+    private val FLYME_PROPS = listOf("ro.build.flyme.version", "ro.flyme.version")
+
     private class Probe(
         val zoomWindowClass: Boolean,
         val oplusFeatureCount: Int,
@@ -79,20 +82,118 @@ object SystemSupport {
      */
     fun freeformUsable(context: Context): Boolean = probe(context).oplus
 
-    /** 给界面显示的系统名，例如「ColorOS 16.0.10」。 */
+    /**
+     * 「运行环境」那一行给用户看的**系统名**，例如「ColorOS 16.0.10」「Flyme 12.6.0.0A」。
+     *
+     * ★ **只报「这是什么系统 + 什么版本」，不以 ColorOS 为参照**（用户 2026-10-09：
+     * 「不要有非 coloros 之类的了」）。原来认不出来时写的是「非 ColorOS（meizu · Android 16）」，
+     * 那种说法在别家机器上读起来像「你这系统不是正牌」，而且**每加一家都得回头改这一句**。
+     * 现在按**已知系统画像**分派，认不出的就老实报品牌 + Android 版本。
+     */
     fun romLabel(context: Context): String {
         val probe = probe(context)
-        if (!probe.oplus) {
-            return "非 ColorOS（${Build.BRAND} · Android ${Build.VERSION.RELEASE}）"
+        if (probe.oplus) {
+            val version = probe.oplusRomDisplay.ifBlank { probe.oplusRom }
+            // 版本号读不到时退回 `Build.DISPLAY`（就是「关于本机」里那串），别只说一句「ColorOS」
+            // —— 用户报问题时那串才是能对上号的。
+            return if (version.isBlank()) "ColorOS（${Build.DISPLAY}）" else "ColorOS $version"
         }
-        val version = probe.oplusRomDisplay.ifBlank { probe.oplusRom }
-        // 版本号读不到时退回 `Build.DISPLAY`（就是「关于本机」里那串），别只说一句「ColorOS」
-        // —— 用户报问题时那串才是能对上号的。
-        return if (version.isBlank()) "ColorOS（${Build.DISPLAY}）" else "ColorOS $version"
+        if (isFlyme(context)) {
+            // 魅族的 `Build.DISPLAY` 真机上是 `Flyme 12.6.0.0A`，本身就带系统名，直接用。
+            val display = Build.DISPLAY
+            return if (display.contains("flyme", ignoreCase = true)) {
+                display
+            } else {
+                "Flyme ${Build.VERSION.RELEASE}"
+            }
+        }
+        return "${Build.BRAND} · Android ${Build.VERSION.RELEASE}"
     }
+
+    /** 这台机器上「小窗」是个什么局面，给界面一句话用（**别在调用点按品牌写 if**）。 */
+    enum class FreeformState {
+        /** 本应用这条链路可用（ColorOS）。 */
+        OURS,
+
+        /** **系统自己就带小窗**（Flyme）—— 不是「坏了」，所以界面上不该用警告色。 */
+        NATIVE,
+
+        /** 谁都没有。 */
+        NONE,
+    }
+
+    fun freeformState(context: Context): FreeformState =
+        when {
+            freeformUsable(context) -> FreeformState.OURS
+            isFlyme(context) -> FreeformState.NATIVE
+            else -> FreeformState.NONE
+        }
+
+    /**
+     * [freeformState] 给用户看的那句话。
+     *
+     * 三种说法放在这一处，是为了让「功能页那一行」和「运行环境那一行」永远一致 ——
+     * 它们问的是同一件事，各写一份迟早说岔。
+     */
+    fun freeformStateLabel(context: Context): String =
+        when (freeformState(context)) {
+            FreeformState.OURS -> "小窗可用"
+            FreeformState.NATIVE -> "原生小窗"
+            FreeformState.NONE -> "小窗不可用"
+        }
+
+    /**
+     * 「呼出」这一块**按系统分家**的一句提醒。
+     *
+     * ★ **返回空串 = 一个字都不显示**（调用方用 `takeIf { it.isNotEmpty() }` 包一下，
+     * 和 `AccessibilityGrant.systemNote` 一个规矩）。**别为了「这地方别空着」硬凑一句通用的**
+     * —— 那是人人都看、人人都不需要的噪音。
+     *
+     * 目前只有魅族一条（用户 2026-10-09：「flyme 也要说明呼出会和魅族的手势冲突」）：
+     * 角落触摸条贴在屏幕**底角**，而 Flyme 的上滑手势（回桌面 / 多任务）起手区正在同一带，
+     * 手指落在那块时两者抢同一记触摸。以后别家有同类冲突，在下面加一条就行，调用点不用动。
+     */
+    fun overlayGestureNote(context: Context): String =
+        when {
+            isFlyme(context) ->
+                "**呼出会和 Flyme 的手势抢地方**：触摸条贴在屏幕底角，和 Flyme 的上滑手势" +
+                    "（回桌面 / 多任务）共用同一段起手区。可以在「主动呼出与轮盘」里把触摸条调小或换一边。"
+            else -> ""
+        }
+
 
     /** 判据明细，只给日志与排查用。 */
     fun describe(context: Context): String = render(probe(context))
+
+    /**
+     * 这台机器是不是魅族 Flyme（[Build.BRAND] / 属性都算）。
+     *
+     * ## 它和 [isColorOs] 的分工，是**代价**分的（2026-10-09 用户提的）
+     *
+     * [isColorOs] 决定「功能开不开」，判错 = 功能消失 ⇒ 只认硬信号（类探测等三条）。
+     * 而这个只用来决定**两句文案**（小窗那一行的说明、呼出手势的提醒），判错的代价是写错一句话
+     * ⇒ 所以它**敢用品牌与属性这类软信号**，和 [HapticsVendor] 的取向一致（那边是手感，这边是文案）。
+     *
+     * 判据三条 OR，与 [HapticsVendor] 的 `MEIZU` 分支**共用这一份实现**（那边改成调本函数，
+     * 不再各写一套 —— 真机魅族 22 上 `ro.build.flyme.version=12`、`display.id=Flyme 12.6.0.0A`
+     * 三条全中）。
+     */
+    fun isFlyme(context: Context): Boolean =
+        flyme ?: synchronized(this) {
+            flyme ?: runProbeFlyme().also {
+                flyme = it
+                Log.i(TAG, "SYSTEM_PROFILE flyme=$it brand=${Build.BRAND}/${Build.MANUFACTURER} display.id=${Build.DISPLAY}")
+            }
+        }
+
+    @Volatile
+    private var flyme: Boolean? = null
+
+    private fun runProbeFlyme(): Boolean =
+        FLYME_PROPS.any { systemProperty(it).isNotBlank() } ||
+            Build.BRAND.contains("meizu", ignoreCase = true) ||
+            Build.MANUFACTURER.contains("meizu", ignoreCase = true) ||
+            Build.DISPLAY.contains("flyme", ignoreCase = true)
 
     private fun probe(context: Context): Probe =
         cached ?: synchronized(this) {
