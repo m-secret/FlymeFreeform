@@ -71,18 +71,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download APK artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: FlymeFreeform-debug-apk
-          path: apk
-
+      # ★★ **顺序不能反：先 checkout，再下载附件。**
+      #    `actions/checkout` 默认 `clean: true`，会先跑 `git clean -ffdx` ——
+      #    要是把附件先下到 `apk/`，紧接着的 checkout 会**把这个未跟踪目录删掉**，
+      #    后面 `gh release create apk/*.apk` 就报 `no matches found for 'apk/*.apk'`
+      #    （v1.1.7 的 tag run 就是这么挂的，日志里 download 明明成功）。
+      #    另一条等价改法是给 checkout 加 `clean: false`；这里选调顺序，语义更直白。
+      #
       # ★ 读标签注解要用它 ⇒ 必须 checkout，而且 `fetch-depth: 0`（默认只拉一个提交，
       #   拿不到标签对象）。
       - name: Checkout（为了读标签注解）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: FlymeFreeform-debug-apk
+          path: apk
 
       # ★★ 两处都修过（2026-10-10）：
       #
