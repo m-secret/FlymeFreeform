@@ -23,8 +23,10 @@ jobs:
         uses: actions/checkout@v4
 
       # 工程用 Java toolchain 17（见 app/build.gradle.kts），且 AGP 9 需要 JDK 17+。
+      # ⚠️ 用 v5：v4 已被官方标为 deprecated（2026-10-10 的 CI 日志里就在报
+      #    "setup-java v4 is deprecated and will no longer receive updates"）。
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
