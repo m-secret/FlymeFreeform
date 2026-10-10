@@ -91,7 +91,16 @@ jobs:
           name: FlymeFreeform-debug-apk
           path: apk
 
-      # ★★ 两处都修过（2026-10-10）：
+      # ★★ **必须把标签对象重新取一次**（2026-10-10 实测）：
+      #    `actions/checkout` 抓标签时会把它**降级成轻量标签**（拉取带 `--no-tags` / 按 SHA
+      #    写进 `refs/tags/`），于是本地那个 `v1.1.7` 指向提交、没有 tag 对象 ——
+      #    `git tag -l --format='%(contents)'` 拿到的是**提交信息**（非空！所以下面那个
+      #    `if` 判不出问题），`--notes-from-tag` 也照着提交信息写 ⇒ v1.1.7 的更新日志
+      #    一度变成了 commit 标题。`--force --tags` 允许用远端那个**注解标签**覆盖同名轻量标签。
+      - name: 取回标签对象（checkout 会把它降级成轻量标签）
+        run: git fetch --force --tags --no-recurse-submodules origin
+
+      # ★★ 三处都修过（2026-10-10）：
       #
       # ① **能重跑**：早先只有 `gh release create` 一条路 ⇒ 重跑 tag **必定失败**
       #    （`a release with the same tag name already exists: v1.1.5`，v1.1.5 的 tag run
@@ -102,16 +111,16 @@ jobs:
       # ② **正文不再是空的**：原来用 `--generate-notes`，而本仓库**直接推 main、没有 PR**，
       #    GitHub 只能生成一行 compare 链接 ⇒ 应用内「更新日志」等于空白
       #    （用户 2026-10-10 当场发现：「没有更新日志啊」）。
-      #    现在改为**用标签注解当正文**（`--notes-from-tag`）⇒ 发版时这样打标签即可：
+      #    现在**直接用标签注解当正文** ⇒ 发版时这样打标签即可：
       #        git tag -a v1.1.7 -F <写好的更新日志.md>
       #    ⚠️ 所以**打标签时就要把更新日志写好**（用户视角的 `### 新增 / ### 改进 / ### 修复`），
       #       别再写一行摘要 —— 那段文字现在会**原样出现在 Release 页和应用内更新日志里**。
-      #    ⚠️ 标签没注解（轻量标签）时兜底回 `--generate-notes`，至少有个对比链接。
-      #    ★★ **这几条 gh 命令一律【不带 `--repo`】**：`--notes-from-tag` 要读**本地**标签
-      #       对象，而 gh 明确禁止它和 `--repo` 同时用（报
-      #       `using --notes-from-tag with --repo is not supported` —— v1.1.7 第二次
-      #       tag run 就是这么挂的）。本 job 上面已经 checkout 过 ⇒ cwd 就是本仓库，
-      #       gh 自己从 `origin` 认得出是哪个库，不需要 `--repo`。
+      #    ★ 这里**不用 `gh --notes-from-tag`**：它和 `--repo` 不兼容（`using
+      #      --notes-from-tag with --repo is not supported`），而**读本地标签**又踩上面那个
+      #      轻量标签坑。自己 `git tag -l --format='%(contents)'` 取出来、用 `--notes-file -`
+      #      喂进去，两件事都不依赖 gh 的隐式行为。
+      #    ⚠️ 标签没注解（真的轻量标签）时 `%(contents)` 也会回落成提交信息 —— 判定用
+      #      `%(objecttype)`：只有 `tag` 才当正文，其余退回 `--generate-notes`。
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,14 +131,16 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" apk/*.apk --clobber
             exit 0
           fi
-          if [ -n "$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")" ]; then
+          TYPE="$(git tag -l --format='%(objecttype)' "$GITHUB_REF_NAME")"
+          if [ "$TYPE" = "tag" ]; then
             echo "用标签注解当更新日志"
-            gh release create "$GITHUB_REF_NAME" apk/*.apk \
-              --verify-tag \
-              --title "$GITHUB_REF_NAME" \
-              --notes-from-tag
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME" \
+              | gh release create "$GITHUB_REF_NAME" apk/*.apk \
+                  --verify-tag \
+                  --title "$GITHUB_REF_NAME" \
+                  --notes-file -
           else
-            echo "标签没有注解 —— 退回自动生成（只会有一行 compare 链接）"
+            echo "标签不是注解标签（type=$TYPE）—— 退回自动生成（只会有一行 compare 链接）"
             gh release create "$GITHUB_REF_NAME" apk/*.apk \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
