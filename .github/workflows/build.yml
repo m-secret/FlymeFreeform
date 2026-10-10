@@ -107,30 +107,30 @@ jobs:
       #    ⚠️ 所以**打标签时就要把更新日志写好**（用户视角的 `### 新增 / ### 改进 / ### 修复`），
       #       别再写一行摘要 —— 那段文字现在会**原样出现在 Release 页和应用内更新日志里**。
       #    ⚠️ 标签没注解（轻量标签）时兜底回 `--generate-notes`，至少有个对比链接。
-      #    ⚠️ 本 job 有 checkout 了，但仍显式带 `--repo`：不依赖 cwd 是不是 git 仓库。
+      #    ★★ **这几条 gh 命令一律【不带 `--repo`】**：`--notes-from-tag` 要读**本地**标签
+      #       对象，而 gh 明确禁止它和 `--repo` 同时用（报
+      #       `using --notes-from-tag with --repo is not supported` —— v1.1.7 第二次
+      #       tag run 就是这么挂的）。本 job 上面已经 checkout 过 ⇒ cwd 就是本仓库，
+      #       gh 自己从 `origin` 认得出是哪个库，不需要 `--repo`。
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME 已存在 —— 只覆盖附件，保留现有正文"
-            gh release upload "$GITHUB_REF_NAME" apk/*.apk \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
+            gh release upload "$GITHUB_REF_NAME" apk/*.apk --clobber
             exit 0
           fi
           if [ -n "$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")" ]; then
             echo "用标签注解当更新日志"
             gh release create "$GITHUB_REF_NAME" apk/*.apk \
-              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
               --notes-from-tag
           else
             echo "标签没有注解 —— 退回自动生成（只会有一行 compare 链接）"
             gh release create "$GITHUB_REF_NAME" apk/*.apk \
-              --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "$GITHUB_REF_NAME" \
               --generate-notes
