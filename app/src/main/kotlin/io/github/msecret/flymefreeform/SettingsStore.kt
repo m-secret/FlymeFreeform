@@ -5,13 +5,22 @@ import android.content.Context
 
 /** 设置存储。原 Xposed 版本走框架远程偏好，这里改为本地 SharedPreferences。 */
 class SettingsStore(context: Context) {
-    private val preferences = context.applicationContext.getSharedPreferences(FILE_NAME, Context.MODE_PRIVATE)
+    /**
+     * 留着它判断系统形态：**小米（AOSP 形态）上小窗落点走另一组键**（见 [anchorKey]）——
+     * 那边小横条相对小窗底边的位置和 ColorOS 不一样，一套值两头跑必然有一头不准。
+     * 存成 applicationContext，免得把 Activity 拽住。
+     */
+    private val context = context.applicationContext
+
+    private val preferences = this.context.getSharedPreferences(FILE_NAME, Context.MODE_PRIVATE)
 
     init {
         migrateRadiusIfNeeded()
         migrateCloseAnchorIfNeeded()
         migrateTouchAndInsetIfNeeded()
         migrateInsetDefaultTo10IfNeeded()
+        // ⚠️ 必须紧跟在上面那条**之后**（它负责更老的 50，这条只管停在 10 的那批）。
+        migrateInsetDefaultTo6IfNeeded()
         migrateCornerRangeDefaultsIfNeeded()
         migrateMenuDimDefaultsIfNeeded()
         migrateOutsideTapPaddingIfNeeded()
@@ -218,7 +227,13 @@ class SettingsStore(context: Context) {
         preferences.edit().putBoolean(KEY_CLOSE_MODE_MIGRATED_OFF_TAP, true).apply()
     }
 
-    /** 轮盘离屏距离默认从 50% 改成 10%：等于旧默认 50 的视为没改过，重置为 10。 */
+    /**
+     * 轮盘离屏距离默认从 **50% 改成 10%**（历史：那一版的新默认是 10；现在常量已是 6，所以落到 6）。
+     *
+     * 判据：**仍然等于旧默认 50** 的视为「没改过」⇒ 写成当时的默认
+     * （[DEFAULT_MENU_CORNER_INSET_PERCENT]，**现为 6**）。用户自己拖过的值不动。
+     * ⚠️ 它后面还跟着 [migrateInsetDefaultTo6IfNeeded]（只管停在 10 的那批），别调换顺序。
+     */
     private fun migrateInsetDefaultTo10IfNeeded() {
         if (preferences.getBoolean(KEY_INSET_MIGRATED_TO_10, false)) return
         if (preferences.getInt(KEY_MENU_CORNER_INSET_PERCENT, -1) == LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT) {
@@ -227,6 +242,27 @@ class SettingsStore(context: Context) {
                 .apply()
         }
         preferences.edit().putBoolean(KEY_INSET_MIGRATED_TO_10, true).apply()
+    }
+
+    /**
+     * 轮盘离角落距离的默认值从 **10% 改成 6%**（2026-10-10 用户：「把默认的轮盘距离改为 6」）。
+     *
+     * 沿用同一套判据：**仍然等于上一版默认 10** 的视为「没改过」，重置成 6；
+     * 用户自己拖过的值（不是 10）不动。
+     *
+     * ⚠️ 必须**排在** [migrateInsetDefaultTo10IfNeeded] **之后**跑：那一步负责把更老的 50
+     * 写成当时的默认（那个常量现在也是 6），这里只管「已经停在 10 的」那一批。
+     */
+    private fun migrateInsetDefaultTo6IfNeeded() {
+        if (preferences.getBoolean(KEY_INSET_MIGRATED_TO_6, false)) return
+        if (preferences.getInt(KEY_MENU_CORNER_INSET_PERCENT, -1) ==
+            LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT_10
+        ) {
+            preferences.edit()
+                .putInt(KEY_MENU_CORNER_INSET_PERCENT, DEFAULT_MENU_CORNER_INSET_PERCENT)
+                .apply()
+        }
+        preferences.edit().putBoolean(KEY_INSET_MIGRATED_TO_6, true).apply()
     }
 
     /**
@@ -496,12 +532,105 @@ class SettingsStore(context: Context) {
      * 落点就会停在半空。
      */
     var closeAnchorYDp: Int
-        get() = preferences.getInt(KEY_CLOSE_BAR_Y_DP, DEFAULT_CLOSE_ANCHOR_Y_DP)
+        get() = readAnchorY(KEY_CLOSE_BAR_Y_DP, defaultAnchorYDp)
+        set(value) = writeAnchorY(KEY_CLOSE_BAR_Y_DP, value)
+
+    /**
+     * **横屏**的落点（dp），语义与 [closeAnchorYDp] 完全相同。
+     *
+     * 横竖屏各存一套，是因为小横条相对小窗底边的位置在两种方向下不一样（横屏窗口更扁、
+     * 系统画横条的位置也不同），一套值两头跑必然有一头不准（用户 2026-10-10：
+     * 「校准也是根据横竖屏校准」）。
+     *
+     * ⚠️ **通用那套（ColorOS）没存过横屏值时回落到竖屏值**，而不是直接取默认 4 ——
+     * 升级上来的用户此前只有一套值、而且可能在横屏下调过它，直接给默认等于把那个值悄悄丢掉。
+     * 小米那套是**新键、没有历史包袱**，直接用自己那份默认（6）。
+     */
+    var closeAnchorYDpLandscape: Int
+        get() =
+            readAnchorY(
+                KEY_CLOSE_BAR_Y_DP_LANDSCAPE,
+                if (anchorDiffersByOrientation) DEFAULT_MIUI_ANCHOR_Y_DP_LANDSCAPE else closeAnchorYDp,
+            )
+        set(value) = writeAnchorY(KEY_CLOSE_BAR_Y_DP_LANDSCAPE, value)
+
+    /**
+     * 按方向取落点。**调用点只问方向，不自己写 if**（和 [aospFreeformScalePercentOf] 一个规矩）。
+     *
+     * ★ 只有 [anchorDiffersByOrientation] 的形态（AOSP）才真分两套；其余形态**横竖屏共用
+     *   竖屏那一套**（用户 2026-10-10：「这个系统应该横竖屏用一个的」）。
+     *   ⚠️ 这里**必须**挡掉：非 AOSP 的 prefs 里可能还留着旧版 UI 写过的横屏值，
+     *      不挡就成了「界面上看不到、实际却在生效」的隐藏状态。
+     */
+    fun closeAnchorYDpOf(landscape: Boolean): Int =
+        if (landscape && anchorDiffersByOrientation) closeAnchorYDpLandscape else closeAnchorYDp
+
+    /**
+     * 落点**是否横竖屏各存一套**（也决定底层走哪一组键）。
+     *
+     * ★ **AOSP（小米 / 澎湃）**：**是**。
+     *   ① 横屏的小窗更扁、系统画小横条的位置与竖屏不同，一套值两头跑必然有一头不准
+     *      （用户 2026-10-10：「校准也是根据横竖屏校准」）；
+     *   ② 小横条的绝对位置也和 ColorOS 不同 ⇒ **底层键也分开**（互不影响）。
+     * ★ **其余（ColorOS 等）**：**否**。横竖屏共用一套就够（用户 2026-10-10：
+     *   「**这个系统应该横竖屏用一个的**」），设置页也就**只显示一行**、不带「（横屏）」。
+     *
+     * 判据问的是**能力**（[SystemSupport.freeformState]），不问品牌。
+     */
+    val anchorDiffersByOrientation: Boolean
+        get() = SystemSupport.freeformState(context) == SystemSupport.FreeformState.AOSP
+
+    /** 竖屏那套的默认值：小米 **8**、其余 **4**。 */
+    private val defaultAnchorYDp: Int
+        get() = if (anchorDiffersByOrientation) DEFAULT_MIUI_ANCHOR_Y_DP else DEFAULT_CLOSE_ANCHOR_Y_DP
+
+    /**
+     * 把「通用键名」映射成当前形态该用的键。
+     *
+     * ★ **UI 与服务一律只认通用键名**，形态差异只在这一处 —— 这样两边都不用写 `if`，
+     * 也不会出现「某一处忘了分派」。
+     */
+    private fun anchorKey(genericKey: String): String =
+        if (!anchorDiffersByOrientation) {
+            genericKey
+        } else {
+            when (genericKey) {
+                KEY_CLOSE_BAR_Y_DP -> KEY_MIUI_ANCHOR_Y_DP
+                KEY_CLOSE_BAR_Y_DP_LANDSCAPE -> KEY_MIUI_ANCHOR_Y_DP_LANDSCAPE
+                else -> genericKey
+            }
+        }
+
+    private fun readAnchorY(genericKey: String, fallback: Int): Int =
+        preferences.getInt(anchorKey(genericKey), fallback)
             .coerceIn(MIN_CLOSE_ANCHOR_Y_DP, MAX_CLOSE_ANCHOR_Y_DP)
-        set(value) =
-            preferences.edit()
-                .putInt(KEY_CLOSE_BAR_Y_DP, value.coerceIn(MIN_CLOSE_ANCHOR_Y_DP, MAX_CLOSE_ANCHOR_Y_DP))
-                .apply()
+
+    private fun writeAnchorY(genericKey: String, value: Int) {
+        preferences.edit()
+            .putInt(anchorKey(genericKey), value.coerceIn(MIN_CLOSE_ANCHOR_Y_DP, MAX_CLOSE_ANCHOR_Y_DP))
+            .apply()
+    }
+
+    /**
+     * 「关闭落点校准」恢复默认：**删键**，而不是写一个默认值进去。
+     *
+     * ★ 为什么不能写死一个数：落点的默认值**按形态分**（小米竖 8 / 横 6，其余 4，
+     *   见 [defaultAnchorYDp]），写死哪个都会在另一种形态上说错。删掉之后各 getter
+     *   各自回落到自己那份默认（[closeAnchorXPercent] / [closeAnchorYDp] /
+     *   [closeAnchorYDpLandscape]）。
+     *
+     * 四组键（通用竖 / 通用横 / 小米竖 / 小米横）**一起删**：当前形态只会用到其中两组，
+     * 但留着另外两组就是 prefs 里看不见也改不掉的脏值。
+     */
+    fun resetCloseAnchor() {
+        preferences.edit()
+            .remove(KEY_CLOSE_BAR_X_PERCENT)
+            .remove(KEY_CLOSE_BAR_Y_DP)
+            .remove(KEY_CLOSE_BAR_Y_DP_LANDSCAPE)
+            .remove(KEY_MIUI_ANCHOR_Y_DP)
+            .remove(KEY_MIUI_ANCHOR_Y_DP_LANDSCAPE)
+            .apply()
+    }
 
     /**
      * 「上滑关闭」时手指滑过的距离，占**屏幕短边**的百分比。
@@ -547,6 +676,11 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean(KEY_CLOSE_ANCHOR_MARKER, false)
         set(value) = preferences.edit().putBoolean(KEY_CLOSE_ANCHOR_MARKER, value).apply()
 
+    // ℹ️ 2026-10-10：曾经加过一组「MIUI 红点」（`miuiMarkerOffsetDp`，**只挪准星显示**、不动注入），
+    //    用户当天就发现它和「点击位置距小窗底边」在界面上是**两组纵向旋钮**、看着重复，而且
+    //    「红点 ≠ 实际落点」本身就不该存在 ⇒ **已删除**，改成小米走自己那组落点键
+    //    （见 [KEY_MIUI_ANCHOR_Y_DP]，默认竖 8 / 横 6）。准星现在永远等于实际落点，所见即所得。
+
     /**
      * 返回键无效时，用 Shizuku 强制停止小窗所属应用。
      *
@@ -567,8 +701,13 @@ class SettingsStore(context: Context) {
      * 而应用在这么小的窗口里仍按整屏的密度排版，于是「窗口很小、字还是大的」。
      * 我们补一记 `am task resize` 把它调到合适的大小（见 `AospFreeformWindow`）。
      *
-     * 默认 **62%**：等比缩到 62% 时窗口形状与整屏一致，应用排版不用重排。
-     * 调小 = 更「迷你」，调大 = 更接近全屏。范围 40%~95%（100% 就是全屏，没意义）。
+     * 语义是「**屏幕上看到的小窗宽度占屏幕宽度的百分比**」（2026-10-09 改，原来直接当尺寸用）。
+     * 默认 **70%**，取的是 HyperOS 原生小窗的实测值（小米 15：屏 1200px、原生小窗屏上 840px）。
+     * 调小 = 更「迷你」，调大 = 更接近全屏。范围 40%~95%。
+     *
+     * ⚠️ **交出去的是「逻辑」尺寸**：系统会把超出屏幕的逻辑矩形整体缩到 0.7 倍，
+     * 所以实际传给 `am task resize` 的是 `本值 ÷ 0.7` —— 见 `AospFreeformWindow.bounds()`。
+     * 高度不跟屏幕比例走，而是照原生小窗的宽高比（1.6）算，否则窗口会又瘦又长。
      *
      * ⚠️ **只对 AOSP 形态生效**：ColorOS 那条路由系统自己决定窗口尺寸，一个像素都不碰。
      */
@@ -583,6 +722,327 @@ class SettingsStore(context: Context) {
                     value.coerceIn(MIN_AOSP_FREEFORM_SCALE, MAX_AOSP_FREEFORM_SCALE),
                 )
                 .apply()
+
+    /**
+     * **竖屏**小窗叠加的偏移量（dp，默认 24，`0` = 不叠加）。
+     *
+     * 同一位置再开一个窗时，新窗朝**右下角**让开这么多，免得两扇窗完全重合
+     * （见 [AospFreeformWindow.portraitCascadeShift]）。横屏那套偏移由另一处常量管，不走这里。
+     */
+    var aospFreeformCascadeDp: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_CASCADE_DP, DEFAULT_AOSP_FREEFORM_CASCADE_DP)
+                .coerceIn(MIN_AOSP_FREEFORM_CASCADE_DP, MAX_AOSP_FREEFORM_CASCADE_DP)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_CASCADE_DP,
+                    value.coerceIn(MIN_AOSP_FREEFORM_CASCADE_DP, MAX_AOSP_FREEFORM_CASCADE_DP),
+                )
+                .apply()
+
+    /**
+     * **横屏**同侧叠加的偏移量（dp，默认 78，`0` = 不叠加）。
+     *
+     * ⚠️ 它只管**两个小窗之间的距离**（位置 2 相对位置 1 往里让多少）；
+     * **位置 1 本身固定在实测处**，不受这个值影响（见 [AospFreeformWindow.bounds] 的
+     * `LANDSCAPE_EDGE_BASE_DP`）—— 否则一调它就会把第一个小窗也挪走。
+     * 实测（小米 15 横屏）同侧两个窗差 234px ≈ 78dp，所以默认取 78。
+     */
+    var aospFreeformCascadeDpLandscape: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE,
+                DEFAULT_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE,
+            ).coerceIn(MIN_AOSP_FREEFORM_CASCADE_DP, MAX_AOSP_FREEFORM_CASCADE_DP)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_CASCADE_DP, MAX_AOSP_FREEFORM_CASCADE_DP),
+                )
+                .apply()
+
+    /** 横屏的占屏比例，见 [aospFreeformScalePercent]。没校准过时用竖屏的默认值。 */
+    var aospFreeformScalePercentLandscape: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_SCALE_LANDSCAPE, DEFAULT_AOSP_FREEFORM_SCALE_LANDSCAPE)
+                .coerceIn(MIN_AOSP_FREEFORM_SCALE, MAX_AOSP_FREEFORM_SCALE)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_SCALE_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_SCALE, MAX_AOSP_FREEFORM_SCALE),
+                )
+                .apply()
+
+    /**
+     * 小米原生小窗的**缩放系数**（千分比，默认 700 = 0.70）：交给系统的逻辑矩形会被缩到这么大。
+     *
+     * ★★ **横竖屏是两套独立参数**（2026-10-10 用户要求）—— 同一个窗口横竖屏的几何不一样，
+     * 横屏那套见 [aospFreeformScaleMilliLandscape]。由 [XiaomiFreeformCalibration] 校准后覆盖；
+     * **只对小米生效**（见 [AospFreeformWindow.scaleFactor]）。
+     */
+    var aospFreeformScaleMilli: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_SCALE_MILLI, DEFAULT_AOSP_FREEFORM_SCALE_MILLI)
+                .coerceIn(MIN_AOSP_FREEFORM_SCALE_MILLI, MAX_AOSP_FREEFORM_SCALE_MILLI)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_SCALE_MILLI,
+                    value.coerceIn(MIN_AOSP_FREEFORM_SCALE_MILLI, MAX_AOSP_FREEFORM_SCALE_MILLI),
+                )
+                .apply()
+
+    /** 横屏的缩放系数，见 [aospFreeformScaleMilli]。没校准过时用竖屏的默认值。 */
+    var aospFreeformScaleMilliLandscape: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE,
+                DEFAULT_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE,
+            ).coerceIn(MIN_AOSP_FREEFORM_SCALE_MILLI, MAX_AOSP_FREEFORM_SCALE_MILLI)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_SCALE_MILLI, MAX_AOSP_FREEFORM_SCALE_MILLI),
+                )
+                .apply()
+
+    /**
+     * 小米原生小窗的**视觉宽高比**（千分比，默认 1600 = 1.60）—— **竖屏**那套。
+     * 它跟着屏幕宽高比走，换机型会变 —— 这正是要校准的原因。见 [aospFreeformScaleMilli]。
+     */
+    var aospFreeformAspectMilli: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_ASPECT_MILLI, DEFAULT_AOSP_FREEFORM_ASPECT_MILLI)
+                .coerceIn(MIN_AOSP_FREEFORM_ASPECT_MILLI, MAX_AOSP_FREEFORM_ASPECT_MILLI)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_ASPECT_MILLI,
+                    value.coerceIn(MIN_AOSP_FREEFORM_ASPECT_MILLI, MAX_AOSP_FREEFORM_ASPECT_MILLI),
+                )
+                .apply()
+
+    /**
+     * 横屏的视觉宽高比，见 [aospFreeformAspectMilli]。
+     *
+     * ⚠️ 横屏的原生小窗是**横着的**，所以校准出来的值 **< 1000**（实测小米 15 上是 0.67）——
+     * 别拿竖屏那个「必须 > 1」的印象去套它。
+     */
+    var aospFreeformAspectMilliLandscape: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE,
+                DEFAULT_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE,
+            ).coerceIn(MIN_AOSP_FREEFORM_ASPECT_MILLI, MAX_AOSP_FREEFORM_ASPECT_MILLI)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_ASPECT_MILLI, MAX_AOSP_FREEFORM_ASPECT_MILLI),
+                )
+                .apply()
+
+    /** 按方向取「缩放系数」：竖屏 / 横屏是两套独立参数。 */
+    fun aospFreeformScaleMilliOf(landscape: Boolean): Int =
+        if (landscape) aospFreeformScaleMilliLandscape else aospFreeformScaleMilli
+
+    /** 按方向取「宽高比」，见 [aospFreeformScaleMilliOf]。 */
+    fun aospFreeformAspectMilliOf(landscape: Boolean): Int =
+        if (landscape) aospFreeformAspectMilliLandscape else aospFreeformAspectMilli
+
+    /** 按方向取「占屏比例」，见 [aospFreeformScaleMilliOf]。 */
+    fun aospFreeformScalePercentOf(landscape: Boolean): Int =
+        if (landscape) aospFreeformScalePercentLandscape else aospFreeformScalePercent
+
+    /**
+     * 写回一次校准结果（四项，**按方向**各存一套）。
+     *
+     * ★★ `topInsetPercent`（窗口上沿）**现在也由校准写**（2026-10-10 用户：
+     * 「不是可以校准获取位置吗，你为什么总是猜来猜去，拿到的位置你不用」）。
+     * 校准读的就是官方窗的 `visual` 矩形，`visual.top` 本来就是现成的官方位置 ——
+     * 之前把它排除在外、改用固定默认值，结果是竖屏怎么调都靠猜。
+     *
+     * ⚠️ 之前那条「上沿是固定量、塞进校准会更复杂」的理由**已作废**：它并不额外增加校准步骤
+     * （还是同一次读取），只是多存一个数。
+     */
+    fun setAospFreeformCalibration(
+        landscape: Boolean,
+        scaleMilli: Int,
+        aspectMilli: Int,
+        percent: Int,
+        topInsetPercent: Int,
+    ) {
+        if (landscape) {
+            aospFreeformScaleMilliLandscape = scaleMilli
+            aospFreeformAspectMilliLandscape = aspectMilli
+            aospFreeformScalePercentLandscape = percent
+            aospFreeformTopInsetPercentLandscape = topInsetPercent
+            aospFreeformTopCalibratedLandscape = true
+        } else {
+            aospFreeformScaleMilli = scaleMilli
+            aospFreeformAspectMilli = aspectMilli
+            aospFreeformScalePercent = percent
+            aospFreeformTopInsetPercent = topInsetPercent
+            aospFreeformTopCalibrated = true
+        }
+    }
+
+    /**
+     * 小窗**上沿**（窗口 `top`）占**短边**的百分比（%）。**竖屏**那套。
+     *
+     * ★★ 值来自**校准**（官方窗 `visual.top` ÷ 短边），见 [setAospFreeformCalibration]。
+     * 横屏官方实测 161 ≈ 短边 13%；**竖屏官方比横屏低得多**，只有校准才拿得准。
+     *
+     * ⚠️ 没校准过的机器用默认 13（= 贴状态栏下沿），**竖屏会偏高** —— 那是兜底，不是正解。
+     */
+    var aospFreeformTopInsetPercent: Int
+        get() =
+            preferences.getInt(KEY_AOSP_FREEFORM_TOP_INSET_PERCENT, DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT)
+                .coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_TOP_INSET_PERCENT,
+                    value.coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT),
+                )
+                .apply()
+
+    /** 横屏的上沿偏移，见 [aospFreeformTopInsetPercent]。 */
+    var aospFreeformTopInsetPercentLandscape: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_TOP_INSET_PERCENT_LANDSCAPE,
+                DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT,
+            ).coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_TOP_INSET_PERCENT_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT),
+                )
+                .apply()
+
+    /** 按方向取「上沿偏移」，见 [aospFreeformScaleMilliOf]。 */
+    fun aospFreeformTopInsetPercentOf(landscape: Boolean): Int =
+        if (landscape) aospFreeformTopInsetPercentLandscape else aospFreeformTopInsetPercent
+
+    /**
+     * **竖屏**：上沿是不是用**自定义值**（false = 用校准读到的**系统位置**）。
+     *
+     * ★ 用户 2026-10-10：「可以上下调整，**默认用系统的位置**，可以自定义」。
+     *
+     * ⚠️ **同日晚些时候起这个开关不再被读**：用户把「屏幕居中 / 自定义」那个二选去掉了
+     * （「自定义的设计还是很怪，能不能直接加个横条」），改由
+     * [aospFreeformTopCustomPercentSaved]（"拖过没有"）判断。
+     * 键保留只为兼容老备份（`knownKeys` 里还有它），**新代码别再用它做判断**。
+     */
+    var aospFreeformTopCustom: Boolean
+        get() = preferences.getBoolean(KEY_AOSP_FREEFORM_TOP_CUSTOM, false)
+        set(value) = preferences.edit().putBoolean(KEY_AOSP_FREEFORM_TOP_CUSTOM, value).apply()
+
+    /** 竖屏的自定义上沿（占短边 %）。见 [aospFreeformTopCustom]。 */
+    var aospFreeformTopCustomPercent: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT,
+                DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT,
+            ).coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT,
+                    value.coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT),
+                )
+                .apply()
+
+    /**
+     * 用户**有没有亲手拖过**「上沿」那根滑块（= `aosp_freeform_top_custom_percent` 存过没有）。
+     *
+     * ★★ 用户 2026-10-10 把「屏幕居中 / 自定义」那个**二选去掉了**（「自定义的设计还是很怪，
+     * 能不能直接加个横条」）⇒ 现在只有一根滑块、**拖了即生效**。于是「默认屏幕居中」这件事
+     * 改由**默认值**承担：**没存过就按居中算**
+     * （见 `FreeformSizeActivity.currentTopPercent` 与 `AospFreeformWindow.bounds`），
+     * 存过才用用户拖的值。
+     *
+     * ⚠️ **别用 [aospFreeformTopCustom] 代替它**：那个旧开关在老用户那边可能是 `true`，
+     * 而百分比其实还是默认值，判出来会以为"拖过"。
+     */
+    val aospFreeformTopCustomPercentSaved: Boolean
+        get() = preferences.contains(KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT)
+
+    /**
+     * 把「上沿」滑块恢复成**没拖过**的状态 —— 也就是**回到「屏幕居中」**。
+     *
+     * ⚠️ 必须**删键**，不能写默认值：新口径下「没存过」才等于居中（见
+     * [aospFreeformTopCustomPercentSaved]），写个 13 会被判成"用户拖到了 13"。
+     */
+    fun clearAospFreeformTopCustomPercent() {
+        preferences.edit().remove(KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT).apply()
+    }
+
+    /** 横屏的「用自定义上沿」开关，见 [aospFreeformTopCustom]。 */
+    var aospFreeformTopCustomLandscape: Boolean
+        get() = preferences.getBoolean(KEY_AOSP_FREEFORM_TOP_CUSTOM_LANDSCAPE, false)
+        set(value) = preferences.edit().putBoolean(KEY_AOSP_FREEFORM_TOP_CUSTOM_LANDSCAPE, value).apply()
+
+    /** 横屏的自定义上沿（占短边 %），见 [aospFreeformTopCustom]。 */
+    var aospFreeformTopCustomPercentLandscape: Int
+        get() =
+            preferences.getInt(
+                KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT_LANDSCAPE,
+                DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT,
+            ).coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT)
+        set(value) =
+            preferences.edit()
+                .putInt(
+                    KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT_LANDSCAPE,
+                    value.coerceIn(MIN_AOSP_FREEFORM_TOP_INSET_PERCENT, MAX_AOSP_FREEFORM_TOP_INSET_PERCENT),
+                )
+                .apply()
+
+    /** 按方向取「用自定义上沿」开关，见 [aospFreeformTopCustom]。 */
+    fun aospFreeformTopCustomOf(landscape: Boolean): Boolean =
+        if (landscape) aospFreeformTopCustomLandscape else aospFreeformTopCustom
+
+    /** 按方向取「自定义上沿」的百分比，见 [aospFreeformTopCustom]。 */
+    fun aospFreeformTopCustomPercentOf(landscape: Boolean): Int =
+        if (landscape) aospFreeformTopCustomPercentLandscape else aospFreeformTopCustomPercent
+
+    /**
+     * **实际该用的上沿百分比**：自定义开着就用自定义值，否则用校准读到的**系统位置**。
+     *
+     * ★ [AospFreeformWindow.bounds] 只认这一个 —— 别再去读 [aospFreeformTopInsetPercentOf]。
+     */
+    fun aospFreeformTopEffectivePercentOf(landscape: Boolean): Int =
+        if (aospFreeformTopCustomOf(landscape)) {
+            aospFreeformTopCustomPercentOf(landscape)
+        } else {
+            aospFreeformTopInsetPercentOf(landscape)
+        }
+
+    /**
+     * **竖屏**的上沿是否**已被校准写入**。
+     *
+     * false ⇒ [aospFreeformTopInsetPercent] 只是默认值，**不能**当官方位置用，
+     * 由 [AospFreeformWindow.bounds] 改走「整屏居中」兜底。
+     */
+    var aospFreeformTopCalibrated: Boolean
+        get() = preferences.getBoolean(KEY_AOSP_FREEFORM_TOP_CALIBRATED, false)
+        set(value) = preferences.edit().putBoolean(KEY_AOSP_FREEFORM_TOP_CALIBRATED, value).apply()
+
+    /** 横屏的上沿是否已被校准写入，见 [aospFreeformTopCalibrated]。 */
+    var aospFreeformTopCalibratedLandscape: Boolean
+        get() = preferences.getBoolean(KEY_AOSP_FREEFORM_TOP_CALIBRATED_LANDSCAPE, false)
+        set(value) =
+            preferences.edit().putBoolean(KEY_AOSP_FREEFORM_TOP_CALIBRATED_LANDSCAPE, value).apply()
+
+    /** 按方向取「上沿是否已校准」，见 [aospFreeformTopCalibrated]。 */
+    fun aospFreeformTopCalibratedOf(landscape: Boolean): Boolean =
+        if (landscape) aospFreeformTopCalibratedLandscape else aospFreeformTopCalibrated
 
     /**
      * 轮盘横向半径（宽度），单位 dp。
@@ -1107,6 +1567,64 @@ class SettingsStore(context: Context) {
         preferences.edit().remove(KEY_RECENT).apply()
     }
 
+    /**
+     * 无障碍观测到的前台应用，**有序**：最近用的排最前，最多 [MAX_RECENT_FOREGROUND] 个。
+     *
+     * 存的是「包名 + 那次前台的时间戳」，不是组件名——无障碍事件里只有包名。
+     * 之所以要留时间戳：它要和系统使用记录（`UsageStatsManager`）**按时间归并**，
+     * 谁更新谁在前。整条链路的说明见 [RecentUsage]。
+     *
+     * 容量给到 32，远大于面板那一行要显示的 [MAX_RECENT]：多留一些是为了**滤掉桌面、
+     * 输入法、SystemUI 这些之后**还剩得下足够多的真实应用。
+     */
+    var recentForeground: List<Pair<String, Long>>
+        get() =
+            preferences.getString(KEY_RECENT_FOREGROUND, null)
+                .orEmpty()
+                .lineSequence()
+                .mapNotNull { line ->
+                    // 包名里不可能出现 `:`，所以从**最后一个**冒号切最稳。
+                    val separator = line.lastIndexOf(':')
+                    if (separator <= 0) return@mapNotNull null
+                    val at = line.substring(separator + 1).toLongOrNull() ?: return@mapNotNull null
+                    line.substring(0, separator) to at
+                }
+                .distinctBy { it.first }
+                .take(MAX_RECENT_FOREGROUND)
+                .toList()
+        set(value) =
+            preferences.edit()
+                .putString(
+                    KEY_RECENT_FOREGROUND,
+                    value.distinctBy { it.first }
+                        .take(MAX_RECENT_FOREGROUND)
+                        .joinToString("\n") { (packageName, at) -> "$packageName:$at" },
+                )
+                .apply()
+
+    /** 记一次前台：挪到最前、同包去重、截断到 [MAX_RECENT_FOREGROUND]。比原来更旧的则什么都不写。 */
+    fun noteForeground(packageName: String, at: Long) {
+        val current = recentForeground
+        val existing = current.firstOrNull { it.first == packageName }
+        if (existing != null && existing.second >= at) return
+        recentForeground = listOf(packageName to at) + current.filterNot { it.first == packageName }
+    }
+
+    /** 清掉无障碍那份观测记录。 */
+    fun clearRecentForeground() {
+        preferences.edit().remove(KEY_RECENT_FOREGROUND).apply()
+    }
+
+    /**
+     * 「清除最近使用」的水位线（[System.currentTimeMillis]）。
+     *
+     * ★ 存在的唯一理由：系统那份使用记录**我们删不掉**，只能把早于这个时刻的条目
+     * 在合并时丢掉（见 [RecentUsage]）。0 表示从没清过。
+     */
+    var recentClearedAt: Long
+        get() = preferences.getLong(KEY_RECENT_CLEARED_AT, 0L)
+        set(value) = preferences.edit().putLong(KEY_RECENT_CLEARED_AT, value).apply()
+
     /** 拖拽结束后整体写回底栏顺序，规则与 [reorderPins] 相同。 */
     fun reorderDock(ordered: List<ComponentName>) {
         val current = dockComponents
@@ -1247,10 +1765,122 @@ class SettingsStore(context: Context) {
         private const val KEY_OUTSIDE_TAP_FORCE = "outside_tap_force_close"
         private const val KEY_AOSP_FREEFORM_SCALE = "aosp_freeform_scale_percent"
 
-        /** AOSP 形态小窗的尺寸档位，见 [aospFreeformScalePercent]。 */
+        /**
+         * AOSP 形态小窗的尺寸档位，见 [aospFreeformScalePercent]。
+         *
+         * 默认 **70%** = HyperOS 原生小窗在屏上占的宽度比（小米 15 实测 840/1200）。
+         */
         const val MIN_AOSP_FREEFORM_SCALE = 40
         const val MAX_AOSP_FREEFORM_SCALE = 95
-        const val DEFAULT_AOSP_FREEFORM_SCALE = 62
+
+        /** 竖屏默认占短边比例（小米 15 实测：原生小窗屏上 840 / 短边 1200）。 */
+        const val DEFAULT_AOSP_FREEFORM_SCALE = 70
+
+        /**
+         * 横屏默认占短边比例。
+         *
+         * ★ **必须与竖屏不同**（用户 2026-10-10 问「为什么横竖屏一样」）：横屏的原生小窗是
+         * **横着的**、且比竖屏占得更满 —— 小米 15 实测 视觉 979×653 / 短边 1200 ⇒ **82%**。
+         */
+        const val DEFAULT_AOSP_FREEFORM_SCALE_LANDSCAPE = 82
+
+        /** 校准出来的缩放（千分比）：竖屏见 [aospFreeformScaleMilli]、横屏见 [...Landscape]。 */
+        private const val KEY_AOSP_FREEFORM_SCALE_MILLI = "aosp_freeform_scale_milli"
+        private const val KEY_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE = "aosp_freeform_scale_milli_landscape"
+
+        /** 校准出来的视觉宽高比（千分比）：竖屏见 [aospFreeformAspectMilli]、横屏见 [...Landscape]。 */
+        private const val KEY_AOSP_FREEFORM_ASPECT_MILLI = "aosp_freeform_aspect_milli"
+        private const val KEY_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE = "aosp_freeform_aspect_milli_landscape"
+
+        /** 横屏的占屏比例，见 [aospFreeformScalePercentLandscape]。 */
+        private const val KEY_AOSP_FREEFORM_SCALE_LANDSCAPE = "aosp_freeform_scale_landscape"
+
+        /** 小窗叠加偏移：竖屏见 [aospFreeformCascadeDp]、横屏见 [aospFreeformCascadeDpLandscape]。 */
+        private const val KEY_AOSP_FREEFORM_CASCADE_DP = "aosp_freeform_cascade_dp"
+        private const val KEY_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE = "aosp_freeform_cascade_dp_landscape"
+
+        /** 叠加偏移（dp）的可调范围：0 = 不叠加；上界给到 120dp，够试出各种手感。 */
+        const val MIN_AOSP_FREEFORM_CASCADE_DP = 0
+        const val MAX_AOSP_FREEFORM_CASCADE_DP = 120
+
+        /** 竖屏默认：24dp（横屏那个 78dp 太大，竖屏窗宽、会让出屏）。 */
+        const val DEFAULT_AOSP_FREEFORM_CASCADE_DP = 24
+
+        /** 横屏默认：78dp（小米 15 横屏实测同侧两个窗差 234px ≈ 78dp）。 */
+        const val DEFAULT_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE = 78
+
+        /**
+         * 小窗**上沿**（= 窗口 `top`）占**短边**的百分比（%）：竖屏见 [aospFreeformTopInsetPercent]、
+         * 横屏见 [aospFreeformTopInsetPercentLandscape]。
+         *
+         * ★★ **它现在是校准写进去的**（2026-10-10 用户：「不是可以校准获取位置吗，你为什么总是
+         * 猜来猜去，拿到的位置你不用」）—— 值就是官方窗 `visual.top` ÷ 短边。
+         * 默认 13（≈161/1200）只给**没校准过**的机器兜底。
+         */
+        private const val KEY_AOSP_FREEFORM_TOP_INSET_PERCENT = "aosp_freeform_top_inset_percent"
+        private const val KEY_AOSP_FREEFORM_TOP_INSET_PERCENT_LANDSCAPE =
+            "aosp_freeform_top_inset_percent_landscape"
+
+        /**
+         * 「上沿用自定义值」的开关与自定义值（竖屏 / 横屏各一套）。
+         *
+         * ★ 用户 2026-10-10：「这个位置也加一个可以调整的设置，可以上下调整，**默认用系统的位置**，
+         * 可以自定义，自定义里加上使用你算出来的**屏幕中间**快速选择」。
+         * 默认 `false` ⇒ 走校准读到的系统位置（[KEY_AOSP_FREEFORM_TOP_INSET_PERCENT]）。
+         */
+        private const val KEY_AOSP_FREEFORM_TOP_CUSTOM = "aosp_freeform_top_custom"
+        private const val KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT = "aosp_freeform_top_custom_percent"
+        private const val KEY_AOSP_FREEFORM_TOP_CUSTOM_LANDSCAPE = "aosp_freeform_top_custom_landscape"
+        private const val KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT_LANDSCAPE =
+            "aosp_freeform_top_custom_percent_landscape"
+
+        /**
+         * 「上沿**已被校准写入**」的标记（竖屏 / 横屏各一个）。
+         *
+         * ★ 为什么非要有它：没校准过时 [KEY_AOSP_FREEFORM_TOP_INSET_PERCENT] 只是**默认值**，
+         * 拿它当"官方位置"用会把窗顶到状态栏上（用户 2026-10-10：「紧贴着状态栏了，我也是服了」）。
+         * 所以没校准过时改走**整屏居中**兜底，校准过才认那个值。
+         */
+        private const val KEY_AOSP_FREEFORM_TOP_CALIBRATED = "aosp_freeform_top_calibrated"
+        private const val KEY_AOSP_FREEFORM_TOP_CALIBRATED_LANDSCAPE =
+            "aosp_freeform_top_calibrated_landscape"
+
+        /**
+         * 上沿的档位范围（%）：0 = 贴屏幕最顶。
+         *
+         * ⚠️ 上限**必须放得开**：竖屏官方小窗的上沿可以低到短边的 **50%+**
+         * （居中附近），早先卡在 30 会把校准读到的值**夹掉**。
+         */
+        const val MIN_AOSP_FREEFORM_TOP_INSET_PERCENT = 0
+        const val MAX_AOSP_FREEFORM_TOP_INSET_PERCENT = 70
+
+        /** 没校准过时的兜底：13 ≈ 161/1200（小米 15 横屏原生小窗实测的上沿）。 */
+        const val DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT = 13
+
+        /** 校准缩放的档位范围（千分比）：真机实测就在 0.70~0.82，卡紧一点挡住读错的情况。 */
+        const val MIN_AOSP_FREEFORM_SCALE_MILLI = 500
+        const val MAX_AOSP_FREEFORM_SCALE_MILLI = 900
+
+        /** 竖屏默认缩放（小米 15 实测：逻辑 1200 → 视觉 840）。 */
+        const val DEFAULT_AOSP_FREEFORM_SCALE_MILLI = 700
+
+        /** 横屏默认缩放（小米 15 实测：逻辑 1200 → 视觉 979）。见 [DEFAULT_AOSP_FREEFORM_SCALE_LANDSCAPE]。 */
+        const val DEFAULT_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE = 820
+
+        /**
+         * 校准宽高比的档位范围（千分比）。
+         *
+         * ⚠️ 下界必须**低于 1.0**：横屏的原生小窗是**横着的**，实测 0.67（小米 15）。
+         * 上界 2.4 覆盖超长屏的竖屏。
+         */
+        const val MIN_AOSP_FREEFORM_ASPECT_MILLI = 400
+        const val MAX_AOSP_FREEFORM_ASPECT_MILLI = 2400
+
+        /** 竖屏默认宽高比（小米 15 实测 840×1344）。 */
+        const val DEFAULT_AOSP_FREEFORM_ASPECT_MILLI = 1600
+
+        /** 横屏默认宽高比（小米 15 实测 979×653）—— **小于 1**，横屏小窗本来就是横的。 */
+        const val DEFAULT_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE = 670
         const val CLICK_MODE_SINGLE = "single"
         const val CLICK_MODE_DOUBLE = "double"
         const val TAB_APPS = "apps"
@@ -1299,6 +1929,18 @@ class SettingsStore(context: Context) {
 
         private const val KEY_CLOSE_BAR_X_PERCENT = "close_bar_x_percent"
         private const val KEY_CLOSE_BAR_Y_DP = "close_bar_y_dp"
+        /** **横屏**那套落点，见 [closeAnchorYDpLandscape]。 */
+        private const val KEY_CLOSE_BAR_Y_DP_LANDSCAPE = "close_bar_y_dp_landscape"
+        /**
+         * **小米（AOSP 形态）专属**的落点键（横竖屏各一个）。
+         *
+         * ★ 用户 2026-10-10 定的：小米上小横条的位置和 ColorOS 不同，所以**底层换一组键**、
+         * 默认值给 **竖 8 / 横 6**；但**界面上那一行的名字和 ColorOS 完全一致**（都是
+         * 「点击位置距小窗底边」），不出现「MIUI」字样 —— 用户看的是一个概念，不是一个系统名。
+         * 选哪组由 [anchorKey] 按形态决定，调用点（UI / 服务）不用管。
+         */
+        private const val KEY_MIUI_ANCHOR_Y_DP = "miui_close_bar_y_dp"
+        private const val KEY_MIUI_ANCHOR_Y_DP_LANDSCAPE = "miui_close_bar_y_dp_landscape"
         private const val KEY_CLOSE_ANCHOR_MARKER = "close_anchor_marker"
         private const val KEY_CLOSE_SWIPE_DISTANCE = "close_swipe_distance_percent"
         private const val KEY_CLOSE_SWIPE_DURATION = "close_swipe_duration_ms"
@@ -1351,6 +1993,17 @@ class SettingsStore(context: Context) {
         private const val PREVIOUS_DEFAULT_CLOSE_ANCHOR_Y_DP = 0
         private const val KEY_CLOSE_ANCHOR_Y_MIGRATED_0 = "close_anchor_y_migrated_to_0"
         private const val KEY_CLOSE_ANCHOR_Y_MIGRATED_4 = "close_anchor_y_migrated_to_4"
+
+        /**
+         * **小米（AOSP 形态）**上「点击位置距小窗底边」的默认值：**竖屏 8 / 横屏 6**
+         * （用户 2026-10-10 给的数）。
+         *
+         * 为什么单独一套默认：小米的小横条相对小窗底边的位置和 ColorOS 不一样，共用同一个默认值
+         * 必然有一家压不准。★ 但**界面上那一行的名字和 ColorOS 完全一致**（都叫
+         * 「点击位置距小窗底边（竖屏）/（横屏）」），只有底层键不同（见 [KEY_MIUI_ANCHOR_Y_DP]）。
+         */
+        const val DEFAULT_MIUI_ANCHOR_Y_DP = 8
+        const val DEFAULT_MIUI_ANCHOR_Y_DP_LANDSCAPE = 6
 
         const val MIN_CLOSE_SWIPE_DISTANCE = 4
         const val MAX_CLOSE_SWIPE_DISTANCE = 60
@@ -1442,6 +2095,10 @@ class SettingsStore(context: Context) {
         private const val LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT = 50
         private const val KEY_INSET_MIGRATED_TO_10 = "menu_corner_inset_migrated_to_10"
 
+        /** 轮盘离角落距离的**上一版**默认（10%）：等于它的视为「没改过」，见 [migrateInsetDefaultTo6IfNeeded]。 */
+        private const val LEGACY_DEFAULT_MENU_CORNER_INSET_PERCENT_10 = 10
+        private const val KEY_INSET_MIGRATED_TO_6 = "menu_corner_inset_migrated_to_6"
+
         const val DEFAULT_EDGE_INSET_DP = 12
 
         /**
@@ -1461,6 +2118,16 @@ class SettingsStore(context: Context) {
         /** 「更多」面板「应用」标签页里「最近使用」一行的容量。 */
         const val MAX_RECENT = 8
         private const val KEY_RECENT = "recent_used"
+
+        /**
+         * 无障碍观测到的前台包（见 [recentForeground]）的容量。
+         *
+         * 比 [MAX_RECENT] 大不少：多出来的余量是留给「桌面 / 输入法 / SystemUI 这些
+         * 记了但显示不出来」的（它们在合并时被滤掉），不是给用户看的。
+         */
+        const val MAX_RECENT_FOREGROUND = 32
+        private const val KEY_RECENT_FOREGROUND = "recent_foreground"
+        private const val KEY_RECENT_CLEARED_AT = "recent_cleared_at"
 
         private const val KEY_MENU_RADIUS_PERCENT = "menu_radius_percent"
 
@@ -1502,10 +2169,26 @@ class SettingsStore(context: Context) {
         /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
         private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
 
-        /** 轮盘离角落距离的调节区间。 */
+        /**
+         * 轮盘离角落距离的调节区间（占屏幕短边 %）。
+         *
+         * 上限 **100 → 30**（用户 2026-10-10：「最大值改成 30」）—— 实际手感全在 0~20 这一段，
+         * 拉到 100 只会让滑块大半截是"没用的行程"、想微调 1% 特别难。
+         * ⚠️ 旧值若大于 30 会被 [menuCornerInsetPercent] 的 `coerceIn` **直接夹到 30**
+         * （读取时就夹，不用额外迁移）。
+         */
         const val MIN_MENU_CORNER_INSET_PERCENT = 0
-        const val MAX_MENU_CORNER_INSET_PERCENT = 100
-        const val DEFAULT_MENU_CORNER_INSET_PERCENT = 10
+        const val MAX_MENU_CORNER_INSET_PERCENT = 30
+
+        /**
+         * 轮盘离角落距离的默认值（占屏幕短边 %）。
+         *
+         * 10 → **6**（用户 2026-10-10：「把默认的轮盘距离改为 6」）—— 他自己就是把值调到 6
+         * 用的，所以把这个手感固化成默认。
+         * ⚠️ 改这个数**必须同时看一眼** [migrateInsetDefaultTo6IfNeeded]：
+         * 老用户 prefs 里存的是**上一版默认 10**，不迁的话只有全新安装才吃到新默认。
+         */
+        const val DEFAULT_MENU_CORNER_INSET_PERCENT = 6
 
         /** 轮盘图标直径的调节区间。上限放到 88dp，大屏上想要「图标更大」也能满足。 */
         const val MIN_MENU_ICON_DP = 24
@@ -1608,13 +2291,29 @@ class SettingsStore(context: Context) {
                 KEY_OUTSIDE_TAP, KEY_CAPTION_TAP_CLOSE, KEY_OUTSIDE_TAP_SIDES_ONLY,
                 KEY_OUTSIDE_TAP_MASK, KEY_OUTSIDE_TAP_PADDING_DP, KEY_OUTSIDE_TAP_DEBUG,
                 KEY_OUTSIDE_TAP_CLOSE_MODE, KEY_OUTSIDE_TAP_CLICK_MODE, KEY_OUTSIDE_TAP_FORCE,
-                KEY_CLOSE_BAR_X_PERCENT, KEY_CLOSE_BAR_Y_DP, KEY_CLOSE_ANCHOR_MARKER,
+                KEY_CLOSE_BAR_X_PERCENT, KEY_CLOSE_BAR_Y_DP, KEY_CLOSE_BAR_Y_DP_LANDSCAPE,
+                KEY_CLOSE_ANCHOR_MARKER,
+                // 小米（AOSP 形态）专属的落点键，见 [anchorKey]
+                KEY_MIUI_ANCHOR_Y_DP, KEY_MIUI_ANCHOR_Y_DP_LANDSCAPE,
                 KEY_CLOSE_SWIPE_DISTANCE, KEY_CLOSE_SWIPE_DURATION, KEY_LEGACY_CLOSE_ANCHOR_X_DP,
                 KEY_CLOSE_ANCHOR_Y_DP,
                 // AOSP 形态（vivo / 小米）小窗尺寸
                 KEY_AOSP_FREEFORM_SCALE,
+                // 小米真机校准出来的缩放与宽高比 —— **横竖屏各一套**
+                KEY_AOSP_FREEFORM_SCALE_MILLI, KEY_AOSP_FREEFORM_ASPECT_MILLI,
+                KEY_AOSP_FREEFORM_SCALE_MILLI_LANDSCAPE, KEY_AOSP_FREEFORM_ASPECT_MILLI_LANDSCAPE,
+                KEY_AOSP_FREEFORM_SCALE_LANDSCAPE,
+                // 小窗上沿（= 窗口 top，由校准写入），横竖屏各一个
+                KEY_AOSP_FREEFORM_TOP_INSET_PERCENT, KEY_AOSP_FREEFORM_TOP_INSET_PERCENT_LANDSCAPE,
+                // 上沿的「自定义」开关 / 自定义值 / 「已校准」标记
+                KEY_AOSP_FREEFORM_TOP_CUSTOM, KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT,
+                KEY_AOSP_FREEFORM_TOP_CUSTOM_LANDSCAPE, KEY_AOSP_FREEFORM_TOP_CUSTOM_PERCENT_LANDSCAPE,
+                KEY_AOSP_FREEFORM_TOP_CALIBRATED, KEY_AOSP_FREEFORM_TOP_CALIBRATED_LANDSCAPE,
+                // 小窗叠加偏移（竖屏 / 横屏各一个，见 [aospFreeformCascadeDp]）
+                KEY_AOSP_FREEFORM_CASCADE_DP, KEY_AOSP_FREEFORM_CASCADE_DP_LANDSCAPE,
                 // 「更多」面板
                 KEY_DRAWER_DEFAULT_TAB, KEY_LANDSCAPE_PANEL_SIDE, KEY_DOCK, KEY_RECENT,
+                KEY_RECENT_FOREGROUND, KEY_RECENT_CLEARED_AT,
                 KEY_TOOL_ORDER, KEY_HIDE_MORE_ENTRY,
                 // 轮盘几何与观感
                 KEY_MENU_RADIUS_PERCENT, KEY_MENU_HAPTIC, KEY_MENU_ICON_DP, KEY_MENU_SWING_DEG,

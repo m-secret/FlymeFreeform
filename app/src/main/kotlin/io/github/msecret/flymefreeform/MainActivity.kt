@@ -36,7 +36,7 @@ import java.util.concurrent.Executors
  * | tab | 放什么 |
  * | --- | --- |
  * | **首页** | 一张「前提检查表」：运行环境 + 权限三行 → 缺项提示 → `[启动主动呼出]` |
- * | **功能** | 分三节：呼出与触感（主动呼出与轮盘 / 更多面板 / 触感）、应用与图标（管理应用 / 图标）、小窗（小窗关闭方式） |
+ * | **功能** | 分三节：呼出与触感（主动呼出与轮盘 / 更多面板 / 触感）、应用与图标（管理应用 / 图标）、小窗（小窗尺寸 / 小窗关闭方式） |
  * | **设置** | 「常规」（后台隐藏）/「备份与恢复」/「调试」（运行日志）/「关于」（一行入口 → [AboutActivity]）四节 |
  *
  * ## 区块标题：只有「功能」「设置」两格有
@@ -152,6 +152,18 @@ class MainActivity : Activity() {
     }
 
     /**
+     * 「主动呼出服务**起来了 / 停了**」→ 重刷那颗按钮。
+     *
+     * 服务是**异步**起来的（`startForegroundService` + 冷启动进程 + 服务 `onCreate`），
+     * 界面原来只在点按钮后**固定 400ms** 刷一次（见 [toggleService]），追不上时按钮就停在
+     * 「启动主动呼出」，而触摸条其实已经能用了（2026-10-10 用户报：重启应用后按钮才变回
+     * 「停止主动呼出」，但服务一直是跑着的）。机制见 [ServiceEvents]。
+     */
+    private val serviceStateListener: () -> Unit = {
+        if (!isFinishing && !isDestroyed) refreshStatus()
+    }
+
+    /**
      * 「后台隐藏」：用户主动离开应用时，把整个 task 结束并移出「最近任务」。
      * 为什么必须逐个 Activity 挂、为什么不用别的 API，都写在 [AppContext.hideFromRecentsOnLeave]。
      */
@@ -184,6 +196,9 @@ class MainActivity : Activity() {
         // **先挂监听、再刷状态**：反过来的话，「刷状态」与服务「连上」挤在同一瞬间时，
         // 那次回调会因为监听还没挂上而丢掉，界面就停在旧状态（用户报的「重进后显示未开启」）。
         FreeformAccessibilityService.addConnectionListener(a11yConnectionListener)
+        // 同理：服务「起来 / 停了」的通知也要在刷状态**之前**挂上（见 [ServiceEvents]），
+        // 否则服务恰好在「挂监听」与「刷状态」之间起来时，那一拍会被丢掉。
+        ServiceEvents.addListener(serviceStateListener)
         refreshStatus()
         // Shizuku 服务可用时自动重连/恢复授权，减少系统重启、软件更新后手动再点。
         ShizukuShell.startAutoReconnect()
@@ -211,6 +226,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         FreeformAccessibilityService.removeConnectionListener(a11yConnectionListener)
+        ServiceEvents.removeListener(serviceStateListener)
         UpdateCenter.removeListener(updateBadgeListener)
         SettingsEvents.removeListener(panelChangeListener)
         worker.shutdown()
@@ -354,7 +370,13 @@ class MainActivity : Activity() {
         shizukuRow =
             permissionRow(
                 name = "Shizuku",
-                detail = "增强项，可选",
+                // ⚠️ 别再写成「增强项，可选」（2026-10-10 用户指出不对）。
+                // 「可选」只对**主动呼出**成立（那条路 DirectStart 优先，Shizuku 只是兜底）；
+                // 但 **窗内关闭**（单击小横条）**必需** —— 它的开关本身就被 Shizuku 卡着
+                // （`OutsideTapSettingsActivity` 里 `enabled = ShizukuShell.hasPermission`），
+                // **横条自动定位**也必需（读系统日志要 shell 身份）。
+                // 写法对齐同一张卡里的其它行（「主动呼出必需」/「窗外关闭 · 识屏 · 截屏」）。
+                detail = "窗内关闭 · 横条定位",
                 grantedText = "已授权",
                 actionText = "去授权",
             ) {
@@ -511,51 +533,51 @@ class MainActivity : Activity() {
         //   但是说明魅族已经支持，因为我们就是仿的 flyme」）：Flyme 上**不能说「不支持」**——
         //   人家系统本来就带小窗，这套交互还是照它做的。
         val freeformState = SystemSupport.freeformState(this)
+        val freeformCards = CardGroup(this)
+        // 「小窗尺寸」**只有 AOSP 形态有**：ColorOS 的窗口大小由系统自己定，我们一个像素都不碰，
+        // 所以那一形态下**不列这一行**（不置灰 —— 摆了只会让人以为是我们没实现）。
+        if (freeformState == SystemSupport.FreeformState.AOSP) {
+            freeformCards.row(
+                Ui.entryRow(
+                    this,
+                    "小窗尺寸",
+                    "竖屏 ${store.aospFreeformScalePercent}% · " +
+                        "横屏 ${store.aospFreeformScalePercentLandscape}%",
+                ) {
+                    openPage(Intent(this, FreeformSizeActivity::class.java))
+                },
+            )
+        }
         val closeModeRow =
             Ui.entryRow(
                 this,
-                if (freeformState == SystemSupport.FreeformState.AOSP) "小窗" else "小窗关闭方式",
+                "小窗关闭方式",
                 when (freeformState) {
-                    SystemSupport.FreeformState.OURS -> "窗外点击 / 窗内小横条"
-                    SystemSupport.FreeformState.AOSP ->
-                        if (ShizukuShell.hasPermission) {
-                            "系统小窗 · 尺寸 ${store.aospFreeformScalePercent}%"
-                        } else {
-                            "系统小窗 · 需要 Shizuku"
-                        }
+                    // ★ OURS 与 AOSP **同一句**（2026-10-10）：两家的关闭动作同源 ——
+                    //   窗外盖遮罩接住点击 + 窗内小横条补一记上滑（见 [CaptionTapClose] /
+                    //   [OutsideTapSettingsActivity]），各写一份只会说岔。
+                    SystemSupport.FreeformState.OURS,
+                    SystemSupport.FreeformState.AOSP,
+                    -> "窗外点击 / 窗内小横条"
                     SystemSupport.FreeformState.NATIVE -> "Flyme 原生小窗，无需启用"
                     SystemSupport.FreeformState.NONE -> "当前系统不支持"
                 },
             ) {
                 openPage(Intent(this, OutsideTapSettingsActivity::class.java))
             }
-        // ★ AOSP 形态也**要能点进去** —— 那一页在它上面装着「小窗尺寸」这一个能用的旋钮
-        //   （ColorOS 专属的关闭方式那一批在页内按形态隐藏，见 OutsideTapSettingsActivity）。
+        // ⚠️ [Ui.setRowEnabled] 必须在 [CardGroup.row] **之前**调：CardGroup 是看 `clickable`
+        //    决定刷不刷涟漪的，装完再压会留下「灰的还能点」。
         Ui.setRowEnabled(
             closeModeRow,
             freeformState == SystemSupport.FreeformState.OURS ||
                 freeformState == SystemSupport.FreeformState.AOSP,
         )
-        featureTab.addView(CardGroup(this).row(closeModeRow))
+        freeformCards.row(closeModeRow)
+        featureTab.addView(freeformCards)
         when (freeformState) {
-            SystemSupport.FreeformState.OURS -> Unit
-            // AOSP 形态（vivo / 小米）：**启动**这条路已经按标准参数写好（windowingMode 5），
-            // 但「关闭方式」（点窗外 / 小横条上滑）是照 ColorOS 的窗口形态做的 ⇒ 说清楚只通一半。
-            // ★ 2026-10-09 真机（HyperOS）反馈补齐了两条必须写出来的前提：
-            //   ① **需要 Shizuku** —— 普通应用直接 startActivity 会被系统限制，而且会弹一次
-            //      「Flyme 小窗 想要打开 XX，是否允许？」的后台弹出确认框；shell 身份没有这个问题。
-            //   ② **尺寸是我们自己补的** —— 系统默认那档小得离谱（实测占屏 31%×28%）。
-            SystemSupport.FreeformState.AOSP ->
-                featureTab.addView(
-                    Ui.hint(
-                        this,
-                        "**系统自带 AOSP 形态的小窗**：靠 **Shizuku** 用标准参数把应用按小窗打开" +
-                            "（没连上 Shizuku 时会退成全屏，系统还会弹一次「想要打开 XX」的确认框）；" +
-                            "尺寸由本应用设成" +
-                            "**屏幕的 ${store.aospFreeformScalePercent}%**。" +
-                            "「关闭方式」（点窗外 / 小横条上滑）依赖 ColorOS 的窗口形态，这里还没适配。",
-                    ),
-                )
+            // OURS / AOSP 都不加 hint：这两档下小窗是能用的，上面两行已经说清「尺寸」和
+            // 「关闭方式」，再补一段解释只是噪音（用户 2026-10-10：「那个注释删了，没什么用」）。
+            SystemSupport.FreeformState.OURS, SystemSupport.FreeformState.AOSP -> Unit
             SystemSupport.FreeformState.NATIVE ->
                 featureTab.addView(
                     Ui.hint(
@@ -1250,6 +1272,8 @@ class MainActivity : Activity() {
             store.enabled = true
             OverlayGestureService.start(this)
         }
+        // 主路径已经是 [ServiceEvents] 的通知（服务 `onCreate` / `onDestroy` 各喊一声，界面立刻
+        // 重刷）；这一拍留着当兜底，防通知恰好没到。
         mainHandler.postDelayed({ refreshStatus() }, 400L)
     }
 

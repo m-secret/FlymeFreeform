@@ -48,6 +48,17 @@ android {
     buildTypes {
         getByName("debug") {
             sharedSigning?.let { signingConfig = it }
+            // 本地调试包在版本号后带 `-debug`（用户 2026-10-10：「本地调试输出的带 debug，
+            // 发版用不带的」）—— 装到机器上一眼能分清手里这个是调试包还是发版包。
+            //
+            // ★★ 为什么不能只按 buildType 分：**本项目发版用的也是 debug 构建**
+            //    （见 `TOOLING.md`，`assembleDebug` 出包），release 那条路开着 R8 优化、
+            //    行为和平时测的不是同一个包，不能拿它发版。
+            //    所以发版时在命令行传空值把这个后缀关掉：
+            //        ./gradlew :app:clean :app:assembleDebug -PflymeFreeformDebugSuffix=
+            //    命令行 `-P` 优先于任何配置文件，且空串会被 `getOrElse` 原样返回（不是 null）。
+            versionNameSuffix =
+                providers.gradleProperty("flymeFreeformDebugSuffix").getOrElse("-debug")
         }
         release {
             sharedSigning?.let { signingConfig = it }

@@ -107,6 +107,28 @@ object AospFreeform {
      */
     const val LAUNCH_FLAGS = 268500992
 
+    /**
+     * AOSP 形态的启动参数：**必须带 bounds**。
+     *
+     * ## 带 / 不带 bounds 的实测差别（小米 15 / HyperOS 4.0）
+     *
+     * | | 实际窗口 |
+     * | --- | --- |
+     * | **带** bounds | 1200×1800（正常大小） |
+     * | **不带** bounds | **298×817**（宽只有 298，屏上就是一条「小胶囊」） |
+     *
+     * ⇒ 「不传 bounds、让系统自己决定」这条路是**错的**：系统会退到自由窗的**最小默认**。
+     * 用户 2026-10-10 的原话：「现在直接打出来一个特小的胶囊状小窗」。
+     *
+     * ## 但传进去的 bounds 会被系统**改**，所以得算准
+     *
+     * `setLaunchBounds` 调用成功（日志 `ok=true`），可 `system_server` **只认一部分**：
+     * 宽度它照用（我们 1205 → 它 1200），**高度却按自己的口径重算**（我们 803 → 它 1800）。
+     * 差一倍多 ⇒ 用户看到的「先出来一半、再上下撑开」。
+     *
+     * ⇒ 真正要修的是 [AospFreeformWindow.bounds] 里那个「高 ÷ 宽」口径（见那里的说明）：
+     * 把它算准，这一跳自然就没了。
+     */
     fun bundle(context: Context): Bundle =
         Bundle().apply {
             putInt(WINDOWING_MODE_KEY, WINDOWING_MODE)
@@ -192,25 +214,41 @@ object MiuiFreeformOptions {
     /**
      * 让小米自己配一份「按小窗打开 [packageName]」的 [ActivityOptions]（含 bounds 与缩放）。
      * 拿不到就返回 null。
+     *
+     * ⚠️ **bounds 为 null 不当失败**：小米完全可能**不设 bounds**、让 ROM 自己挑默认位置与尺寸
+     * （`POS_AUTO` 那条重载就是明证）。只有「设了 bounds 但落在屏幕外」才算不靠谱 ——
+     * 真机上第一版就是拿「非空」当硬条件，结果把小米那份**误杀**了，日志里只剩
+     * 「有入口但取不到」，白丢一次机会。
      */
     fun build(context: Context, packageName: String): ActivityOptions? {
-        val method = factoryMethod() ?: return null
-        val args: Array<Any?> =
-            when (method.parameterTypes.size) {
-                3 -> arrayOf(context, packageName, true)
-                4 -> arrayOf(context, packageName, true, false)
-                5 -> arrayOf(context, packageName, true, POS_AUTO, POS_AUTO)
-                else -> return null
-            }
-        val options =
-            runCatching { method.invoke(null, *args) }.getOrNull() as? ActivityOptions ?: return null
-        // 校验：必须带一份**落在屏幕内**的 bounds。宁可不用，也不要拿着一份看不懂的
-        // ActivityOptions 去启动 —— 那会把窗口扔到屏幕外或者撑成全屏。
-        val bounds = runCatching { options.launchBounds }.getOrNull() ?: return null
-        if (bounds.isEmpty) return null
-        val display = displayBounds(context) ?: return null
-        if (!display.contains(bounds)) return null
-        return withoutFreeformAnimation(options)
+        val factory = findFactory() ?: return null
+        val options = invoke(context, packageName, factory) ?: return null
+        val bounds = runCatching { options.launchBounds }.getOrNull() ?: return options
+        if (bounds.isEmpty) return options
+        val display = displayBounds(context)
+        // 读不到屏幕尺寸时**不拒**（宁可用它，也别因为读不到分辨率就放弃官方那份）。
+        if (display != null && !display.contains(bounds)) return null
+        return options
+    }
+
+    /**
+     * 探针：把「入口在不在、调用成不成、拿到的几何是什么」一次说清。
+     *
+     * 只给日志用 —— 真机上这三个问题必须一眼可辨，否则只能靠猜（第一版就是因为诊断太粗，
+     * 「方法找到了但调用失败」和「调用成了但 bounds 被我们拒了」长得一模一样）。
+     */
+    fun probe(context: Context, packageName: String): String {
+        val factory = findFactory() ?: return "miui=无入口"
+        val tag = "${factory.declaringClass.simpleName}#${factory.parameterTypes.size}"
+        val args = arguments(context, packageName, factory.parameterTypes.size) ?: return "miui=$tag 参数个数不支持"
+        val result = runCatching { factory.invoke(null, *args) }
+        result.exceptionOrNull()?.let { error ->
+            return "miui=$tag 调用失败 ${error.javaClass.simpleName}: ${error.message?.take(90)}"
+        }
+        val options = result.getOrNull() as? ActivityOptions
+            ?: return "miui=$tag 返回的不是 ActivityOptions（${result.getOrNull()?.javaClass?.name}）"
+        val bounds = runCatching { options.launchBounds }.getOrNull()
+        return "miui=$tag 成功 bounds=${bounds?.flattenToString() ?: "null"} scale=${scaleOf(options)}"
     }
 
     /**
@@ -230,36 +268,63 @@ object MiuiFreeformOptions {
         }.getOrDefault(Float.NaN)
 
     /**
-     * 小米**自己**会给小窗用多大的矩形（`MiuiMultiWindowUtils.getFreeformRect` /
-     * `getDefaultFreeformRect`）。
+     * 给日志用的一句话：小米那套入口的调用结果 + 两个「默认矩形」的口径 + **当前开着的自由窗几何**。
      *
-     * **只读、不参与启动** —— 我们不用它当尺寸（它返回的是**逻辑**尺寸，跟我们的
-     * 「任务边界 = 屏幕实际占比」不是同一个口径，混用会算错），只写进日志，
-     * 好让下一轮拿它跟我们的 `want=` 对比、决定默认值该定多少。
-     */
-    fun nativeRect(context: Context): Rect? =
-        listOf("getFreeformRect", "getDefaultFreeformRect").firstNotNullOfOrNull { name ->
-            runCatching {
-                val cls = classOrNull(MULTI_WINDOW_UTILS_CLASS) ?: return null
-                cls.getMethod(name, Context::class.java).invoke(null, context) as? Rect
-            }.getOrNull()
-        }
-
-    /**
-     * 给日志用的一句话：小米原生的 bounds 与缩放各是多少。
-     *
-     * **只读、不参与启动** —— 放在尺寸补偿那个后台线程里调，是为了拿到官方口径跟我们自己
-     * 算出来的值对比（下一轮真机排查就看这一行）。
+     * **只读、不参与启动** —— 它回答的是「官方口径是多少」，好让我们决定自己的尺寸该定多少。
      */
     fun describe(context: Context, packageName: String): String {
-        val rect = nativeRect(context)?.flattenToString() ?: "?"
-        if (factoryMethod() == null) return "miui=无入口 默认rect=$rect"
-        val options = build(context, packageName)
-        if (options == null) return "miui=有入口但取不到（bounds 空或越界） 默认rect=$rect"
-        val bounds = runCatching { options.launchBounds }.getOrNull()
-        return "miui=原生 bounds=${bounds?.flattenToString() ?: "?"} " +
-            "scale=${scaleOf(options)} 默认rect=$rect"
+        val rect =
+            listOf("getFreeformRect", "getDefaultFreeformRect").joinToString("/") { name ->
+                val value = callStaticRect(name, context)
+                if (value == null) "$name=?" else "$name=${value.flattenToString()}"
+            }
+        return probe(context, packageName) + " | " + rect + " | " + stacksProbe()
     }
+
+    /**
+     * 读 `MiuiFreeFormManager.getAllFreeFormStackInfosOnDisplay(0)`，把**当前每个自由窗**的
+     * `bounds`（逻辑）与 `smallWindowBounds`（屏上实际看到的）打出来。
+     *
+     * ★ 这两个值的比就是那层**自由窗缩放**（`mFreeformScale`）—— 也就是「应用按多大排版、
+     * 屏幕上缩到多小」。它决定我们 `am task resize` 该往哪儿调：**要的是屏上大小，得按逻辑尺寸反推**。
+     *
+     * 出处：`Leaf-lsgtky/MeiWindow` 拆 jar 时记下的字段表（`packageName / bounds /
+     * smallWindowBounds / visible / windowState / inPinMode`）。⚠️ 它同时记了一条反面证据：
+     * 他们那台机器上这个方法**返回空**（疑与调用方 uid 有关）⇒ 所以这里把「空」也如实打出来。
+     */
+    private fun stacksProbe(displayId: Int = 0): String {
+        val cls = classOrNull(MANAGER_CLASS)
+            ?: return "stacks=类不在"
+        val raw =
+            runCatching {
+                cls.getMethod("getAllFreeFormStackInfosOnDisplay", Int::class.javaPrimitiveType)
+                    .invoke(null, displayId) as? List<*>
+            }.getOrNull() ?: return "stacks=调不到"
+        if (raw.isEmpty()) return "stacks=空"
+        return raw.mapNotNull { info ->
+            info ?: return@mapNotNull null
+            val c = info.javaClass
+            fun field(name: String): Any? = runCatching { c.getField(name).get(info) }.getOrNull()
+            val pkg = field("packageName") as? String ?: return@mapNotNull null
+            val bounds = field("bounds") as? Rect
+            val small = field("smallWindowBounds") as? Rect
+            val ratio =
+                if (bounds != null && small != null && bounds.width() > 0) {
+                    "scale=%.3f".format(small.width().toFloat() / bounds.width())
+                } else {
+                    "scale=?"
+                }
+            "$pkg bounds=${bounds?.flattenToString() ?: "?"} " +
+                "small=${small?.flattenToString() ?: "?"} $ratio state=${field("windowState")}"
+        }.joinToString(" ; ").ifEmpty { "stacks=无可解析项" }
+    }
+
+    /** 调 `MiuiMultiWindowUtils` 上那类「返回 Rect」的静态方法，拿不到就 null。 */
+    private fun callStaticRect(methodName: String, context: Context): Rect? =
+        runCatching {
+            val cls = classOrNull(MULTI_WINDOW_UTILS_CLASS) ?: return null
+            cls.getMethod(methodName, Context::class.java).invoke(null, context) as? Rect
+        }.getOrNull()
 
     /** 小米的 `setFreeformAnimation(false)` —— 它自己的小窗启动也关掉这个动画。 */
     private fun withoutFreeformAnimation(options: ActivityOptions): ActivityOptions {
@@ -272,7 +337,7 @@ object MiuiFreeformOptions {
     }
 
     /** 在候选表里找第一个**类加载得到、方法也在**的组合。 */
-    private fun factoryMethod(): Method? {
+    private fun findFactory(): Method? {
         for ((className, paramTypes) in FACTORIES) {
             val cls = classOrNull(className) ?: continue
             val method =
@@ -282,6 +347,51 @@ object MiuiFreeformOptions {
             if (Modifier.isStatic(method.modifiers)) return method
         }
         return null
+    }
+
+    /** 按参数个数拼实参；`5` 参那条的落点用 [POS_AUTO]（= 让 ROM 自己决定位置）。 */
+    private fun arguments(context: Context, packageName: String, paramCount: Int): Array<Any?>? =
+        when (paramCount) {
+            3 -> arrayOf(context, packageName, true)
+            4 -> arrayOf(context, packageName, true, false)
+            5 -> arrayOf(context, packageName, true, POS_AUTO, POS_AUTO)
+            else -> null
+        }
+
+    /** 调一次工厂；失败或者返回的不是 `ActivityOptions` 都返回 null。 */
+    private fun invoke(context: Context, packageName: String, factory: Method): ActivityOptions? {
+        val args = arguments(context, packageName, factory.parameterTypes.size) ?: return null
+        val options = runCatching { factory.invoke(null, *args) }.getOrNull() as? ActivityOptions
+        return options?.let(::withoutFreeformAnimation)
+    }
+
+    /**
+     * 这台机器是不是**小米**（MIUI / HyperOS）—— 判据是「小米的自由窗类在不在」，
+     * 与 [SystemSupport] 探 ColorOS 同一思路：判据留在能力所在的对象上，不用品牌名。
+     */
+    fun isAvailable(): Boolean =
+        classOrNull(MANAGER_CLASS) != null || classOrNull(MULTI_WINDOW_UTILS_CLASS) != null
+
+    /**
+     * 当前**还开着**的自由窗的**逻辑** bounds（`getAllFreeFormStackInfosOnDisplay`）。
+     *
+     * 用途：算「这次要开的窗是这一侧的第几个」—— 小米原生横屏是**同一侧叠加**的，
+     * 第 2、4、6…个会往中间让开一点（见 [AospFreeformWindow.bounds]）。
+     *
+     * 拿不到（类不在 / 调用被拒 / 返回空）就返回空列表 —— 调用方按「第 1 个」处理。
+     * 这条是**进程内**的 binder 调用，不走 shell，够快。
+     */
+    fun currentFreeformBounds(displayId: Int = 0): List<Rect> {
+        val cls = classOrNull(MANAGER_CLASS) ?: return emptyList()
+        val raw =
+            runCatching {
+                cls.getMethod("getAllFreeFormStackInfosOnDisplay", Int::class.javaPrimitiveType)
+                    .invoke(null, displayId) as? List<*>
+            }.getOrNull() ?: return emptyList()
+        return raw.mapNotNull { info ->
+            info ?: return@mapNotNull null
+            runCatching { info.javaClass.getField("bounds").get(info) as? Rect }.getOrNull()
+        }
     }
 
     private fun classOrNull(className: String): Class<*>? =
@@ -342,19 +452,468 @@ object MiuiFreeformOptions {
  */
 object AospFreeformWindow {
 
-    /** 目标窗口边界（px）。读不到真实屏幕尺寸时返回 null，调用方就当没有这一项。 */
+    /**
+     * 这次是从哪一边呼出的：`-1` 左 / `+1` 右 / `0` 不知道（居中）。
+     *
+     * ## 为什么要它（2026-10-10 用户实测描述）
+     *
+     * 小米原生小窗在**横屏**下是**贴呼出边**的：「左边呼出就在屏幕左边，右边呼出就在右边」。
+     * 我们原来一律居中，横屏下左右各留一大块空，和原生对不上。
+     *
+     * 竖屏不受影响（那边一直是居中的小窗，用户没提），所以只在下标为横屏时用它。
+     *
+     * ★ 用进程内静态值而不是传参：[bounds] 是在**后台线程**上被调的（整条启动链路都在
+     * worker 里跑），传参要改一整条调用链（`launch` → `FreeformLauncher` → 策略 → 这里）。
+     * 写入点是 [OverlayGestureService.launch]，那是唯一知道「用户从哪个角呼出」的地方。
+     */
+    @Volatile
+    var launchSide: Int = 0
+
+    /**
+     * 本应用**这一轮**已经开出去几个小窗，用来算「第几个」。
+     *
+     * ⚠️ 为什么不能只信系统那份列表（[MiuiFreeformOptions.currentFreeformBounds]）：
+     * 实测它**会饱和** —— 开够几个以后列表长度不再涨，`index` 就卡住不动了。
+     * 真机表现（2026-10-10）：
+     * - 横屏：同侧**从第 4 个起全叠在第 3 个的位置上**（系统只数得到 2 个同侧窗）；
+     * - 竖屏：第 5 个之后又全叠加回位置 1。
+     * 所以这里自己数一份，取两者**较大值**；系统说「一个都没有」时归零。
+     *
+     * 写入点是 [OverlayGestureService.launch] 成功之后（一次启动只 +1，别放在 [bounds] 里
+     * —— 那条路一次启动可能被调不止一次）。
+     */
+    @Volatile
+    private var launchedCount: Int = 0
+
+    /**
+     * 横屏**左侧**已开出的窗数，见 [launchedCount]。
+     *
+     * ★ 横屏两侧是**各自独立**叠加的（左呼出贴左、右呼出贴右），所以必须分左右数 ——
+     * 用一个总数会让「左边开 2 个、右边再开 1 个」算成第 3 个，位置直接跳掉。
+     */
+    @Volatile
+    private var launchedLeft: Int = 0
+
+    /** 横屏**右侧**已开出的窗数，见 [launchedCount]。 */
+    @Volatile
+    private var launchedRight: Int = 0
+
+    /**
+     * [bounds] 最近一次看到的方向。
+     *
+     * [noteLaunched] 是从 [OverlayGestureService] 调的、**拿不到 context**，没法自己判方向，
+     * 所以由 [bounds] 顺手记一笔（它在每次启动时都会被调，且**先于** [noteLaunched]）。
+     */
+    @Volatile
+    private var lastLandscape: Boolean = false
+
+    /** 小窗成功开出去一个（见 [launchedCount]）。 */
+    fun noteLaunched() {
+        if (lastLandscape) {
+            // 横屏：分左右各记一份。
+            if (launchSide < 0) {
+                launchedLeft++
+            } else if (launchSide > 0) {
+                launchedRight++
+            }
+        } else {
+            // 竖屏：不分左右，按总数记（见 [portraitCascadeShift]）。
+            launchedCount++
+        }
+    }
+
+    /**
+     * 系统对「**超出屏幕**的逻辑矩形」施加的固定缩放（2026-10-09 在小米 15 / HyperOS 4.0 实测）。
+     *
+     * 两组数据都是 0.70：原生小窗逻辑 1200×1920 → 屏上 840×1344；我们塞全屏矩形
+     * 1200×2670 → 屏上 840×1869。锚点在**逻辑左上角**（视觉 left/top = 逻辑 left/top）。
+     * 与矩形大小无关，是系统写死的（`MeiWindow`、`FanFreeform` 也都记着 0.7 / `mFreeformScale`）。
+     *
+     * ⚠️ 这是**默认值**：小米上可由 [XiaomiFreeformCalibration] 真机校准后覆盖（见 [scaleFactor]）。
+     */
+    private const val DEFAULT_FREEFORM_SCALE = 0.7f
+
+    /** 原生小窗**视觉**宽高比（实测 840×1344 ⇒ 1.6）的默认值。 */
+    private const val DEFAULT_VISUAL_ASPECT = 1.6f
+
+    /**
+     * 横屏**位置 1 距呼出边**的偏移量（px）—— **固定值，不跟设置走**。
+     *
+     * 实测（小米 15 / HyperOS 4.0，横屏 2670×1200）：系统同侧第 1 个逻辑 `left=1938`
+     * （= `edge + 234px`）、第 2 个 `left=1704`（= `edge`）⇒ 距边缘 **234px ≈ 78dp**。
+     *
+     * ⚠️ 它和「两个位置的间距」是**两回事**：位置 1 由它钉死，用户调的是间距
+     * （[SettingsStore.aospFreeformCascadeDpLandscape]）。曾经两者共用一个 `step`，
+     * 结果**一调间距就把第一个小窗也挪走**（用户 2026-10-10 报的 bug）。
+     */
+    private const val LANDSCAPE_EDGE_BASE_DP = 78
+
+    /**
+     * 横屏**两个位置之间的距离**（px）—— **用户可调**。
+     *
+     * 位置 1 固定在 [LANDSCAPE_EDGE_BASE_DP] 处，位置 2 = 位置 1 再**朝屏幕中间**让这么多。
+     * 取默认 78dp 时与实测完全一致：左侧 78 / 156，右侧 `edge + 78` / `edge`。
+     */
+    private fun landscapeCascadeStepPx(context: Context): Int =
+        dpToPx(context, SettingsStore(context).aospFreeformCascadeDpLandscape)
+
+
+    /**
+     * 当前该用的缩放：**只有小米**才认校准值，其余一律用 [DEFAULT_FREEFORM_SCALE]。
+     *
+     * ★ **横竖屏各一套**（2026-10-10 用户：「校准支持横屏和竖屏，两个应该是独立的参数」）——
+     * 校准值按方向分开存，所以这里必须知道方向。
+     */
+    fun scaleFactor(context: Context, landscape: Boolean): Float =
+        if (MiuiFreeformOptions.isAvailable()) {
+            SettingsStore(context).aospFreeformScaleMilliOf(landscape) / 1000f
+        } else {
+            DEFAULT_FREEFORM_SCALE
+        }
+
+    /** 当前该用的视觉宽高比，见 [scaleFactor]。 */
+    fun aspect(context: Context, landscape: Boolean): Float =
+        if (MiuiFreeformOptions.isAvailable()) {
+            SettingsStore(context).aospFreeformAspectMilliOf(landscape) / 1000f
+        } else {
+            DEFAULT_VISUAL_ASPECT
+        }
+
+    /**
+     * 交给系统的**逻辑**窗口矩形（px）。读不到真实屏幕尺寸时返回 null，调用方就当没有这一项。
+     *
+     * ★★ **必须给逻辑矩形，不能给「屏幕上看到的大小」** —— 这是 2026-10-09 真机取证换来的结论。
+     *
+     * ## 小米 / 澎湃的 freeform 是「逻辑矩形 + 固定缩放」
+     *
+     * 拿 HyperOS 4.0（小米 15 / 1200×2670）实测的原生小窗当基准：
+     *
+     * | | 逻辑 bounds | 屏幕上实际看到 |
+     * |---|---|---|
+     * | 原生小窗 | `[259,589][1459,2509]` = **1200×1920**（右边界 1459 **超出**屏幕 1200） | `[259,589][1099,1933]` = **840×1344** |
+     * | 我们塞全屏矩形 | `[0,0][1200,2670]` | `[0,0][840,1869]` |
+     *
+     * 两组的比值都是 **0.70** ⇒ 系统会把「超出屏幕的逻辑矩形」整体缩到 **0.7 倍**，
+     * 锚点在**逻辑左上角**（视觉 left/top = 逻辑 left/top）。缩放系数是系统写死的，
+     * 与矩形大小无关（`Leaf-lsgtky/MeiWindow` 与 `oxohang/FanFreeform` 也都记着
+     * 「normally 0.7」/`mFreeformScale`）。
+     *
+     * ## 于是原生的做法是
+     *
+     * 逻辑宽取**整屏宽**、逻辑高取**屏幕高的约 0.72**（1200×1920），再让系统缩到 840×1344
+     * —— 屏幕上就是「**缩小版的手机**」：应用仍按 400dp 排版，只是整体缩小，
+     * 而不是被塞进一个 284dp 的窄窗口里重排。
+     *
+     * ## 我们错在哪（用户 2026-10-09：「小窗还是比例不对」「这才是正确的大小」）
+     *
+     * 原来直接把 `视觉尺寸`（852×1895）当逻辑矩形交给 `am task resize`，于是
+     * ① 系统不再缩放（矩形没超出屏幕）⇒ 应用按 284dp 重排，不是缩小版；
+     * ② 形状也不对：我们的等比是 0.449（屏幕比例），原生是 0.625 —— 窗口看着「又瘦又长」。
+     *
+     * 现在改成：**先算「想要多大（屏幕上）」，再除以 0.7 得到逻辑矩形**。
+     *
+     * @return 逻辑矩形；`右/下` 会**故意超出屏幕**，那是正常的（系统就靠这个触发缩放）。
+     */
     fun bounds(context: Context): Rect? {
         val size = displaySizePx(context) ?: return null
-        val width = size.first
-        val height = size.second
-        if (width <= 0 || height <= 0) return null
-        val percent = SettingsStore(context).aospFreeformScalePercent
-        val w = (width * percent / 100).coerceAtLeast(1)
-        val h = (height * percent / 100).coerceAtLeast(1)
-        val left = (width - w) / 2
-        val top = (height - h) / 2
-        return Rect(left, top, left + w, top + h)
+        val screenW = size.first
+        val screenH = size.second
+        if (screenW <= 0 || screenH <= 0) return null
+        val store = SettingsStore(context)
+        // ★ 横竖屏各一套参数（用户 2026-10-10）—— 三个值都按方向取。
+        val landscape = screenW > screenH
+        // 记一笔方向：noteLaunched() 是从别处调的、拿不到 context，靠它分流计数（见 [lastLandscape]）。
+        lastLandscape = landscape
+        val percent = store.aospFreeformScalePercentOf(landscape)
+        val aspect = aspect(context, landscape)
+        // ★★ 基准是**短边**，不是屏宽（2026-10-10 用户：「横屏…你呼出的太小了」）。
+        //
+        // 竖屏短边**就是**屏宽，所以这一改竖屏一个像素都不动；横屏短边是**屏高**（本机
+        // 1200），于是窗口不会再被「2670 那么宽」的屏幕撑大、也不会反过来被压小。
+        //
+        // 对照真机：小米原生小窗的逻辑 bounds 是 **1200×1800**（`am stack list` 实测，
+        // 横屏），它的宽也正好是短边 1200 —— 这就是"该有多大"的官方口径。
+        // 我们 percent=70 时得 1200×1920，与它基本一致。
+        val shortEdge = minOf(screenW, screenH)
+        val visibleW = shortEdge * percent / 100.0
+        // ★★ `aspect` 的口径要**归一成「高 ÷ 宽」**（2026-10-10 用户：「加载一半，然后上下拉伸」）。
+        //
+        // [XiaomiFreeformCalibration] 里 `aspect = 视觉高 ÷ 视觉宽`：竖屏原生小窗 ≈ **1.6**
+        // （高 > 宽，直接用），**横屏实测是 0.67（宽 > 高）** —— 可系统最终给出的逻辑矩形却是
+        // **1200×1800（高 ÷ 宽 = 1.5）**，两个口径是反的。
+        //
+        // 直接用 0.67 会算出一个「矮扁」矩形（高只有 803），系统随后把它拉到 1800
+        // ⇒ 用户看到的就是「先出来一半、再上下撑开」。取倒数之后高变成 ≈1800，与系统一致。
+        val ratio = if (aspect >= 1f) aspect else 1f / aspect
+        val visibleH = visibleW * ratio
+        // ★ 交出去的必须是逻辑矩形：系统会把它缩到 [scaleFactor] 倍（小米上可被校准覆盖）。
+        val scale = scaleFactor(context, landscape)
+        val logicalW = (visibleW / scale).toInt().coerceAtLeast(1)
+        val logicalH = (visibleH / scale).toInt().coerceAtLeast(1)
+        // 位置（视觉 left/top 就等于逻辑 left/top）：
+        // - **横屏**贴呼出边（见 [launchSide]）：左边呼出贴左、右边呼出贴右，与小米原生一致；
+        // - 竖屏、或不知道哪边呼出：居中（一直是这个行为，用户没提，别动）。
+        //
+        // ★★ 横屏：**每一侧只有两个位置**（2026-10-10 用户：「每一侧只开两个位置」）。
+        //
+        // - **左侧**：位置 1 距左边缘 `step`、位置 2 距左边缘 `2×step` —— 往里让，**完全在屏内**；
+        // - **右侧**：位置 1 贴右**再往外** `step`（`edge + step`）、位置 2 贴右（`edge`）——
+        //   保留小米原生的观感（会超出屏幕一个步长，那是系统的画法）。
+        //
+        // ★ 两侧的**偏移量（绝对值）相同**，只是方向相反：左侧朝**屏内**、右侧朝**屏外**
+        //   （用户 2026-10-10 拍板：「右侧保留原位置（贴右再往外）」+「左侧…往里留一步、完全在屏内」）。
+        //
+        // ⚠️ **别再写成「累进」**（`(第几个 − 1) × 步长`）—— 用户 2026-10-10 否了：
+        //    「现在每开一个就会向另一侧偏移，不对吧，每一侧只开两个位置」。
+        // ⚠️ **别再写 `left = 0`**（贴死左边缘）—— 「左侧呼出的贴边了，这是不对的」。
+        val edge = (screenW - visibleW).toInt()
+        // ★★ **位置 1 与「两个位置的间距」必须拆开**（用户 2026-10-10：
+        //   「叠加偏移横屏为什么调整的是第一个小窗的位置啊」）。
+        //   之前一个 `step` 同时当这两件事 ⇒ 调设置会把**第一个**小窗也挪走。
+        //   现在：位置 1 固定在实测的 [LANDSCAPE_EDGE_BASE_DP]（系统就是这个位置），
+        //   设置只管 `gap`（位置 2 相对位置 1 往里让多少）。
+        val gap = landscapeCascadeStepPx(context)
+        val base = dpToPx(context, LANDSCAPE_EDGE_BASE_DP)
+        // 偶数个再往里让一个 gap —— 与竖屏是同一套「两个位置」的规则。
+        val extra = if (sameSideIndex(screenW, landscape) % 2 == 0) gap else 0
+        // ★ 竖屏那一路的叠加偏移（用户 2026-10-10：「能给竖屏也加偏移的」）——
+        //   **只动水平**，方向朝屏幕中间（见 [portraitCascadeShift]）。横屏走 [extra]，不用它。
+        val portraitShift =
+            if (landscape) 0 else portraitCascadeShift(context, screenW, visibleW)
+        val left =
+            when {
+                // 左侧：位置 1 距左边缘 base（固定）、位置 2 再往里 gap —— 完全在屏内。
+                landscape && launchSide < 0 -> base + extra
+                // 右侧：位置 1 贴右再往外 base（固定）、位置 2 往回收 gap —— 保留原来的位置。
+                landscape && launchSide > 0 -> edge + base - extra
+                // 竖屏（或横屏但不知道哪边呼出）：居中；**偶数个朝右下角让开**（往右）。
+                else -> edge / 2 + portraitShift
+            }
+        // ★★ 纵向：从**状态栏下沿**开始，不是贴屏幕最顶，也不居中（2026-10-10 用户实测）。
+        //
+        // 两件事叠在一起：
+        // ① 横屏的窗视觉高 ≈1476，**本来就比屏高（1200）高**，居中算出来 `top = −138`（负值）
+        //    ⇒ 上半截被推出屏幕（「位置偏上了」「上小半被遮挡了」）；
+        // ② 但**从 0 起也不对** —— 小米原生实测 `top = 161`（= 状态栏高度），我们贴到 0 就
+        //    「都顶住上面了」。真机对照：系统窗 `[179,161]` vs 我们 `[1920,0]`。
+        //
+        // ★★ 纵向取值的**优先级**（2026-10-10 用户两轮拍板后定稿）：
+        //   ① **自定义**（设置页「自定义」档，可上下调）—— **只有竖屏认它**；
+        //   ② **跟随系统**（设置页默认档）：**校准过**就用校准读到的官方上沿
+        //      （[XiaomiFreeformCalibration.Result.topPercent]）；
+        //   ③ 还没校准过 ⇒ **整屏居中**兜底。
+        //
+        // ⚠️ ③ 是必须的：没校准过时 `aospFreeformTopInsetPercent` 只是**默认 13%**，
+        //    拿它当官方位置用会把窗顶到状态栏上（用户 2026-10-10：「紧贴着状态栏了，我也是服了」）。
+        //    「已校准」标记（[SettingsStore.aospFreeformTopCalibratedOf]）就是用来区分这两者的。
+        // ⚠️ ② 不能省 —— 用户 2026-10-10：「**现在校准没改小窗位置**」。光把值写进 prefs
+        //    是不够的，得有人读它（之前那一版把这一支摘了，校准就变成了纯摆设）。
+        //
+        // ★★ **横屏一律走 ③**（用户 2026-10-10：「横屏不要加，现在默认就是填满」）：
+        //    横屏的窗（视觉高 ≈1791）本来就比屏幕（1200）高，从状态栏下沿摆下去就是填满，
+        //    没有可调的余地；设置页那边也**只有竖屏那一组**。这里一并忽略，免得留下
+        //    「能设但设了没用」的隐藏状态（历史值还在 prefs 里，用户看不到也改不掉）。
+        //    横屏 `centeredPercent` 是负数 ⇒ 被 13% 兜住 ⇒ **横屏零变化**。
+        val centeredPercent = ((screenH - visibleH) / 2 * 100.0 / shortEdge).toInt()
+        val topPercent =
+            when {
+                // ① 用户手动调过那根「上沿」滑块 → 听用户的
+                //    ★ 判据是「**百分比那个键存过没有**」，不再是旧的 `aospFreeformTopCustom` 开关：
+                //      用户 2026-10-10 把「屏幕居中 / 自定义」二选去掉了（「自定义的设计还是很怪，
+                //      能不能直接加个横条」），现在只有一根滑块、拖了即生效 ——
+                //      "默认居中"由**没存过**来承担（见 `FreeformSizeActivity.currentTopPercent`）。
+                !landscape && store.aospFreeformTopCustomPercentSaved ->
+                    store.aospFreeformTopCustomPercent
+                // ② 校准过 → 跟随系统（校准读到的官方上沿）
+                !landscape && store.aospFreeformTopCalibratedOf(false) ->
+                    store.aospFreeformTopInsetPercentOf(false)
+                // ③ 都没 → 整屏居中兜底
+                else ->
+                    maxOf(SettingsStore.DEFAULT_AOSP_FREEFORM_TOP_INSET_PERCENT, centeredPercent)
+            }
+        val topInset = (shortEdge * topPercent / 100.0).toInt()
+        val baseTop = topInset
+        // ★★ 竖屏叠加是**右下角**（用户 2026-10-10 最终口径：「而不是右下」）——
+        //    **横竖都要让**：`left` 那边已经加了 portraitShift，这里再往下加一份。
+        //    加完**夹住**，不让窗口被推出屏幕下沿。
+        val topLimit = (screenH - visibleH).toInt()
+        val top =
+            if (topLimit > baseTop) {
+                (baseTop + portraitShift).coerceAtMost(topLimit)
+            } else {
+                baseTop
+            }
+        return Rect(left, top, left + logicalW, top + logicalH)
     }
+
+    /**
+     * 「**屏幕中间**」对应的上沿百分比（%）—— 给设置页那个快速选择用。
+     *
+     * 口径与 [bounds] 完全一致：窗高 = 短边 × percent% × 宽高比，居中后
+     * `top = (屏高 − 窗高) / 2`，再换算成占**短边**的百分比（可能为负，被夹到 0）。
+     *
+     * ★ 与当前屏幕方向**无关**：内部按 [landscape] 把长短边摆好，所以在横屏下也能算竖屏的值。
+     */
+    fun centeredTopPercent(context: Context, landscape: Boolean): Int {
+        val size = displaySizePx(context) ?: return 0
+        val shortEdge = minOf(size.first, size.second)
+        val longEdge = maxOf(size.first, size.second)
+        val screenH = if (landscape) shortEdge else longEdge
+        val store = SettingsStore(context)
+        val percent = store.aospFreeformScalePercentOf(landscape)
+        val aspect = aspect(context, landscape)
+        val ratio = if (aspect >= 1f) aspect else 1f / aspect
+        val visibleW = shortEdge * percent / 100.0
+        val visibleH = visibleW * ratio
+        val centered = ((screenH - visibleH) / 2 * 100.0 / shortEdge)
+        return Math.round(centered).toInt()
+            .coerceIn(
+                SettingsStore.MIN_AOSP_FREEFORM_TOP_INSET_PERCENT,
+                SettingsStore.MAX_AOSP_FREEFORM_TOP_INSET_PERCENT,
+            )
+    }
+
+    /**
+     * 这一侧已经开着几个自由窗 → 本次是**第几个**（从 1 起）。
+     *
+     * 数不出来（不是小米 / 类不在 / 调用被拒）就当第 1 个 —— 宁可不错位，也别乱让。
+     * 走 [MiuiFreeformOptions.currentFreeformBounds] 这条**进程内**的 binder 调用，不用 shell。
+     *
+     * ★★ 但**不能只信它**：那份列表会**饱和**（见 [launchedCount]）—— 真机实测系统只数得到
+     * 2 个同侧窗，于是从第 4 个起 `index` 卡在 3，用户看到的就是「**第 4 个起全叠在第 3 个
+     * 的位置上**」（2026-10-10）。所以取「系统数到的」与「我们自己数的（[launchedLeft] /
+     * [launchedRight]）」**较大值**；系统说一个都没有时两边一起归零。
+     */
+    private fun sameSideIndex(screenW: Int, landscape: Boolean): Int {
+        if (!landscape || launchSide == 0 || !MiuiFreeformOptions.isAvailable()) return 1
+        val all = MiuiFreeformOptions.currentFreeformBounds()
+        // 系统说「一个都没有」⇒ 用户把窗都关掉了，计数归零（不然会一直往后叠加）。
+        if (all.isEmpty()) {
+            launchedCount = 0
+            launchedLeft = 0
+            launchedRight = 0
+        }
+        val system = all.count { bounds ->
+            val center = bounds.left + bounds.width() / 2
+            if (launchSide < 0) center < screenW / 2 else center >= screenW / 2
+        }
+        val mine = if (launchSide < 0) launchedLeft else launchedRight
+        // 诊断：横屏叠加偶发异常时，第一件事就是看这一行（`idx` 决定落在位置 1 还是 2）。
+        DebugLog.info("AOSP_POS", "side=$launchSide system=$system mine=$mine idx=${maxOf(system, mine) + 1}")
+        return maxOf(system, mine) + 1
+    }
+
+    /**
+     * **竖屏**的叠加偏移量（px，**无符号**）：**第 2、4、6…个**让开一个步长。
+     *
+     * ★★ **只有两个位置**（用户 2026-10-10 拍板：「不要这样，要只有 1、2 两个位置」）：
+     * - 第 1、3、5…个 → **位置 1**（居中，老行为）；
+     * - 第 2、4、6…个 → **位置 2**（让开一个步长）。
+     *
+     * ★★ 方向 = **右下角**（用户 2026-10-10 拍板：「往右下角」）：水平往**右**、纵向往**下**
+     * 各让一个步长 ⇒ [bounds] 里 `left` 和 `top` **都要加**这个值。
+     *
+     * ⚠️ 曾写成「朝屏幕中间（右呼出就往左让）」—— 用户否了：
+     *    「竖屏第二个也变成向左侧水平偏移了」。**方向与呼出边无关，一律往右下。**
+     *
+     * ⚠️ 步长必须**小**：用横屏那个默认（[SettingsStore.aospFreeformCascadeDpLandscape] = 78dp = 234px）时，
+     * 位置 2 的右边界 1254 > 屏宽 1200（用户：「**偏移太大，都超出了屏幕**」）。
+     * 现在由用户自己调（[SettingsStore.aospFreeformCascadeDp]，默认 24dp），并且**夹住不出屏**。
+     *
+     * 「第几个」= 当前还开着的自由窗个数 + 1（竖屏按**总数**算）；数不出来就当第 1 个，不让开。
+     */
+    private fun portraitCascadeShift(context: Context, screenW: Int, visibleW: Double): Int {
+        if (!MiuiFreeformOptions.isAvailable()) return 0
+        val open = MiuiFreeformOptions.currentFreeformBounds().size
+        // 系统说「一个都没有」⇒ 用户把窗都关掉了，计数归零。
+        if (open == 0) launchedCount = 0
+        // ★ 取较大值：系统那份列表会**饱和**（实测到 4 就不涨了），单靠它算不到第 5 个往后。
+        val index = maxOf(open, launchedCount) + 1
+        if (index % 2 != 0) return 0
+        // 让开多少由用户定（[SettingsStore.aospFreeformCascadeDp]，0 = 不叠加）。
+        val stepDp = SettingsStore(context).aospFreeformCascadeDp
+        if (stepDp <= 0) return 0
+        // 居中的话左右各有这么多空余 —— 让开的量不许超过它，否则窗口会被推出屏幕。
+        val maxShift = ((screenW - visibleW) / 2).toInt().coerceAtLeast(0)
+        // ★ 方向**固定往右下**（用户 2026-10-10 最终口径：「竖屏也变成了向左偏移，而不是右下」）。
+        //   不再看呼出边 —— 曾按「左侧往右、右侧向左」做过一版，用户否了：右边呼出时看着是往左偏。
+        return dpToPx(context, stepDp).coerceAtMost(maxShift)
+    }
+
+    private fun dpToPx(context: Context, dp: Int): Int =
+        (dp * context.resources.displayMetrics.density).toInt()
+
+    /**
+     * AOSP 形态（小米 / vivo）**启动一个小窗的完整链路**，整段丢到后台线程一次跑完。
+     *
+     * ## 为什么是「一条 shell 跑完」
+     *
+     * 2026-10-09 在小米 15（HyperOS 4.0）上录屏取证：原来「主线程跑 `am start`，返回后再起
+     * 后台线程 + 轮询找任务 + `am task resize`」这套，会让窗口以**系统默认尺寸**
+     * （实测 587×1200 = 屏 49%×45%）停留 **约 1.2 秒**才跳到目标尺寸，而且两次的宽高比
+     * 还不一样（默认 0.489、我们的等比 0.449）⇒ 用户看到「弹出来一个、过一会儿又变一下」
+     * 并且中途**变形**（原话：「弹出变大再变小，比例也很奇怪」）。
+     *
+     * 现在把三步拼进**同一条 shell**：
+     *
+     * ```sh
+     * t=$(am stack list | … 找这个包的任务 …)      # 已有任务先放开「可调整」
+     * [ -n "$t" ] && am task resizeable $t 2
+     * am start --windowingMode 5 -f 268500992 -n <包>/<类>
+     * sleep 0.15                                    # 让窗口登记好（am start 是同步的）
+     * … 万一还没进自由窗（应用不可调整）→ 放开 + 再起一次 …
+     * am task resize $t <逻辑矩形>
+     * ```
+     *
+     * 主线程**立刻返回**（面板能马上收起），窗口从出现到目标尺寸只差那 0.15 秒。
+     *
+     * ⚠️ 代价：这条命令要跑 1 秒上下，所以**绝不能放主线程**（那会「点一下卡一秒」）。
+     * 也因此这里不做「失败重试/回退」——启动结果只写日志（`LAUNCH_FREEFORM`）。
+     */
+    fun launchInBackground(context: Context, target: LaunchTarget) {
+        val bounds = bounds(context) ?: return
+        val rect = "${bounds.left} ${bounds.top} ${bounds.right} ${bounds.bottom}"
+        val startCmd =
+            "am start --windowingMode ${AospFreeform.WINDOWING_MODE}" +
+                " -f ${AospFreeform.LAUNCH_FLAGS} -n ${target.flattened} >/dev/null 2>&1"
+        // 取「这个包的任务」那两行：`RootTask …`（带 mWindowingMode）+ `taskId=…`（带 taskId/bounds）。
+        val snapshot = "am stack list 2>/dev/null | grep -B1 '${target.packageName}/' | head -2"
+        val pickTask = "sed -n 's/.*taskId=\\([0-9]*\\).*/\\1/p' | head -1"
+        val pickMode = "sed -n 's/.*mWindowingMode=\\([a-z]*\\).*/\\1/p' | head -1"
+        val script =
+            buildString {
+                append("t=\$(").append(snapshot).append(" | ").append(pickTask).append(")\n")
+                append("[ -n \"\$t\" ] && am task resizeable \$t 2 >/dev/null 2>&1\n")
+                append(startCmd).append('\n')
+                // `am start` 是同步的（返回时 Activity 已 started），再给 150ms 让窗口登记进 WM。
+                append("sleep 0.15\n")
+                append("b=\$(").append(snapshot).append(")\n")
+                append("t=\$(echo \"\$b\" | ").append(pickTask).append(")\n")
+                append("m=\$(echo \"\$b\" | ").append(pickMode).append(")\n")
+                // 万一还是全屏（应用自己不可调整），放开「可调整」再起一次 —— 照 FanFreeform。
+                append("if [ -n \"\$t\" ] && [ \"\$m\" = \"fullscreen\" ]; then\n")
+                append("  am task resizeable \$t 2\n")
+                append("  ").append(startCmd).append('\n')
+                append("  sleep 0.25\n")
+                append("  t=\$(").append(snapshot).append(" | ").append(pickTask).append(")\n")
+                append("fi\n")
+                append("[ -n \"\$t\" ] && am task resize \$t ").append(rect).append('\n')
+                append("echo \"task=\$t mode=\$m want=").append(rect).append('"')
+            }
+        Thread(
+            {
+                val result = ShizukuShell.run(script, timeoutMs = LAUNCH_TIMEOUT_MS)
+                DebugLog.info(
+                    "LAUNCH_FREEFORM",
+                    "${target.flattened} ${(result.stdout + result.stderr).trim()}",
+                )
+            },
+            "aosp-freeform-launch",
+        ).start()
+    }
+
+    /** 启动那条链路的超时：`am start` + 两次 `am stack list` + `am task resize`，给足 20 秒。 */
+    private const val LAUNCH_TIMEOUT_MS = 20_000L
 
     /**
      * 起完小窗之后，在**后台线程**上把它的尺寸调成 [bounds]，顺手修「没进小窗」的情况。
@@ -427,11 +986,29 @@ object AospFreeformWindow {
         val pickBounds =
             "sed -n 's/.*bounds=\\[\\([0-9]*\\),\\([0-9]*\\)\\]\\[\\([0-9]*\\),\\([0-9]*\\)\\].*/\\1 \\2 \\3 \\4/p' | head -1"
         return buildString {
-            append("sleep 0.6\n")
-            append("b1=\$(").append(snapshot).append(")\n")
-            append("tid=\$(echo \"\$b1\" | ").append(pickTaskId).append(")\n")
+            // ★ ① 等任务出现用**轮询**，不用写死的 `sleep 0.6`。
+            //   写死那 0.6 秒里，窗口已经按小米的默认尺寸（真机实测 587×1200 = 屏 49%×45%）
+            //   画出来了，用户看得见「先出来一个、再变一下」。轮询让它一出现就动手。
+            append("i=0\n")
+            append("while [ \$i -lt 12 ]; do\n")
+            append("  b1=\$(").append(snapshot).append(")\n")
+            append("  tid=\$(echo \"\$b1\" | ").append(pickTaskId).append(")\n")
+            append("  [ -n \"\$tid\" ] && break\n")
+            append("  sleep 0.05\n")
+            append("  i=\$((i+1))\n")
+            append("done\n")
             append("mode=\$(echo \"\$b1\" | ").append(pickMode).append(")\n")
             append("before=\$(echo \"\$b1\" | ").append(pickBounds).append(")\n")
+            // ★ ② 读到的可能是**展开动画中途**的形态，先给它一点时间再确认一次 ——
+            //   否则「本来是自由窗、只是还没画完」会被误判成「没进自由窗」而白重启一次。
+            append("if [ -n \"\$tid\" ] && [ \"\$mode\" = \"fullscreen\" ]; then\n")
+            append("  sleep 0.3\n")
+            append("  b1=\$(").append(snapshot).append(")\n")
+            append("  mode=\$(echo \"\$b1\" | ").append(pickMode).append(")\n")
+            append("  before=\$(echo \"\$b1\" | ").append(pickBounds).append(")\n")
+            append("fi\n")
+            // ★ ③ 确实是全屏（`--windowingMode 5` 被系统忽略：应用不可调整、或它已经在全屏跑）
+            //   ⇒ 放开「可调整」再起一次。照 `oxohang/FanFreeform` 的 `retryNonResizableTaskIfNeeded`。
             append("if [ -n \"\$tid\" ] && [ \"\$mode\" = \"fullscreen\" ]; then\n")
             append("  am task resizeable \$tid 2\n")
             append("  ").append(restartCommand).append("\n")
@@ -484,13 +1061,39 @@ object AospFreeformWindow {
 private fun platformWindowModeOptions(mode: Int, bounds: Rect? = null): Bundle? =
     try {
         ActivityOptions.makeBasic().let { options ->
-            bounds?.let { value -> runCatching { options.setLaunchBounds(value) } }
+            bounds?.let { value ->
+                // 临时诊断：`setLaunchBounds` 是隐藏 API，失败会被 runCatching 静默吞掉。
+                // 「传了 bounds 但窗口还是系统默认位置」时必须先看这一行。
+                val result = runCatching { options.setLaunchBounds(value) }
+                android.util.Log.i(
+                    "FlymeFreeformNoRoot",
+                    "AOSP_OPTIONS setLaunchBounds=$value ok=${result.isSuccess} " +
+                        "err=${result.exceptionOrNull()?.javaClass?.simpleName}",
+                )
+            }
             runCatching {
                 ActivityOptions::class.java
                     .getDeclaredMethod("setLaunchWindowingMode", Int::class.javaPrimitiveType)
                     .also { it.isAccessible = true }
                     .invoke(options, mode)
             }
+            // ★ 关掉小米的自由窗**展开动画**（2026-10-10 用户：「加载一半，然后向下拉伸」）。
+            //
+            // 小米自己的启动会调这一句（见 [MiuiFreeformOptions.withoutFreeformAnimation]），
+            // 但它那份 `getActivityOptions` 在**横屏**下会被我们自己的校验拒掉 —— 它给的
+            // 1200×1800 超出横屏高度 1200（见 [MiuiFreeformOptions.build] 的 bounds 校验）
+            // ⇒ 走到这里时动画还是开着的。所以在这份上再关一次。
+            val animResult =
+                runCatching {
+                    ActivityOptions::class.java
+                        .getMethod("setFreeformAnimation", Boolean::class.javaPrimitiveType)
+                        .invoke(options, false)
+                }
+            android.util.Log.i(
+                "FlymeFreeformNoRoot",
+                "AOSP_OPTIONS setFreeformAnimation(false) ok=${animResult.isSuccess} " +
+                    "err=${animResult.exceptionOrNull()?.javaClass?.simpleName}",
+            )
             options.toBundle()
         }
     } catch (_: RuntimeException) {
@@ -526,22 +1129,29 @@ object FreeformProtocol {
 /**
  * `startActivity` 那条路要用的启动参数。
  *
- * AOSP 形态下**优先让小米自己配**（[MiuiFreeformOptions]）：它那份带着正确的 bounds 与
- * `freeformScale`（≈0.7，应用会整体缩到七成，所以看着像「缩小版的手机」），
- * 比我们自己拼的那份更接近系统自己的小窗。拿不到就退回 [FreeformProtocol.bundle]。
+ * AOSP 形态下**优先让小米自己配**（[MiuiFreeformOptions]）：它那份带着正确的
+ * `freeformScale`（≈0.7，应用会整体缩到七成，所以看着像「缩小版的手机」）。
+ * 拿不到就退回 [FreeformProtocol.bundle]（它在 AOSP 下就是 [AospFreeform.bundle]，
+ * 同样**不带 bounds**）。
+ *
+ * ★★ **两条路都不设 bounds**（2026-10-10 用户：「不要 resize」）：
+ * 真机实测 `setLaunchBounds` **调用成功但系统不认**（见 [AospFreeform.bundle] 里那段说明），
+ * 传了反而会「先按我们的矩形开一帧、再被改回系统默认」⇒ 就是用户看到的「上下拉伸」。
+ * 所以这里**不再覆盖**小米那份的几何，让系统一步到位。
  *
  * ⚠️ 拿到小米那份之后**还要把 `android.activity.windowingMode` 这个 extra 补上去**：
  * 那是我们这条链路里**验过能用**的写法（ColorOS 与 HyperOS 都吃它），
  * 而小米那份 ActivityOptions 里 windowingMode 是怎么带的并没有验过 —— 补上不冲突，
  * 少了则可能变成全屏。
  */
+@SuppressLint("BlockedPrivateApi")
 private fun directOptions(context: Context, packageName: String, isAosp: Boolean): Bundle {
     if (!isAosp) return FreeformProtocol.bundle(context)
     val native = MiuiFreeformOptions.build(context, packageName)
     if (native != null) {
         DebugLog.info(
             "LAUNCH_MIUI_OPTIONS",
-            "$packageName 用小米原生 ActivityOptions " +
+            "$packageName 小米原生 ActivityOptions " +
                 "bounds=${runCatching { native.launchBounds }.getOrNull()} " +
                 "scale=${MiuiFreeformOptions.scaleOf(native)}",
         )
@@ -574,20 +1184,18 @@ class DirectStartStrategy : FreeformLaunchStrategy {
             // AOSP 形态补一位 NO_ANIMATION（同 [AospFreeform.LAUNCH_FLAGS]）：小窗是
             // 「先按整屏起、再缩成小窗」的，带动画就会先闪一下全屏。ColorOS 那条不加。
             if (isAosp) intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            // ★★ AOSP 形态的尺寸**已经在这份 ActivityOptions 里**（`setLaunchBounds` + 隐藏的
+            // `setLaunchWindowingMode`，见 [AospFreeform.bundle]）⇒ 窗口**一步到位**，
+            // 不再补 `am task resize`（用户 2026-10-09：「能不能别 resize，直接打开」）。
             context.startActivity(intent, directOptions(context, target.packageName, isAosp))
-            // 走 direct 也把尺寸补上（没有 Shizuku 时这是唯一的尺寸手段，
-            // bundle 里的 `setLaunchBounds` 在部分 ROM 上是生效的）。没 Shizuku 就别白试。
-            if (isAosp && ShizukuShell.hasPermission) {
-                AospFreeformWindow.scheduleResize(
-                    context,
-                    target.packageName,
-                    ShizukuAmStrategy.buildCommand(
-                        target,
-                        FreeformProtocol.windowMode(context),
-                        FreeformProtocol.launchFlags(context),
-                    ),
-                )
-            }
+            // 这条打点是 direct 那条路**唯一**的取证窗口（它不走 shell，没有 `am stack list` 可看）：
+            // 窗口到底有没有按这份逻辑矩形开出来，事后只看这一行。
+            DebugLog.info(
+                "LAUNCH_DIRECT",
+                "${target.flattened} aosp=$isAosp " +
+                    "逻辑=${AospFreeformWindow.bounds(context)?.flattenToString() ?: "?"} " +
+                    "windowingMode=${FreeformProtocol.windowMode(context)}",
+            )
             StrategyOutcome.Success("已提交 windowingMode=${FreeformProtocol.windowMode(context)}")
         } catch (exception: SecurityException) {
             StrategyOutcome.Failure("被拒绝（SecurityException）：${exception.message}")
@@ -610,7 +1218,21 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
     override fun isAvailable(context: Context): Boolean = ShizukuShell.hasPermission
 
     override fun launch(context: Context, target: LaunchTarget): StrategyOutcome {
-        val isAosp = FreeformProtocol.isAosp(context)
+        // ★★ AOSP 形态（小米 / vivo）：**整条链路丢后台一次跑完**。
+        //
+        // 2026-10-09 真机录屏取证：原来「主线程跑 `am start`，返回后再起后台线程 resize」
+        // 会让窗口以**系统默认尺寸**（小米实测 49%×45%）停留 **~1.2 秒**才跳到目标尺寸，
+        // 用户看到的就是「弹出来一个、过一会儿又变一下」，而且两次的宽高比还不一样
+        // （默认 0.489、我们的等比 0.449）⇒ 窗口在中间「变形」。
+        // 现在把三步（放开可调整 → 起小窗 → 立刻改尺寸）拼进**同一条 shell**，
+        // 主线程立刻返回（面板能马上收起），窗口从出现到目标尺寸只差一个 `sleep 0.15`
+        // —— 见 [AospFreeformWindow.launchInBackground]。
+        if (FreeformProtocol.isAosp(context)) {
+            AospFreeformWindow.launchInBackground(context, target)
+            return StrategyOutcome.Success(
+                "已提交（后台）windowingMode=${FreeformProtocol.windowMode(context)}",
+            )
+        }
         val command =
             buildCommand(
                 target,
@@ -620,10 +1242,6 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
         val result = ShizukuShell.run(command)
         val output = (result.stdout + result.stderr).trim()
         val ok = result.isSuccess && !looksLikeError(output)
-        // AOSP 形态：`am start` 只负责「按小窗起」，尺寸是系统默认那一档（实测只占屏 31%×28%），
-        // 得另起一条 `am task resize` 去改；万一它压根没进自由窗（应用不支持），
-        // 还要放开「可调整」再起一次。两件都丢后台，不占启动这条主线程。
-        if (ok && isAosp) AospFreeformWindow.scheduleResize(context, target.packageName, command)
         return if (ok) {
             StrategyOutcome.Success("shell 执行成功：$command")
         } else {
@@ -646,12 +1264,46 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
          *
          * @param flags 额外的 Intent flags；0 表示不带 `-f`。AOSP 形态传
          *   [AospFreeform.LAUNCH_FLAGS]（十进制，与社区实测那条命令逐字一致）。
+         * @param preflight AOSP 形态传 true：命令前面会先拼一段 [resizeablePreflight]。
          */
-        fun buildCommand(target: LaunchTarget, windowMode: Int, flags: Int = 0): String =
+        fun buildCommand(
+            target: LaunchTarget,
+            windowMode: Int,
+            flags: Int = 0,
+            preflight: Boolean = false,
+        ): String =
             buildString {
+                if (preflight) append(resizeablePreflight(target.packageName)).append('\n')
                 append("am start --windowingMode ").append(windowMode)
                 if (flags != 0) append(" -f ").append(flags)
                 append(" -n ").append(target.flattened)
+            }
+
+        /**
+         * **起小窗之前**的一步：这个包如果已经有任务，先把它标成「可调整」。
+         *
+         * ## 为什么要有它（2026-10-09 小米 15 真机实测）
+         *
+         * 应用**已经在全屏跑**时，第一次 `am start --windowingMode 5` 会被系统**直接忽略**
+         * （那个任务的 resize mode 是不可调整），于是先**全屏弹出来**；我们随后才靠
+         * 「放开可调整 + 再起一次」补救 —— 用户看到的就是「**先变大、再变小**」那一跳。
+         * 把这一步提到**启动之前**，第一跳就直接进小窗，没有那一下。
+         *
+         * 出处：`oxohang/FanFreeform` 的 `launchIntentNow` 也是先
+         * `forceTaskResizable(existing.taskId)` 再 start（`HyperOsFreeformBridge:313`）。
+         *
+         * 真机验证：对已有任务先 `am task resizeable <id> 2` 再 `am start --windowingMode 5`，
+         * `mWindowingMode` 从 `fullscreen` 直接变 `freeform` ✓（全程一条 shell，不加往返）。
+         *
+         * ⚠️ **只动「已经存在的任务」**：找不到就什么都不做 —— 全新启动本来就一次到位
+         * （真机实测新任务第一次就是 freeform），不该为它多花一次 `am stack list`。
+         */
+        fun resizeablePreflight(packageName: String): String =
+            buildString {
+                append("t=\$(am stack list 2>/dev/null | grep -B1 '").append(packageName)
+                append("/' | head -2 | sed -n 's/.*taskId=\\([0-9]*\\).*/\\1/p' | head -1)\n")
+                append("[ -n \"\$t\" ] && am task resizeable \$t 2 >/dev/null 2>&1\n")
+                append(":")
             }
 
         /**
@@ -673,8 +1325,12 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
             intent: Intent,
             windowingMode: Int,
             extraFlags: Int = 0,
+            preflight: Boolean = false,
         ): String =
             buildString {
+                // 与 buildCommand 同理：先放开「已有任务」的可调整，避免先全屏弹一下。
+                val target = intent.component?.packageName ?: intent.`package`
+                if (preflight && target != null) append(resizeablePreflight(target)).append('\n')
                 append("am start")
                 if (windowingMode > 0) append(" --windowingMode ").append(windowingMode)
                 intent.action?.let { append(" -a ").append(shellQuote(it)) }
@@ -767,33 +1423,29 @@ class FreeformLauncher(
                 FreeformProtocol.windowMode(context),
                 // AOSP 形态补 NO_ANIMATION（这里用「或」而不是覆盖，见 buildIntentCommand）。
                 if (isAosp) Intent.FLAG_ACTIVITY_NO_ANIMATION else 0,
+                preflight = isAosp,
             )
         val resize = { pkg: String -> AospFreeformWindow.scheduleResize(context, pkg, intentCommand) }
 
-        // ★ AOSP 形态 + 有 Shizuku ⇒ **跳过直接启动**（理由见 [orderedStrategies]）：
-        // 那条路在 HyperOS 上会被系统限制，而且失败时应用已经全屏弹出来了。
-        val skipDirect = isAosp && ShizukuShell.hasPermission
-        if (!skipDirect) {
-            val direct =
-                try {
-                    if (isAosp) prepared.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                    context.startActivity(
-                        prepared,
-                        directOptions(context, targetPackage.orEmpty(), isAosp),
-                    )
-                    if (isAosp && ShizukuShell.hasPermission && targetPackage != null) {
-                        resize(targetPackage)
-                    }
-                    StrategyOutcome.Success("已提交 windowingMode=${FreeformProtocol.windowMode(context)}")
-                } catch (exception: ActivityNotFoundException) {
-                    StrategyOutcome.Failure("找不到可处理该 Intent 的页面")
-                } catch (exception: RuntimeException) {
-                    StrategyOutcome.Failure("启动失败：${exception.javaClass.simpleName}: ${exception.message}")
-                }
-            attempts += Attempt(directId, direct)
-            DebugLog.info("LAUNCH_INTENT_ATTEMPT", "$directId -> ${describe(direct)}")
-            if (direct is StrategyOutcome.Success) return Verdict(attempts.first(), attempts)
-        }
+        // ★ 直接启动优先（AOSP 也一样，理由见 [orderedStrategies]）：它是唯一能**一步到位**的路
+        // （`setLaunchBounds` 在启动那一刻就把窗口尺寸定死），成了就不必再 resize。
+        // 失败（被小米的「后台弹出界面」拦掉）才落到下面的 shell 分支兜底。
+        val direct =
+            try {
+                if (isAosp) prepared.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                context.startActivity(
+                    prepared,
+                    directOptions(context, targetPackage.orEmpty(), isAosp),
+                )
+                StrategyOutcome.Success("已提交 windowingMode=${FreeformProtocol.windowMode(context)}")
+            } catch (exception: ActivityNotFoundException) {
+                StrategyOutcome.Failure("找不到可处理该 Intent 的页面")
+            } catch (exception: RuntimeException) {
+                StrategyOutcome.Failure("启动失败：${exception.javaClass.simpleName}: ${exception.message}")
+            }
+        attempts += Attempt(directId, direct)
+        DebugLog.info("LAUNCH_INTENT_ATTEMPT", "$directId -> ${describe(direct)}")
+        if (direct is StrategyOutcome.Success) return Verdict(attempts.first(), attempts)
         // 直接启动被拒时，退回 Shizuku 的 `am start`（同样是 shell 身份，权限更高）。
         if (ShizukuShell.hasPermission) {
             val result = ShizukuShell.run(intentCommand)
@@ -825,7 +1477,20 @@ class FreeformLauncher(
      */
     private fun orderedStrategies(context: Context): List<FreeformLaunchStrategy> =
         if (FreeformProtocol.isAosp(context)) {
-            strategies.sortedBy { if (it is ShizukuAmStrategy) 0 else 1 }
+            // ★★ AOSP 形态**让「直接启动」排前面**（2026-10-09 用户：「能不能别 resize，直接打开，
+            // 现在这样变一下很傻逼」）。
+            //
+            // 理由：**只有 `startActivity(intent, ActivityOptions)` 能在「启动那一刻」把窗口尺寸
+            // 定下来**（`setLaunchBounds` + 隐藏的 `setLaunchWindowingMode`）。而 shell 的
+            // `am start` **根本没有 bounds 参数**（真机 `am help` 逐条确认过）⇒ 只能
+            // 「先按系统默认尺寸（小米实测 587×1200 = 屏 49%×45%）起来、过 0.15 秒再
+            // `am task resize`」—— 用户看到的就是「弹出来一下、过会儿又变一下」，而且两次
+            // 宽高比还不一样（0.489 vs 0.449）⇒ 中途「变形」。
+            //
+            // ⚠️ 代价：小米/澎湃会拦「后台应用启动 Activity」，可能弹一次
+            // 「Flyme 小窗 想要打开 XX，是否允许？」。用户点过「始终允许」之后就不再弹。
+            // 一旦被拒，下面的 [ShizukuAmStrategy] 仍会兜底（那时只能走「先起再 resize」那条）。
+            strategies.sortedBy { if (it is DirectStartStrategy) 0 else 1 }
         } else {
             strategies
         }

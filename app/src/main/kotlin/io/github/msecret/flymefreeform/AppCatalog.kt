@@ -244,6 +244,16 @@ object AppCatalog {
         // ★★ Flyme 上图标一律**原样**，连形状都不裁（见下面那段）。判据用「本机有没有 Flyme
         // 主题图标集」这个能力信号，而不是 ROM 名字。
         val flymeDesktop = FlymeIconSet.available()
+        // ★★ 「跟随系统」但本机**没有可读的主题图标集**（小米就是这种）⇒ 那一路只能退回
+        // `pm.getApplicationIcon`，而它**已经被系统做成带形状的了**（HyperOS 的六边形 /
+        // Flyme 的圆角矩形）⇒ 原样用、**不裁圆**。用户 2026-10-10 定的对应关系：
+        // **默认 = 我们自己画的圆**（应用自带原图 → 裁圆）、**跟随系统 = 不加圆形裁剪**。
+        //
+        // ⚠️ 判据取 `store.useSystemIconSet`（**用户原样选的那一项**）而不是 [useSystemIconSet]：
+        //    后者在「选了图标包」时被强行置真（那是兜底规则、不是用户选的「跟随系统」），
+        //    拿它当判据会把图标包没命中的那些应用也一起改成不裁圆。
+        val themedSetAvailable = SystemIconSet.available() || flymeDesktop
+        val systemShaped = (store.useSystemIconSet && !themedSetAvailable) || flymeDesktop
         val targetPx = iconTargetPx(context, densityDpi)
         var systemHits = 0
         // 这一批用到的图标，读完整体替换缓存（见 [iconKey]）。
@@ -268,20 +278,22 @@ object AppCatalog {
                                                 targetPx,
                                                 iconPackPkg,
                                                 iconMapping,
+                                                systemShaped,
                                             ) { packageName, fraction ->
                                                 systemIcons?.load(packageName, targetPx, fraction) {
                                                     runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
                                                 }?.also { systemHits++ }
                                             }
-                                        // 图标包 / 系统图标集来的图标**保留原形**——用户 2026-10-08 明确要求：
-                                        // 既然用了图标集，就不要再套默认那个圆形裁剪。
-                                        //
-                                        // ★★ Flyme 上**连原图标也不裁**（2026-10-09 用户两次实测）：
-                                        // Flyme 的 `pm.getApplicationIcon` 返回的已经是用户装的那套主题图标
-                                        // （支付宝是**圆角矩形**），我们一裁圆，它的四个角就被切掉、变成
-                                        // 「八边形」—— 用户原话「支付宝被遮罩了」。⇒ Flyme 一律原样。
-                                        // ColorOS 保持老观感不变。
-                                        if (resolved.themed || flymeDesktop) resolved.bitmap
+                                        // ★★ 裁不裁圆由 [ResolvedIcon.themed] 一个信号决定
+                                        // （这个信号怎么来，见 [resolveIcon]）：
+                                        // - **图标包 / 系统图标集**来的图标**保留原形**（用户 2026-10-08
+                                        //   明确要求：既然用了图标集，就不要再套默认那个圆形裁剪）；
+                                        // - **「跟随系统」退回系统图标**时也**不裁**（Flyme 2026-10-09
+                                        //   实测：它返回的圆角矩形被我们切掉四角 ⇒「八边形」；
+                                        //   小米 2026-10-10：它返回的六边形被我们裁 ⇒ 用户报
+                                        //   「反而给系统的加上了圆形」）；
+                                        // - 其余（**「默认」**）⇒ `circleCrop()`，这才是"我们自己画的圆"。
+                                        if (resolved.themed) resolved.bitmap
                                         else resolved.bitmap.circleCrop()
                                     }
                             icons[key] = icon
@@ -330,6 +342,14 @@ object AppCatalog {
         targetPx: Int,
         iconPackPkg: String,
         iconMapping: Map<String, String>,
+        /**
+         * 第 3 级退回的那张图**该不该当成「系统已经做好形状的」**（⇒ 原样用、不裁圆）。
+         *
+         * `true` = 「跟随系统」但本机没有可读图标集（小米）/ Flyme（它一律原样）——
+         * 见 `AppCatalog.load` 里 `systemShaped` 那段。`false` = 「默认」⇒ 用**应用自带原图**，
+         * 交回调用方裁成圆。
+         */
+        systemShaped: Boolean,
         systemIcon: (String, Float) -> Bitmap?,
     ): ResolvedIcon {
         val component = info.componentName
@@ -360,15 +380,29 @@ object AppCatalog {
         // 2) 系统图标集 —— 键是**包名**。同样对齐到该应用的默认图标大小。
         systemIcon(packageName, defaultIconFraction(pm, packageName, targetPx))
             ?.let { return ResolvedIcon(it, themed = true) }
-        // 3) 退回默认图标（图标包里没有这个应用时走的就是这一步，不会再留空）。
-        //    ★ 它是**基准**，`alignVisual = false`：只统一目标边长，不做视觉归一化
-        //    （理由见 [IconPackLoader.scaleTo] —— 真机上根本判不出它是不是 AdaptiveIconDrawable）。
+        // 3) 退回**这一档该用的那张图**（图标包里没有这个应用时走的就是这一步，不会再留空）。
+        //
+        // ★★ 用哪个源，看的是**用户选的那一项**（2026-10-10 用户定：「默认我们自己绘制的圆形，
+        //    跟随系统不加圆形裁剪」）：
+        //    - **「跟随系统」**（[systemShaped]）⇒ `pm.getApplicationIcon` —— 系统（HyperOS /
+        //      Flyme 主题）已经把它做成**带形状**的了，原样用、**不裁**（`themed = true`）；
+        //    - **「默认」** ⇒ 优先 `LauncherActivityInfo.getIcon()`（**应用自带原图**，
+        //      不走 PackageManager 的主题钩子）⇒ 交回调用方**裁成圆**（`themed = false`）。
+        //      以前两种情况都用 `getApplicationIcon`，于是小米上「默认」拿到的也是系统那个
+        //      已经带形状的图标 —— 裁圆等于没裁，用户报的「我们默认重绘的也没重绘」就是它。
+        //
+        // ★ 它是**基准**，`alignVisual = false`：只统一目标边长，不做视觉归一化
+        //   （理由见 [IconPackLoader.scaleTo] —— 真机上根本判不出它是不是 AdaptiveIconDrawable）。
         val drawable =
-            runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
-                ?: runCatching { info.getIcon(context.resources.displayMetrics.densityDpi) }.getOrNull()
+            if (systemShaped) {
+                runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
+            } else {
+                runCatching { info.getIcon(context.resources.displayMetrics.densityDpi) }.getOrNull()
+                    ?: runCatching { pm.getApplicationIcon(packageName) }.getOrNull()
+            }
         val bitmap =
             drawable?.toBitmap(targetPx) ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-        return ResolvedIcon(bitmap, themed = false)
+        return ResolvedIcon(bitmap, themed = systemShaped)
     }
 
     /**
@@ -416,6 +450,11 @@ object AppCatalog {
             if (iconPackPkg.isNotBlank()) IconPackLoader.loadMapping(context, iconPackPkg) else emptyMap()
         val useSystemIconSet = systemIconSetEnabled(store, iconPackPkg)
         val systemIcons = if (useSystemIconSet) ThemedIcons.open(context) else null
+        // 与 [load] 同一套判据（见那里的说明）——预览要跟面板里画得**一模一样**，否则
+        // 「默认图标 vs 当前来源」这排对比本身就失真了。
+        val flymeDesktop = FlymeIconSet.available()
+        val themedSetAvailable = SystemIconSet.available() || flymeDesktop
+        val systemShaped = (store.useSystemIconSet && !themedSetAvailable) || flymeDesktop
         val densityDpi =
             context.resources.displayMetrics.densityDpi.takeIf { it > 0 } ?: FALLBACK_DENSITY_DPI
         val targetPx = iconTargetPx(context, densityDpi)
@@ -427,13 +466,26 @@ object AppCatalog {
                 .mapNotNull { info ->
                     runCatching {
                         val resolved =
-                            resolveIcon(context, pm, info, targetPx, iconPackPkg, iconMapping) { pkg, fraction ->
+                            resolveIcon(
+                                context,
+                                pm,
+                                info,
+                                targetPx,
+                                iconPackPkg,
+                                iconMapping,
+                                systemShaped,
+                            ) { pkg, fraction ->
                                 systemIcons?.load(pkg, targetPx, fraction) {
                                     runCatching { pm.getApplicationIcon(pkg) }.getOrNull()
                                 }
                             }
                         if (!resolved.themed) return@runCatching null
-                        val defaultDrawable = pm.getApplicationIcon(info.componentName.packageName)
+                        // 「默认」这一侧用**和面板里同一个源**（应用自带原图，见 [resolveIcon] 第 3 级），
+                        // 否则预览里的基准不是用户真正看到的那个。
+                        val defaultDrawable =
+                            runCatching { info.getIcon(densityDpi) }.getOrNull()
+                                ?: runCatching { pm.getApplicationIcon(info.componentName.packageName) }.getOrNull()
+                                ?: return@runCatching null
                         IconComparison(
                             label =
                                 info.label?.toString()?.trim().orEmpty()

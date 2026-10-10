@@ -7,6 +7,7 @@ import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -49,6 +50,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     private var blocker: OutsideTapBlocker? = null
 
     private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * 记「最近使用」用的设置存储（见 [rememberForeground]）。
+     *
+     * 懒建一次就好：这个服务里到处是 `SettingsStore(this)`，但那条热路径
+     * （每次前台包变化）不该反复构造——它的 `init` 会跑一长串迁移检查。
+     */
+    private val settingsStore: SettingsStore by lazy { SettingsStore(this) }
 
     /**
      * 学「小横条真实坐标」用的线程。
@@ -261,11 +270,41 @@ class FreeformAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         when (event?.eventType) {
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED,
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            -> scheduleRefresh()
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> scheduleRefresh()
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                scheduleRefresh()
+                rememberForeground(event)
+            }
             else -> Unit
         }
+    }
+
+    /**
+     * 上一次记进「最近使用」的前台包。
+     *
+     * 同一扇窗会刷出**连串** `TYPE_WINDOW_STATE_CHANGED`（标题变、焦点变、子窗弹出都算），
+     * 靠它把这一串压成一次写入。
+     */
+    private var lastForegroundPackage: String? = null
+
+    /**
+     * 顺手记一笔「前台换成了谁」，供「更多」面板的「最近使用」用（见 [RecentUsage]）。
+     *
+     * 这是「读系统最近使用」的**免权限**那一路：本服务一直在跑，前台包名变化本身就等于
+     * 「用户刚用了这个应用」，不需要 `PACKAGE_USAGE_STATS`。
+     *
+     * ★ 必须在**无障碍主线程**上保持极便宜：这里只做几次字符串比较 + 一次
+     * `SharedPreferences` 写入（`apply()` 是异步落盘的），**一个 `PackageManager` 查询都不做**。
+     * 桌面 / 输入法 / 系统组件的过滤交给 [RecentUsage.recentComponents] 按包名反查应用目录时
+     * 完成。主线程被占住会被系统当成无响应的无障碍服务并直接停用 ——
+     * 那正是本项目最怕的失败态（见 [scheduleRefresh] 上面那段）。
+     */
+    private fun rememberForeground(event: AccessibilityEvent) {
+        val packageName = event.packageName?.toString().orEmpty()
+        if (packageName.isEmpty() || packageName == lastForegroundPackage) return
+        lastForegroundPackage = packageName
+        runCatching { RecentUsage.noteForeground(this, settingsStore, packageName) }
+            .onFailure { DebugLog.warn("RECENT_FOREGROUND_FAILED", packageName, it) }
     }
 
     override fun onInterrupt() = Unit
@@ -366,9 +405,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     fun refresh() {
         val store = SettingsStore(this)
         val target = blocker ?: return
-        // ★ 非 ColorOS 上认不出小窗（识别靠 ColorOS 给小窗画的**伴生装饰窗**，见 [observeLayout]），
-        // 再往下走只会把一整屏遮罩铺到用户面前。判据见 [SystemSupport]。
-        if (!SystemSupport.freeformUsable(this)) return
+        // ★ 只在「系统自带小窗、且我们认得出来」的形态上铺遮罩：ColorOS（OURS）与 AOSP 自由窗
+        // （小米 / 澎湃）都行 —— 两家的**识别判据不同**（见 [observeLayout]），但「在窗外盖一层
+        // 遮罩接住点击」这件事是一样的。Flyme（NATIVE）与没有小窗的系统不干活：
+        // 认不出小窗时硬铺，只会把一整屏遮罩糊到用户脸上。
+        val state = SystemSupport.freeformState(this)
+        if (state != SystemSupport.FreeformState.OURS && state != SystemSupport.FreeformState.AOSP) {
+            return
+        }
         target.clickMode = store.outsideTapClickMode
         if (closing) {
             // 关闭流程分**两段**，两段都要从这里返回，但理由不同：
@@ -539,6 +583,19 @@ class FreeformAccessibilityService : AccessibilityService() {
         val windowList = runCatching { windows }.getOrNull()
         lastWindows = windowList.orEmpty()
         if (windowList == null) return null
+        // TEMP-PROBE（取证用，验完删）：把无障碍看到的每一扇窗口打出来。
+        // 小米小窗的形态必须实测 —— 它的装饰是 WM Shell 图层、不是独立窗口，
+        // 现在这条「要求伴生装饰窗」的判据在那边配不上对，得先看清那边到底长什么样。
+        runCatching {
+            val rect = android.graphics.Rect()
+            val text =
+                windowList.joinToString(" | ") { w ->
+                    w.getBoundsInScreen(rect)
+                    "t=${w.type} id=${w.id} b=${rect.flattenToString()} " +
+                        "pkg=${w.root?.packageName} f=${w.isFocused} a=${w.isActive}"
+                }
+            android.util.Log.i("FlymeFreeformNoRoot", "A11Y_WINDOWS $text")
+        }
         val screen = screenBounds()
         val safe = safeArea(screen, windowList)
         if (safe.isEmpty) return null
@@ -595,11 +652,19 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 点到下层应用（「关掉一扇后遮罩有一会儿不在」）；紧跟的重放还会因列表为空而
         // `OUTSIDE_TAP_TARGET_MISS`。
         val decorRects = ArrayList<Rect>(4)
+        // 小米 / 澎湃那套凭证：`pkg=com.android.systemui` 的 caption 窗口（顶/底各一条）。
+        // **不按面积筛**——它们本身就只有 132×12 上下，过不了面积那道门；真正的把关在
+        // 「必须**落在**某扇内容窗内部」那一步（见下面 `miuiCaptionRects.any { bounds.contains(it) }`）。
+        val miuiCaptionRects = ArrayList<Rect>(4)
         for (window in windowList) {
-            if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION) continue
-            if (packageOf(window) != DECOR_PACKAGE) continue
+            val owner = packageOf(window)
             val bounds = Rect().also { window.getBoundsInScreen(it) }
             if (bounds.isEmpty) continue
+            if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                if (owner == MIUI_CAPTION_PACKAGE) miuiCaptionRects += bounds
+                continue
+            }
+            if (owner != DECOR_PACKAGE) continue
             val area = bounds.width().toLong() * bounds.height()
             if (area < minFreeformArea || area >= maxFreeformArea) continue
             decorRects += bounds
@@ -619,8 +684,17 @@ class FreeformAccessibilityService : AccessibilityService() {
                 if (bounds.isEmpty) continue
                 val area = bounds.width().toLong() * bounds.height()
                 if (area < minFreeformArea || area >= maxFreeformArea) continue
-                // 内容窗必须配得上一个装饰窗才算自由窗（见上）。
-                if (app && decorRects.none { withinSlack(it, bounds, DECOR_MERGE_SLACK_PX) }) continue
+                // 内容窗必须配得上一个「装饰凭证」才算自由窗（见上）。
+                // ★ 两种形态各认各的凭证，**判据留在各自形态自己身上**：
+                //   - ColorOS：`TYPE_SYSTEM + pkg=android` 的装饰层**覆盖整扇窗**（边界差 ≤ slack）；
+                //   - 小米 / 澎湃：`pkg=com.android.systemui` 的 caption **落在窗内**（顶/底两条）。
+                // 这条闸不能省：竖屏应用跑在横屏下会被系统放进 size-compat 窗（实测占屏 21%、
+                // 面积正落在小窗区间），系统对话框同理 —— 都靠「没有凭证」被挡掉。
+                if (app) {
+                    val hasDecor = decorRects.any { withinSlack(it, bounds, DECOR_MERGE_SLACK_PX) }
+                    val hasCaption = miuiCaptionRects.any { bounds.contains(it) }
+                    if (!hasDecor && !hasCaption) continue
+                }
                 val focused = window.isFocused
                 val active = window.isActive
                 // 近似去重：同一扇窗会**同时**以内容窗与装饰窗两个身份出现（边界差 1~2px），
@@ -1565,7 +1639,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 那一刀打在空处。真机复现：目标被缩到 [397,559][1261,2095] 后，补刀起点还是
         // (829,2257)，补完依旧 `OUTSIDE_TAP_STILL_OPEN`。
         val target = lastFreeformBounds ?: closeTargetBounds
-        if (target != null && needsFocusBeforeSwipe(target) && !activateTarget(target)) {
+        if (target != null && shouldPrimeCaption(target) && !activateTarget(target)) {
             DebugLog.warn(
                 "CLOSE_SWIPE_ACTIVATE_FAILED",
                 "连「点横条」这一下都没注入出去，照常动作（多半会漏成底部上滑/点了没反应）",
@@ -1717,12 +1791,22 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 后半段正是这个状态。
      *
      * 找不到对应窗口时返回 false：身份都对不上就别乱点。
+     *
+     * ★★ **2026-10-10 改成「永远先点」**（原来只在**非焦点窗**时才点）。
+     *
+     * 真机（小米 15 / HyperOS 4.0）复现出：**已经聚焦**的窗直接上滑也会「回桌面」——
+     * `OUTSIDE_TAP_DISPATCH 单击模式：直接关闭` → `SHIZUKU_INJECT_SWIPE (1886,1118)->(1886,638)`
+     * → 紧接着 `com.miui.home` 起前台，系统侧 `MiuiFreeformModeMoveHandler
+     * .onBottomCaptionHandleMotionEvents` 把这一刀当成了**拖拽**（`freeformExiting=true`）。
+     *
+     * 而 2026-10-07 的 A/B（见 [activateTarget] 注释）早已给出答案：
+     * 「**先点横条**再上滑」= 19 关 / 20、**零次回桌面**；「什么都不点」= 2 关 / 5 回桌面。
+     * ⇒ 那一下的意义**不是让窗拿焦点**，而是**让系统的横条处理器先认领这次触摸**；
+     * 少了它，这一刀就是「无主的底部上滑」，会被系统当成回桌面。
+     * 用户 2026-10-10 的观察也吻合：「**单击小横条**关闭就没事」。
      */
-    private fun needsFocusBeforeSwipe(bounds: Rect): Boolean {
-        val me = lastFreeformWindows.firstOrNull { withinSlack(it.bounds, bounds, closeSameSlackPx) }
-            ?: return false
-        return !me.focused
-    }
+    private fun shouldPrimeCaption(bounds: Rect): Boolean =
+        lastFreeformWindows.any { withinSlack(it.bounds, bounds, closeSameSlackPx) }
 
     /**
      * 把目标窗「点亮」的落点。
@@ -1900,7 +1984,7 @@ class FreeformAccessibilityService : AccessibilityService() {
         val y = point.second.toInt()
         DebugLog.info(
             "CLOSE_SWIPE_ACTIVATE",
-            "目标窗不是焦点窗，先点($x,$y)让它拿到焦点（$why）",
+            "先点横条 ($x,$y) 让系统认领这次触摸（$why）",
         )
         val tapped =
             if (ShizukuShell.hasPermission) {
@@ -1917,12 +2001,22 @@ class FreeformAccessibilityService : AccessibilityService() {
         val startedAt = SystemClock.elapsedRealtime()
         val deadline = startedAt + CLOSE_FOCUS_WAIT_MS
         var readable = false
+        // ★★ **读到焦点也不许提前收工**（2026-10-10 真机定位）。
+        //
+        // 早先这里一读到焦点就 `break`，实测只隔 **31ms** 就补上滑。结果系统把
+        // 「点横条 + 上滑」当成**同一次从屏幕底部起手的滑动** —— 注入的 DOWN 直接进了
+        // `[Gesture Monitor] swipe-up`，桌面被拉起（`hyper_launcher_app:
+        // GestureInputMonitorImpl before_handle_down_event` / `SchedBoost GESTURE_APP_MOVE`）。
+        //
+        // 对照组就是「**单击小横条关闭**」那条路：它天然隔着用户手指那一下与我们的上滑
+        // （[CaptionTapClose] 的 `MIUI_TAP_DELAY_MS = 250ms`），**从来没事**
+        // （用户原话：「单击小横条关闭就没事」）。本处 A/B 也记着「**交接 300ms**
+        // 那批 5 关 / 0 回桌面」。
+        //
+        // 所以：**等满 [CLOSE_FOCUS_WAIT_MS]**，让这两次注入在系统看来是两次独立手势。
         while (SystemClock.elapsedRealtime() < deadline) {
             SystemClock.sleep(CLOSE_FOCUS_POLL_MS)
-            if (isFocusedWindowNow(bounds)) {
-                readable = true
-                break
-            }
+            if (isFocusedWindowNow(bounds)) readable = true
         }
         DebugLog.info(
             "CLOSE_SWIPE_FOCUS_DONE",
@@ -1930,6 +2024,17 @@ class FreeformAccessibilityService : AccessibilityService() {
         )
         return true
     }
+
+    /**
+     * 当前是不是横屏。
+     *
+     * 落点「距小窗底边」在**AOSP 形态**下按方向取两套值（见 [SettingsStore.closeAnchorYDpOf]）：
+     * 横屏窗更扁、系统画小横条的位置不同，一套值两头跑必然有一头不准（用户 2026-10-10：
+     * 「校准也是根据横竖屏校准」）。**ColorOS 等形态横竖屏共用一套**（同一位用户：「这个系统
+     * 应该横竖屏用一个的」）—— 差别收在 [SettingsStore.anchorDiffersByOrientation] 里。
+     */
+    private val isLandscape: Boolean
+        get() = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
     /**
      * 「上滑小横条」关闭用的**横条落点**。
@@ -1941,19 +2046,19 @@ class FreeformAccessibilityService : AccessibilityService() {
     private fun captionPoint(bounds: Rect, store: SettingsStore): Pair<Float, Float> {
         val ratio = (store.closeAnchorXPercent.coerceIn(0, 100)) / 100f
         val x = (bounds.left + bounds.width() * ratio).coerceIn(bounds.left.toFloat(), bounds.right.toFloat())
-        val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDp)).toFloat()
+        val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDpOf(isLandscape))).toFloat()
             .coerceIn(bounds.top.toFloat(), bounds.bottom.toFloat())
         return x to y
     }
 
     /**
      * 小横条在屏幕上的坐标（px）：横向按小窗宽度取 [SettingsStore.closeAnchorXPercent]，
-     * 纵向从**底边**向上量 [SettingsStore.closeAnchorYDp]。
+     * 纵向从**底边**向上量 [SettingsStore.closeAnchorYDpOf]（横竖屏各一套）。
      */
     private fun closeAnchorPoint(bounds: Rect, store: SettingsStore): Pair<Float, Float> {
         val ratio = (store.closeAnchorXPercent.coerceIn(0, 100)) / 100f
         val x = bounds.left + bounds.width() * ratio
-        val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDp)).toFloat()
+        val y = (bounds.bottom - CornerGeometry.dp(this, store.closeAnchorYDpOf(isLandscape))).toFloat()
         return x to y
     }
 
@@ -1974,6 +2079,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         val manager = getSystemService(WindowManager::class.java) ?: return
         val size = CornerGeometry.dp(this, MARKER_SIZE_DP)
+        // ★ **准星永远画在实际落点上**（所见即所得）。2026-10-10 曾给它叠过一段「MIUI 红点」的
+        //   纯显示偏移，用户当天就发现那会让「红点 ≠ 实际点下去的位置」、而且界面上多出一组
+        //   纵向旋钮 ⇒ 已删除。小米上小横条位置不同这件事，改由**落点自己那组键**承担
+        //   （`SettingsStore.anchorKey`，小米默认竖 8 / 横 6）。
         val point = closeAnchorPoint(freeform, store)
         val left = (point.first - size / 2f).toInt()
         val top = (point.second - size / 2f).toInt()
@@ -2199,8 +2308,10 @@ class FreeformAccessibilityService : AccessibilityService() {
             } else {
                 DebugLog.warn(
                     "OUTSIDE_TAP_STILL_OPEN",
+                    // ★ 落点要报**实际用的那个值**（按方向取，见 [closeAnchorYDpOf]）——
+                    //   之前这里写死竖屏值，AOSP 横屏下排查时对不上（吃过"日志和实际不一致"的亏）。
                     "点击没关掉小窗。当前落点是「横向 ${store.closeAnchorXPercent}% 窗宽 / 距底边 " +
-                        "${store.closeAnchorYDp}dp」，可在设置里打开「显示关闭落点准星」把落点对准" +
+                        "${store.closeAnchorYDpOf(isLandscape)}dp」，可在设置里打开「显示关闭落点准星」把落点对准" +
                         "小窗底部那条小横条，或改用「Shizuku 返回键」、开启「强力关闭」兜底",
                 )
             }
@@ -2301,6 +2412,25 @@ class FreeformAccessibilityService : AccessibilityService() {
          * 的窗口列表里**只剩**这个装饰窗。所以它必须算作小窗候选（见 [observeLayout]）。
          */
         private const val DECOR_PACKAGE = "android"
+
+        /**
+         * 小米 / 澎湃的「伴生装饰窗」包名（2026-10-09 在小米 15 / HyperOS 4.0 上实测）。
+         *
+         * 形态与 ColorOS **完全不同**：那边是一个 `TYPE_SYSTEM + pkg=android`、**覆盖整扇窗**的
+         * 装饰层（所以有「边界差 ≤12px」那条判据）；小米这边是 `TYPE_APPLICATION` +
+         * `pkg=com.android.systemui` 的**两小条**（顶部 caption + 底部小横条），
+         * 面积只有 132×12 上下 —— 既过不了面积那道门，也不是 `TYPE_SYSTEM`。
+         *
+         * 实测（小米 15，屏 1200×2670，多看阅读小窗）：
+         * ```
+         * t=1 b=446 1595 578 1607  pkg=com.android.systemui   ← 底部小横条
+         * t=1 b=482  817 542  829  pkg=com.android.systemui   ← 顶部 caption
+         * t=1 b=307  785 718 1625  pkg=com.duokan.reader      ← 小窗本体（411×840 = 视觉尺寸）
+         * ```
+         * 所以小米那边的凭证判据是「**有一条 systemui 的 caption 落在小窗矩形内部**」，
+         * 见 [observeLayout] 里 `miuiCaptionRects` 那一段。
+         */
+        private const val MIUI_CAPTION_PACKAGE = "com.android.systemui"
 
         /**
          * 内容窗与它的伴生装饰窗的边界容差（px）。

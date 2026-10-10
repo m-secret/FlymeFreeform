@@ -64,6 +64,15 @@ object SystemSupport {
         val oplusFeatureCount: Int,
         val oplusRom: String,
         val oplusRomDisplay: String,
+        /**
+         * 非 ColorOS 时补一句**小米那套原生自由窗入口**的探针结果
+         * （`miui.app.MiuiFreeFormManager.getActivityOptions` 能不能调、原生 bounds 与
+         * `freeformScale` 各是多少）。见 [MiuiFreeformOptions.describe]。
+         *
+         * 放在这里是因为：这几个值决定了「AOSP 形态上窗口该开多大」，
+         * 而它们**只能在那台机器上读出来**；挂在启动探针上就不用碰用户界面、也不用真去启动一个应用。
+         */
+        var miuiFreeform: String = "",
     ) {
         val oplus: Boolean
             get() = zoomWindowClass || oplusFeatureCount > 0 || oplusRom.isNotBlank()
@@ -117,11 +126,17 @@ object SystemSupport {
         OURS,
 
         /**
-         * **系统自带 AOSP 形态的小窗**（vivo OriginOS / 小米 MIUI·澎湃）。
+         * **系统建在 AOSP Freeform 之上的自由窗**（vivo OriginOS / 小米 MIUI·澎湃）。
          *
-         * 依据：两家官方适配文档都写明自己的小窗**基于 Android 的多窗口 Freeform 方案**
-         * （见 `AospFreeform` 的说明），所以它们会声明
-         * [PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT] 这条公开特性。
+         * ★★ **别把它当成「纯 AOSP」**（用户 2026-10-10 指正：「小米其实和 ColorOS 一样，
+         * 都是加了它自己的扩展」）：各家在 AOSP freeform 之上又叠了一套**私有扩展**——
+         * 小米就有 `mFreeformScale`（整体缩到 0.7）、私有的 `MiuiFreeFormManager`、
+         * 以及系统自己那套默认几何，而且**对第三方关死**（探针只能读到 null）。
+         * ⇒ 我们也得自己补一层（shell `windowingMode 5` 启动 / resize / 尺寸校准）才接得上，
+         * 这和 ColorOS 那条路**同性质**，不是「系统白送的」。
+         *
+         * 判据仍是**公开特性** [PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT]：
+         * 不用认品牌就能问出「这台机器的窗口管理器认不认 `freeform`」。
          * ⇒ 启动可以走标准参数；识别 / 关闭是另一套，得真机取证。
          */
         AOSP,
@@ -144,8 +159,8 @@ object SystemSupport {
     /**
      * 这台机器声明了 **AOSP 的自由窗**（`android.software.freeform_window_management`）。
      *
-     * 这是**公开特性**，不用认识品牌就能问出「这台机器有没有 AOSP 形态的小窗」——
-     * vivo / 小米 的官方文档都说明它们的小窗就是基于这套 Freeform 方案实现的。
+     * 这是**公开特性**，不用认识品牌就能问出「这台机器的窗口管理器认不认 `freeform`」——
+     * vivo / 小米 的自由窗都建在这套方案上（各家再叠自己的私有扩展，见 [FreeformState.AOSP]）。
      *
      * ⚠️ 它只回答「**系统有**」，不代表第三方一定发得起来（见 `FreeformProtocol` 的说明）。
      */
@@ -159,13 +174,17 @@ object SystemSupport {
     /**
      * [freeformState] 给用户看的那句话。
      *
-     * 四种说法放在这一处，是为了让「功能页那一行」和「运行环境那一行」永远一致 ——
+     * 各档的说法放在这一处，是为了让「功能页那一行」和「运行环境那一行」永远一致 ——
      * 它们问的是同一件事，各写一份迟早说岔。
+     *
+     * ★★ **OURS 与 AOSP 同一句**（用户 2026-10-10：「小米其实和 ColorOS 一样，都是加了
+     * 自己的扩展」）：两家的自由窗**都不是「纯系统白送」**，都得本应用自己补一层才接得上
+     * （ColorOS 走 zoom window、小米走 shell + resize + 尺寸校准）⇒ **不该把 AOSP 写成
+     * 「系统小窗」**——那读起来像「系统给好的、我们只管用」，把这一层适配抹掉了。
      */
     fun freeformStateLabel(context: Context): String =
         when (freeformState(context)) {
-            FreeformState.OURS -> "小窗可用"
-            FreeformState.AOSP -> "系统小窗"
+            FreeformState.OURS, FreeformState.AOSP -> "小窗可用"
             FreeformState.NATIVE -> "原生小窗"
             FreeformState.NONE -> "小窗不可用"
         }
@@ -234,13 +253,20 @@ object SystemSupport {
             }
         }
 
-    private fun runProbe(context: Context): Probe =
-        Probe(
-            zoomWindowClass = classPresent(),
-            oplusFeatureCount = oplusFeatureCount(context),
-            oplusRom = systemProperty(PROP_OPLUS_ROM),
-            oplusRomDisplay = systemProperty(PROP_OPLUS_ROM_DISPLAY),
-        )
+    private fun runProbe(context: Context): Probe {
+        val probe =
+            Probe(
+                zoomWindowClass = classPresent(),
+                oplusFeatureCount = oplusFeatureCount(context),
+                oplusRom = systemProperty(PROP_OPLUS_ROM),
+                oplusRomDisplay = systemProperty(PROP_OPLUS_ROM_DISPLAY),
+            )
+        // 小米那条只在**非 ColorOS** 上探（ColorOS 上这套类根本不在，白跑）。
+        // 用我们自己的包名去问：`getActivityOptions` 要一个「要开成小窗的应用」，
+        // 我们用自己（一定装着、也有 launcher 入口），拿到的几何与具体应用无关。
+        probe.miuiFreeform = if (probe.oplus) "（ColorOS）" else MiuiFreeformOptions.describe(context, context.packageName)
+        return probe
+    }
 
     /**
      * 只问「这个类在不在」，**不初始化**它。
@@ -292,5 +318,6 @@ object SystemSupport {
             "$PROP_OPLUS_ROM=${probe.oplusRom.ifBlank { "（空）" }} " +
             "display=${probe.oplusRomDisplay.ifBlank { "（空）" }} " +
             "brand=${Build.BRAND}/${Build.MANUFACTURER} android=${Build.VERSION.RELEASE} " +
-            "display.id=${Build.DISPLAY}"
+            "display.id=${Build.DISPLAY}" +
+            if (probe.miuiFreeform.isNotBlank()) " ${probe.miuiFreeform}" else ""
 }

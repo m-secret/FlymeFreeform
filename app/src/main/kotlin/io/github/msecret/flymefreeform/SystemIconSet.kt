@@ -55,6 +55,15 @@ object SystemIconSet {
         listOf("res/drawable-xxhdpi/", "res/drawable-xhdpi/", "res/drawable-hdpi/", "res/drawable/")
 
     /**
+     * 这台机器**有没有**可读的系统图标集（只看文件在不在，不解包）。
+     *
+     * ★ 给「默认 / 跟随系统」那个分岔用（`AppCatalog.resolveIcon`）：**没有可读图标集时
+     * 「跟随系统」只能退回 `pm.getApplicationIcon`**（小米就是这种），而那个图标**已经被系统
+     * 做成带形状的了** ⇒ 不能再裁圆。有可读图标集时（ColorOS 装了主题）走的是图标集那一套。
+     */
+    fun available(): Boolean = runCatching { File(ICONS_PATH).canRead() }.getOrDefault(false)
+
+    /**
      * 打开当前系统图标集。
      *
      * @return 不可用（没装主题 / 文件读不到 / 映射为空）时返回 **null**；否则返回一个会话，

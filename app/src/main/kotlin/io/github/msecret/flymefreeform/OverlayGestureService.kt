@@ -351,6 +351,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         getSystemService(DisplayManager::class.java)?.registerDisplayListener(displayListener, handler)
         launcher = FreeformLauncher()
         isRunning = true
+        // 告诉界面「服务起来了」：首页那颗按钮的文案靠它实时纠正，不再靠 `toggleService` 里
+        // 那 400ms 延时去猜（冷启动常常超过 400ms，见 [ServiceEvents]）。
+        ServiceEvents.notifyChanged()
         DebugLog.enabled = store.debugLogEnabled
         createNotificationChannel()
         // 触摸条巡检随服务常驻（见 [triggerWatchdog]）：它是「轮盘忽然再也呼不出来」唯一的
@@ -677,6 +680,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     override fun onDestroy() {
         isRunning = false
+        // 对称地喊一声：界面把按钮从「停止主动呼出」翻回「启动主动呼出」。
+        ServiceEvents.notifyChanged()
         runningService = null
         // 宿主没了，「窗内关闭」的常驻监听也要收掉（`isRunning` 已置 false，这一句会走 shutdown）。
         CaptionTapClose.sync(this)
@@ -1353,7 +1358,11 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                     // 横屏贴左 / 右（竖屏与「居中」都是居中显示）。见 AppDrawerPanel.sideMode。
                     // 「跟随呼出边」在这里被解析成具体的左 / 右（见 [resolvedLandscapeSide]）。
                     landscapeSide = resolvedLandscapeSide(),
-                    recent = store.recentComponents,
+                    // 「最近使用」不再只看「我们面板里点过谁」：系统使用记录（要「使用情况访问」
+                    // 权限）+ 无障碍观测到的前台包，两路按时间合并，都拿不到才退回我们自己那份。
+                    // 三路来源与合并规则全在 [RecentUsage]；这里把 `appEntries` 递进去当白名单，
+                    // 保证返回的组件一定能在面板里反查到实体。
+                    recent = RecentUsage.recentComponents(this, store, appEntries),
                     onSelected = { entry ->
                         hideDrawer()
                         DebugLog.info(
@@ -1364,7 +1373,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                         // ColorOS 可能判定为「非小窗场景」而退回全屏，所以等它彻底退场再拉起。
                         // 内置工具同理：面板必须先撤下，识屏/截屏才拿得到干净的屏幕内容。
                         handler.postDelayed(
-                            { worker.execute { launch(entry) } },
+                            { worker.execute { launch(entry, drawerSide) } },
                             DRAWER_LAUNCH_DELAY_MS,
                         )
                     },
@@ -1402,7 +1411,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                         applyTools()
                         notifyPanelChanged()
                     },
-                    onClearRecent = { store.clearRecent() },
+                    // 清除要连**系统那份记录的水位线**一起打上（见 [RecentUsage.clear]）：
+                    // 只清本地两份的话，系统统计下一帧就会把那批应用原样带回来。
+                    onClearRecent = { RecentUsage.clear(store) },
                     onDismiss = { hideDrawer() },
                 )
             } catch (error: Throwable) {
@@ -1625,7 +1636,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
                 entry != null -> {
                     removeMenu()
                     DebugLog.info("GESTURE_COMMIT", "side=$side app=${entry.label} ${entry.component.flattenToString()}")
-                    worker.execute { launch(entry) }
+                    worker.execute { launch(entry, side) }
                 }
                 else -> {
                     removeMenu()
@@ -1674,12 +1685,14 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             return
         }
         DebugLog.info("MENU_TAP", "app=${entry.label} ${entry.component.flattenToString()}")
+        // 撤轮盘会把 [activeSide] 清空（见 [removeMenu]），而「小窗贴哪一边」正需要它 ⇒ 先抄。
+        val side = activeSide
         removeMenu()
         // 粘滞态到这里就算结束了（轮盘已撤），触摸条的「手势中」状态必须一并收掉：
         // 否则它会一直停在「排除已暂停」上，直到下一次手势才可能复位——而用户接下来做的
         // 正是「小窗起来之后再去角落呼轮盘」。
         collapseTrigger()
-        worker.execute { launch(entry) }
+        worker.execute { launch(entry, side) }
     }
 
     /**
@@ -2466,7 +2479,17 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             else -> false
         }
 
-    private fun launch(entry: AppEntry) {
+    private fun launch(entry: AppEntry, side: CornerSide?) {
+        // 横屏时小窗要**贴呼出边**（用户 2026-10-10：小米原生横屏就是「左边呼出贴左、
+        // 右边呼出贴右」），所以把「这次是从哪一边呼出的」带给 [AospFreeformWindow]。
+        // 用进程内静态值而不是参数，是因为 [AospFreeformWindow.bounds] 是在**后台线程**
+        // 上被调用的（启动整条链路都在 worker 里跑），传参要改一整条调用链。
+        AospFreeformWindow.launchSide =
+            when (side) {
+                CornerSide.Left -> -1
+                CornerSide.Right -> 1
+                null -> 0
+            }
         // 内置工具：伪组件，不查 PackageManager，也不套小窗参数，直接在主线程执行。
         if (SystemTools.isTool(entry.component)) {
             val id = entry.component.className
@@ -2483,6 +2506,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
         val verdict = launcher.launch(this, target)
         if (verdict.isSuccess) {
+            // 小窗真的开出去了 ⇒ 计数 +1（竖屏叠加靠它算「第几个」，见 [AospFreeformWindow.noteLaunched]）。
+            AospFreeformWindow.noteLaunched()
             // 小窗是**动画展开**的：动画期间窗口边界接近全屏，会被无障碍那边的识别逻辑
             // 当成普通全屏应用跳过，于是遮罩挂晚了——用户这时候点「窗外」会点到下面的应用。
             // 这里让服务在接下来两秒多里密集重探几次，尽早抓住落定那一刻。
@@ -2505,6 +2530,21 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         private const val CHANNEL_ID = "noroot_corner_gesture"
 
         private const val NOTIFICATION_ID = 1001
+
+        /**
+         * 横屏轮盘半径的**收缩下限**（见 [menuLandscapeScale]）。
+         *
+         * 横屏按 `屏高 ÷ 屏宽` 收（本机 1200/2670 ≈ 0.45）。给个下限是为了让**更长的屏**
+         * 不再继续缩 —— 再小轮盘就小到点不准了。
+         */
+        private const val MIN_MENU_LANDSCAPE_SCALE = 0.45f
+
+        /**
+         * 横屏**图标**的收缩下限（见 [menuLandscapeIconScale]）。
+         *
+         * 半径收得狠、图标收得浅：图标跟着半径等比缩会把相邻图标挤在一起，所以给一个更松的下限。
+         */
+        private const val MIN_MENU_LANDSCAPE_ICON_SCALE = 0.7f
 
         /**
          * 盖好注入遮罩之后、真正注入之前要等的时间（ms）。见 [coverGestureShield]。

@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.widget.LinearLayout
@@ -63,22 +64,17 @@ class OutsideTapSettingsActivity : Activity() {
 
     private fun buildContent(): View {
         val root = Ui.pageRoot(this)
-        // ★ 这一页在**两种形态**下装的不是同一批东西（2026-10-09）：
-        //   - ColorOS：全套关闭方式（下面那些）；
-        //   - AOSP 形态（vivo / 小米）：只有「小窗尺寸」一个旋钮 —— 关闭方式那一批是照
-        //     ColorOS 的窗口形态做的，在那边一个都用不了，**摆出来比不摆更糟**（用户会一个个试）。
-        //   所以按形态整页分岔，而不是把一堆行置灰。
-        if (SystemSupport.freeformState(this) == SystemSupport.FreeformState.AOSP) {
-            root.addView(Ui.title(this, "小窗"))
-            renderAospPage(root)
-            return Ui.scrollPage(this, root)
-        }
+        // ★ **两种形态共用这一页**（2026-10-09 用户要求「保持一样的页面和功能，保留小米支持的」）：
+        //   - **窗外关闭** = 窗外盖遮罩接住点击 + 补一记上滑 ⇒ 只认「小窗矩形」，两家通用；
+        //   - **窗内关闭** = 点小横条 ⇒ 识别判据各家不同，但动作同源（[CaptionTapClose]）；
+        //   - **落点校准 / 上滑距离与时长** ⇒ 同一套注入参数，两家共用。
+        // AOSP 专属的「小窗尺寸」已拆到独立页 [FreeformSizeActivity]（设置页里是另一行）。
         root.addView(Ui.title(this, "小窗关闭方式"))
         root.addView(
             Ui.hint(
                 this,
                 "两种**触发方式**，可各自开关：点小窗**外面**关，或点小窗**自己的小横条**关 —— " +
-                    "做的都是同一件事：在小横条上补一记快速上滑（ColorOS 自带的关闭手势）。",
+                    "做的都是同一件事：在小横条上补一记快速上滑，那正是**系统自带的关闭手势**。",
             ),
         )
         // 用户 2026-10-07：「关闭落点校准这个优先级比较高，得让用户知道它在不生效时应该调它」。
@@ -103,20 +99,25 @@ class OutsideTapSettingsActivity : Activity() {
         renderSwitchSection()
         root.addView(Ui.spacer(this))
 
-        // ---- 关闭方式 ----
-        root.addView(Ui.sectionTitle(this, "关闭方式"))
-        val modeGroup = CardGroup(this)
-        root.addView(modeGroup)
-        renderCloseMode(modeGroup)
-        root.addView(
-            Ui.hint(
-                this,
-                "「关闭落点校准」只影响**窗外关闭**（落点按小窗边界估算）；「窗内关闭」用的是你点下去的" +
-                    "真实坐标。「高级设置 → 上滑手势」里的距离与时长两种方式共用。",
-            ),
-        )
-
         // ---- 关闭落点校准（常显，不折叠）----
+        //
+        // ★ 2026-10-10 **删掉了原来夹在这里的「关闭方式」一节**（用户：「关闭方式那个描述还有必要保留吗」
+        //   —— 他确认这条也是要删的）。那一节（`renderCloseMode`）只剩一行说明：
+        //   「上滑小横条关闭 / 落点按小窗边界估算；不需要 Shizuku，由无障碍模拟手势」。两条理由，
+        //   **两个系统上都成立**：
+        //   ① 它说的动作就是上面「触发方式」里两个开关背后共同做的那件事 —— 重复；
+        //   ② 「不需要 Shizuku」只对**窗外**那条路成立（失败能退到无障碍 `dispatchGesture`），
+        //      而**窗内关闭必须 Shizuku**（要常驻读系统日志才知道你点了小横条）—— 它却紧跟在
+        //      「窗内关闭」开关下面，那个开关的说明写着「需要先授权 Shizuku」，**自相矛盾**。
+        //      小米同理（窗内判据是 `MiuiFreeformModeTaskInfo` 日志，同样要 shell 身份）。
+        //   ℹ️ 那一节记着的「2026-10-07 隐藏 Shizuku 自动定位」那段历史没丢 ——
+        //      见 [SettingsStore.migrateOffCaptionAutoMode]。
+        //
+        // ★★ **两种形态都显示这一节**（2026-10-10 用户明确纠正：「别删关闭落点校准，这个是支持的」）：
+        //   我一度以为 AOSP 形态（小米）走 `closeViaTaskRemove` 直接 `am stack remove` 就不需要落点了，
+        //   按形态把它藏了起来 —— **判断错了**。小米上落点仍然参与（`CLOSE_MODE_SYSTEM` 那条路、
+        //   以及 `closeViaTaskRemove` 失败后的注入兜底都要它），而且用户实测它是有用的。
+        //   ⇒ **别再按形态分岔这一节。**
         //
         // 用户 2026-10-07 要求：**不要把它藏起来**。这是「小窗关不掉 / 把下层应用滑走了」时
         // 唯一能自救的旋钮；打开准星之后整组会高亮，提示用户照着红点校准。
@@ -224,70 +225,6 @@ class OutsideTapSettingsActivity : Activity() {
     }
 
     /**
-     * AOSP 形态（vivo OriginOS / 小米 MIUI·澎湃）这一页的**全部内容**。
-     *
-     * 只有一项能调：**小窗尺寸**。理由写在 [SettingsStore.aospFreeformScalePercent] 的注释里 ——
-     * 系统给的默认窗口小得离谱（HyperOS 实测占屏 31%×28%），应用在里面仍按整屏密度排版，
-     * 于是「窗口很小、字还是大的」；我们补一记 `am task resize` 把它调到合适大小
-     * （见 `AospFreeformWindow`），比例就是这一行。
-     *
-     * ⚠️ **关闭方式那一整套不在这里出现**：点窗外 / 小横条上滑 / 落点校准都依赖 ColorOS
-     * 那种「伴生装饰窗 + 日志 tag」的窗口形态，AOSP 自由窗的标题栏画在应用自己的窗口里、
-     * 关闭按钮是右上角那个 `close_window` —— 完全是另一套，还没取证。与其摆一排用不了的
-     * 开关让人一个个试，不如一句话说清。
-     */
-    private fun renderAospPage(root: LinearLayout) {
-        val connected = ShizukuShell.hasPermission
-        root.addView(
-            Ui.hint(
-                this,
-                if (connected) {
-                    "当前系统的小窗走**标准自由窗（AOSP Freeform）**，本应用用 Shizuku 的 shell 身份" +
-                        "把它拉起来，再补一记尺寸。"
-                } else {
-                    "当前系统的小窗走**标准自由窗（AOSP Freeform）**，但它必须由 **Shizuku** 的 shell " +
-                        "身份发起 —— 现在 Shizuku 没连上，应用会退成**全屏**打开，系统还会弹一次" +
-                        "「想要打开 XX，是否允许？」的确认框。去首页把 Shizuku 授权了就正常了。"
-                },
-            ),
-        )
-
-        root.addView(Ui.sectionTitle(this, "小窗尺寸"))
-        root.addView(
-            CardGroup(this)
-                .row(
-                    seekRow(
-                        label = "小窗占屏比例",
-                        value = store.aospFreeformScalePercent,
-                        min = SettingsStore.MIN_AOSP_FREEFORM_SCALE,
-                        max = SettingsStore.MAX_AOSP_FREEFORM_SCALE,
-                        detail = "%，两个方向等比缩放，居中摆放",
-                    ) { value ->
-                        store.aospFreeformScalePercent = value
-                    },
-                ),
-        )
-        root.addView(
-            Ui.hint(
-                this,
-                "系统给的默认窗口只有屏幕的三成左右，应用在里面还是按整屏排版，所以看着" +
-                    "「窗口很小、字很大」。这里设的是**下一次打开**用的尺寸（默认 " +
-                    "${SettingsStore.DEFAULT_AOSP_FREEFORM_SCALE}%，约等于等比缩到六成）。",
-            ),
-        )
-
-        root.addView(Ui.sectionTitle(this, "关闭方式"))
-        root.addView(
-            Ui.hint(
-                this,
-                "**还没适配**：点窗外关闭、点小横条关闭、落点校准，都是照 ColorOS 的窗口形态做的。" +
-                    "AOSP 自由窗的标题栏画在应用自己的窗口里（右上角有最大化 / 关闭按钮），" +
-                    "要另找判据，得先在真机上取证。在那之前先用系统自己的方式关（点窗外或点关闭按钮）。",
-            ),
-        )
-    }
-
-    /**
      * 重画「遮罩范围」两个开关。
      *
      * 两项是**同一件事的两端**（`sidesOnly` 只遮左右、`verticalOnly` 只遮上下），都开等于
@@ -349,9 +286,20 @@ class OutsideTapSettingsActivity : Activity() {
         val on = store.closeAnchorMarkerEnabled
         calibrationSection.removeAllViews()
         if (on) {
-            calibrationSection.addView(Ui.pill(this, "照着小窗底部的红点调下面两项"))
+            calibrationSection.addView(Ui.pill(this, "照着小窗底部的红点调下面的落点"))
         }
-        calibrationSection.addView(
+        // ★ 「点击位置距小窗底边」这一行**两种形态名字完全一样**，只有底层键不同（小米那套默认
+        //   竖 8 / 横 6，见 `SettingsStore.anchorKey`）—— 用户 2026-10-10 明确要求「名字和 ColorOS
+        //   保持一致，只加横屏竖屏」。所以这里**不要**出现「MIUI」字样。
+        // ★★ 落点**分不分横竖屏**，由 [SettingsStore.anchorDiffersByOrientation] 说了算：
+        //   - **AOSP（小米 / 澎湃）**：分。横屏窗更扁、系统画横条的位置不同，一套值两头跑必然
+        //     有一头不准（用户 2026-10-10：「校准也是根据横竖屏校准」）⇒ 两行都显示。
+        //   - **其余（ColorOS 等）**：**不分**，横竖屏共用一套（用户 2026-10-10：
+        //     「**这个系统应该横竖屏用一个的**」）⇒ 只显示一行，标签也不带「（竖屏）」。
+        //   ⚠️ 判据来自 SettingsStore（问**能力**），这里**别**自己写 ROM 判断。
+        //   ⚠️ 副标题**不写默认值**：小米那套是 8 / 6，别的系统是 4，写死会有一头说错。
+        val perOrientation = store.anchorDiffersByOrientation
+        val group =
             CardGroup(this)
                 .row(
                     Ui.switchRow(
@@ -371,7 +319,7 @@ class OutsideTapSettingsActivity : Activity() {
                         value = store.closeAnchorXPercent,
                         min = SettingsStore.MIN_CLOSE_ANCHOR_X_PERCENT,
                         max = SettingsStore.MAX_CLOSE_ANCHOR_X_PERCENT,
-                        detail = "占小窗宽度 %（50 = 水平中点）",
+                        detail = "占小窗宽度 %，50 = 水平中点",
                     ) { value ->
                         store.closeAnchorXPercent = value
                         FreeformAccessibilityService.refreshIfRunning()
@@ -379,27 +327,61 @@ class OutsideTapSettingsActivity : Activity() {
                 )
                 .row(
                     seekRow(
-                        label = "点击位置距小窗底边",
+                        label = if (perOrientation) {
+                            "点击位置距小窗底边（竖屏）"
+                        } else {
+                            "点击位置距小窗底边"
+                        },
                         value = store.closeAnchorYDp,
                         min = SettingsStore.MIN_CLOSE_ANCHOR_Y_DP,
                         max = SettingsStore.MAX_CLOSE_ANCHOR_Y_DP,
-                        detail = "dp，正数往窗内、负数往窗外（默认 ${SettingsStore.DEFAULT_CLOSE_ANCHOR_Y_DP}）",
+                        detail = "dp，正数往窗内、负数往窗外",
                     ) { value ->
                         store.closeAnchorYDp = value
                         FreeformAccessibilityService.refreshIfRunning()
                     },
-                ),
-        )
+                )
+        if (perOrientation) {
+            group.row(
+                seekRow(
+                    label = "点击位置距小窗底边（横屏）",
+                    value = store.closeAnchorYDpLandscape,
+                    min = SettingsStore.MIN_CLOSE_ANCHOR_Y_DP,
+                    max = SettingsStore.MAX_CLOSE_ANCHOR_Y_DP,
+                    detail = "dp，横屏那一套",
+                ) { value ->
+                    store.closeAnchorYDpLandscape = value
+                    FreeformAccessibilityService.refreshIfRunning()
+                },
+            )
+        }
+        calibrationSection.addView(group)
         calibrationSection.addView(
             Ui.hint(
                 this,
-                if (on) {
+                (if (on) {
                     "把红点调到**正好压在小窗底部那条小横条上**。调完把准星关掉即可，设置会保留。"
                 } else {
-                    "打开准星——红点就是即将点击的位置，照着它调下面两项。"
-                },
+                    "打开准星——红点就是即将点击的位置，照着它调下面的落点。"
+                }) + " 只影响**窗外关闭**。",
             ),
         )
+        // ★ 这一组自己的恢复默认（用户 2026-10-10：「关闭落点校准也加上恢复默认」）。
+        //   只管落点那三项，**不动「显示准星」开关** —— 那是"看"的辅助，正在校准的人不需要被关掉。
+        calibrationSection.addView(Ui.spacer(this))
+        calibrationSection.addView(Ui.outlinedButton(this, "关闭落点校准恢复默认") { resetCloseAnchor() })
+    }
+
+    /**
+     * 「关闭落点校准」恢复默认：落点回默认。
+     *
+     * 默认值**按形态分**（小米竖 8 / 横 6，其余 4）⇒ 走 [SettingsStore.resetCloseAnchor] 删键回落，
+     * 别在这里写死一个数（见那里的说明）。
+     */
+    private fun resetCloseAnchor() {
+        store.resetCloseAnchor()
+        FreeformAccessibilityService.refreshIfRunning()
+        renderCalibration()
     }
 
     /**
@@ -534,35 +516,6 @@ class OutsideTapSettingsActivity : Activity() {
             FreeformAccessibilityService.refreshIfRunning()
             renderSwitchSection()
         }
-
-    /**
-     * 重画「关闭方式」。
-     *
-     * ★ 用户 2026-10-07 要求**隐藏「Shizuku 自动定位」那个选项**：它读系统日志拿小横条真实坐标，
-     * 但学到的是**绝对坐标**、属于学到那一刻的那一扇窗；屏上两扇以上时几乎必然是上一扇窗留下的
-     * 坐标，只能整条作废退回估算——用户实测「识别的位置不对」。多扇窗是常态，所以它实际帮不上忙，
-     * 还白起一个 Shizuku 子进程。
-     *
-     * 折回估算**没有行为回归**：那条自动路本来就一直在失败后退回估算
-     * （真机统计：297 次尝试、**0 次成功**）。见 [SettingsStore.migrateOffCaptionAutoMode]。
-     *
-     * 只剩一种行为，就不再是「单选」了，用一行纯说明呈现。
-     * 注意用 [CardGroup.setRows]（替换）而不是 `rows`（追加），否则会复制。
-     */
-    private fun renderCloseMode(group: CardGroup) {
-        val texts =
-            LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(Ui.rowTitle(this@OutsideTapSettingsActivity, "上滑小横条关闭"))
-                addView(
-                    Ui.rowDetail(
-                        this@OutsideTapSettingsActivity,
-                        "落点按小窗边界估算；不需要 Shizuku，由无障碍模拟手势",
-                    ),
-                )
-            }
-        group.setRows(listOf(Ui.row(this).apply { addView(texts) }))
-    }
 
     /**
      * 可折叠分区：标题行（放进 [CardGroup] 里当一行）+ 内容容器（后续 addView 都加在它上面）。

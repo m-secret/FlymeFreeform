@@ -5,6 +5,9 @@ import android.os.SystemClock
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 「窗内关闭」：**单击小窗自己的小横条**，就把小窗关掉。
@@ -62,6 +65,27 @@ object CaptionTapClose {
     /** 按下点与 `onSingleTapUp` 之间允许的最大间隔（ms）。与 ColorOS 自己认单击的口径一致。 */
     private const val MATCH_WINDOW_MS = 1_200L
 
+    // ---- 小米 / 澎湃（`MiuiFreeformModeTaskInfo` / `MiuiFreeformModeAnimation`）----
+    //
+    // 判据和上面那套**不同**：小米没有「单击抬起」这种明确的一行，但它**按下小横条时**
+    // 会打一行 `setDownParams`（带 taskId），而**用户自己在拖动小横条**时会打
+    // `applyBottomCaptionDragAnimation`。于是判定是：
+    //   按下小横条 → 250ms 内没等到拖动动画 ⇒ 当成单击 ⇒ 补一记上滑。
+    // 按下点的坐标在紧挨着的那行 `isWithinTopCaptionRegion … x= … y= …` 里
+    // （2026-10-09 在小米 15 / HyperOS 4.0 上逐条比对 logcat 得来）。
+
+    /** 按在小横条上（这一行带 taskId）。 */
+    private val MIUI_DOWN_REGEX = Regex("""\bsetDownParams\b""")
+
+    /** 按下点：`isWithinTopCaptionRegion: … x= 511 y= 1600 …`。 */
+    private val MIUI_POINT_REGEX = Regex("""\bx=\s*(\d+)\s+y=\s*(\d+)""")
+
+    /** 用户自己在拖动小横条 —— 那就不该补刀（他自己会上滑关）。 */
+    private val MIUI_DRAG_REGEX = Regex("""\bapplyBottomCaptionDragAnimation\b""")
+
+    /** 按下之后等多久没等到拖动动画，就认定是「单击」。 */
+    private const val MIUI_TAP_DELAY_MS = 250L
+
     /** 按下点必须低于这条线才算小横条（顶部那条状态栏附近的不算）。 */
     private const val MIN_PRESS_Y = 555
 
@@ -84,8 +108,11 @@ object CaptionTapClose {
      * `-T 1` 只回放最近 1 行（最多一行，凑不出「一对」），之后照常跟随。
      */
     private const val COMMAND =
-        "echo \$\$; exec /system/bin/logcat -v brief -T 1 'FlexiblePointerHandler:D' " +
-            "'FlexibleTaskCaptionView:I' '*:S'"
+        "echo \$\$; exec /system/bin/logcat -v brief -T 1 " +
+            // ColorOS：小横条的按下点 + 「单击抬起」
+            "'FlexiblePointerHandler:D' 'FlexibleTaskCaptionView:I' " +
+            // 小米 / 澎湃：小横条按下的参数（带 taskId）+ 拖动动画（用户自己在滑）
+            "'MiuiFreeformModeTaskInfo:D' 'MiuiFreeformModeAnimation:D' '*:S'"
 
     /**
      * 所有状态迁移都排在这条单线程上。
@@ -94,6 +121,14 @@ object CaptionTapClose {
      * 起 `logcat`，都**不能压在主线程**上。
      */
     private val executor = Executors.newSingleThreadExecutor { Thread(it, "caption-tap-close") }
+
+    /**
+     * 「按下小横条之后，等 250ms 看有没有拖动动画」用的定时器（小米那条判据）。
+     *
+     * 不能用 [executor]：那条线程被 `readLoop` 的读循环占着，在它上面 sleep 会把日志读卡住。
+     */
+    private val scheduler =
+        Executors.newSingleThreadScheduledExecutor { Thread(it, "caption-tap-delay") }
 
     /** 「此刻该不该在监听」。与 [listener] 分开：进程意外死掉时它还是 true，好据此重启。 */
     @Volatile
@@ -119,11 +154,12 @@ object CaptionTapClose {
     }
 
     private fun applyState(context: Context) {
-        // ★ 非 ColorOS 上直接不干活：这条链路盯的是 ColorOS 小横条的日志
-        // （`FlexibleTaskCaptionView`），别的系统上永远不会有那一行 —— 白起一个常驻 logcat
-        // 进程，还占着 Shizuku。判据见 [SystemSupport]。
+        // ★ 只在「系统自带小窗、且我们能驱动它」的形态上干活：ColorOS（OURS）与 AOSP 自由窗
+        // （小米 / 澎湃，AOSP 档）都行 —— 两家的日志判据不同，但「按下小横条 → 补一记上滑」
+        // 这件事是一样的（见 [readLoop] 里那两段）。Flyme（NATIVE）与没有小窗的系统不干活。
+        val state = SystemSupport.freeformState(context)
         desired =
-            SystemSupport.freeformUsable(context) &&
+            (state == SystemSupport.FreeformState.OURS || state == SystemSupport.FreeformState.AOSP) &&
                 SettingsStore(context).captionTapCloseEnabled &&
                 ShizukuShell.hasPermission &&
                 screenOn &&
@@ -169,6 +205,11 @@ object CaptionTapClose {
         var pressX = 0
         var pressY = 0
         var pressAt = 0L
+        // 小米那条判据的状态：按下点 + 「还没等到拖动动画」的待定标记（定时器在另一条线程上读它）。
+        var miuiX = 0
+        var miuiY = 0
+        val miuiPending = AtomicBoolean(false)
+        val miuiGeneration = AtomicInteger(0)
         var first = true
         try {
             BufferedReader(InputStreamReader(process.inputStream), 8192).use { reader ->
@@ -180,6 +221,39 @@ object CaptionTapClose {
                         line.trim().toIntOrNull()?.let { prefs.edit().putInt(KEY_PID, it).apply() }
                         continue
                     }
+                    // ---- 小米 / 澎湃 ----
+                    // ① 按下点（这一行紧跟在 `setDownParams` 前面）
+                    MIUI_POINT_REGEX.find(line)?.let { match ->
+                        miuiX = match.groupValues[1].toIntOrNull() ?: miuiX
+                        miuiY = match.groupValues[2].toIntOrNull() ?: miuiY
+                    }
+                    // ② 用户自己在拖动小横条 ⇒ 撤掉待定（他自己会上滑关，别多补一刀）
+                    if (MIUI_DRAG_REGEX.containsMatchIn(line)) {
+                        miuiPending.set(false)
+                        continue
+                    }
+                    // ③ 按在小横条上 ⇒ 起一个 250ms 定时器：到点还没等到拖动动画就当成单击
+                    if (MIUI_DOWN_REGEX.containsMatchIn(line)) {
+                        if (miuiX > 0 && miuiY > 0) {
+                            val generation = miuiGeneration.incrementAndGet()
+                            val x = miuiX
+                            val y = miuiY
+                            miuiPending.set(true)
+                            scheduler.schedule(
+                                {
+                                    if (miuiPending.compareAndSet(true, false) &&
+                                        miuiGeneration.get() == generation
+                                    ) {
+                                        onCaptionTap(context, x, y)
+                                    }
+                                },
+                                MIUI_TAP_DELAY_MS,
+                                TimeUnit.MILLISECONDS,
+                            )
+                        }
+                        continue
+                    }
+                    // ---- ColorOS ----
                     val press = PRESS_REGEX.find(line)
                     if (press != null) {
                         pressX = press.groupValues[1].toIntOrNull() ?: 0

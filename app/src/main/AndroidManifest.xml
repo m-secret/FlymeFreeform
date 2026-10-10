@@ -14,6 +14,11 @@
     <!-- 枚举所有已安装应用（用于检测图标包、应用列表）。 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- 「更多」面板「最近使用」读系统应用使用记录（见 RecentUsage）。
+         这是 Android 的「使用情况访问」特殊权限：**写进 manifest 不会自动生效**，
+         必须在系统设置里由用户手动打开；没开就自动退回「本应用观测到的前台应用」。 -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
     <!-- 开机自启：系统重启后自动恢复 Shizuku 监听与主动呼出服务。 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 「关于」页的「检查更新」要访问 GitHub 的 releases 接口。这是全应用唯一一处联网，
@@ -85,6 +90,13 @@
             android:name=".OutsideTapSettingsActivity"
             android:exported="false"
             android:label="小窗关闭方式" />
+
+        <!-- 小窗尺寸：只有 AOSP 形态（小米 / vivo）才有的入口，ColorOS 由系统自己定大小。
+             页面里还带「大小校准」（仅小米），所以不再单独开一页。 -->
+        <activity
+            android:name=".FreeformSizeActivity"
+            android:exported="false"
+            android:label="小窗尺寸" />
 
         <!-- 「更多」面板的行为参数（默认页 / 工具顺序 / 底栏沉底）。 -->
         <activity

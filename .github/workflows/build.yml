@@ -45,8 +45,13 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # ★★ 必须带 `-PflymeFreeformDebugSuffix=`（等号后为空）：
+      # `debug` buildType 默认给 versionName 加 `-debug` 后缀（本地调试包用来一眼分辨），
+      # 而**本项目发版用的就是 debug 构建**（见 `TOOLING.md`）⇒ 不带这个参数，
+      # 挂到 Release 上的 APK 版本号会是 `1.1.6-debug`，装到用户手上「关于」页也显示 `-debug`。
+      # 命令行 `-P` 优先于配置文件，空串会被 `getOrElse` 原样返回（不是 null）。
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: ./gradlew :app:assembleDebug -PflymeFreeformDebugSuffix= --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

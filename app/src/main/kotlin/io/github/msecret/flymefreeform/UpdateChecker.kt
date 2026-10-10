@@ -132,10 +132,16 @@ object UpdateChecker {
      *
      * 逐段比而不是字符串比：字符串比会得出 `"1.0.10" < "1.0.9"` 这种反直觉结论。
      * 段数不一致时短的补 0（`1.0` 与 `1.0.0` 视为相同）。
+     *
+     * ★★ **先剥掉预发布后缀**（`-debug` / `-beta` / `+build` 之类），否则本地调试包会**永远提示有更新**：
+     * 调试包的 `versionName` 是 `1.1.6-debug`（见 `app/build.gradle.kts` 的 `versionNameSuffix`），
+     * 第三段 `"6-debug".toIntOrNull()` 拿到 null 就补 0 ⇒ 解析成 `1.1.0`，于是它比线上那个
+     * `1.1.6` 永远「旧」，更新页一直亮着、点进去下的还是同一个包（用户 2026-10-10 提的后缀需求，
+     * 这个坑必须一起堵）。剥掉之后 `1.1.6-debug` 与 `1.1.6` **视为同一版**。
      */
     fun isNewer(remote: String, local: String): Boolean {
-        val r = remote.split('.').map { it.toIntOrNull() ?: 0 }
-        val l = local.split('.').map { it.toIntOrNull() ?: 0 }
+        val r = segments(remote)
+        val l = segments(local)
         for (index in 0 until maxOf(r.size, l.size)) {
             val a = r.getOrElse(index) { 0 }
             val b = l.getOrElse(index) { 0 }
@@ -143,6 +149,10 @@ object UpdateChecker {
         }
         return false
     }
+
+    /** 把 `1.1.6-debug` / `1.1.6+build.7` 这种剥成纯点分数字再切段；非数字段一律按 0。 */
+    private fun segments(version: String): List<Int> =
+        version.substringBefore('-').substringBefore('+').split('.').map { it.toIntOrNull() ?: 0 }
 
     /** 用系统浏览器打开一个链接；没有任何应用能接时给一句提示而不是崩掉。 */
     fun openUrl(context: Context, url: String) {

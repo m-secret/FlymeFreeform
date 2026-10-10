@@ -3,6 +3,7 @@ package io.github.msecret.flymefreeform
 import android.app.Activity
 import android.os.Bundle
 import android.view.View
+import android.widget.LinearLayout
 
 /**
  * 「更多」面板的设置页。
@@ -17,6 +18,10 @@ import android.view.View
  *    `SettingsStore.landscapePanelSide`，默认「跟随呼出边」。
  *    只管横屏：竖屏永远是居中的小窗（用户明确要求竖屏逻辑不动）。贴左 / 贴右之后底栏会
  *    从卡片下方改排到卡片外侧一列；
+ * 3. **「最近使用」要不要读系统使用记录**——这一项没有本地开关可存：授权状态本身在系统里
+ *    （`PACKAGE_USAGE_STATS`，系统设置里的「使用情况访问」），我们只负责**引导 + 显示状态**。
+ *    它读的是全机应用使用记录，比「本应用观测到的前台应用」全得多，代价是要用户手动开一次。
+ *    两条路怎么合并见 [RecentUsage]。
  * 工具页顺序与底栏成员**不在这里**——连带它们的「恢复默认 / 清空」一起，都在
  * **「管理应用」页**（理由见下）。
  *
@@ -50,6 +55,14 @@ class DrawerSettingsActivity : Activity() {
     private lateinit var landscapeGroup: CardGroup
 
     /**
+     * 「最近使用」那一行「读取系统使用记录」的入口。
+     *
+     * 留成字段是为了从系统「使用情况访问」页回来时**就地改它的副标题**——
+     * 授权状态是会变的（见 [onResume]）。
+     */
+    private var usageAccessRow: LinearLayout? = null
+
+    /**
      * 「后台隐藏」：用户主动离开应用时，把整个 task 结束并移出「最近任务」。
      * 为什么必须逐个 Activity 挂、为什么不用别的 API，都写在 [AppContext.hideFromRecentsOnLeave]。
      */
@@ -62,6 +75,17 @@ class DrawerSettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = SettingsStore(this)
         setContentView(buildContent())
+    }
+
+    /**
+     * 从系统「使用情况访问」页回来时刷新那一行的状态。
+     *
+     * 这一页是**普通 Activity**，切出去再回来会正常走 `onResume`，所以不需要
+     * [SettingsEvents] 那一套——那套是专给「不占焦点、底下那页收不到 `onResume`」的悬浮面板用的。
+     */
+    override fun onResume() {
+        super.onResume()
+        (usageAccessRow?.tag as? Ui.RowTexts)?.detail?.text = usageAccessStatus()
     }
 
     private fun buildContent(): View {
@@ -104,6 +128,30 @@ class DrawerSettingsActivity : Activity() {
             Ui.hint(
                 this,
                 "两页之间可以左右滑动切换。",
+            ),
+        )
+
+        // ---- 最近使用 ----
+        //
+        // 「最近使用」这一行的数据来源有两条（见 [RecentUsage]）：系统使用记录、
+        // 无障碍观测到的前台应用。无障碍那一路跟着服务走，首页已经在管它了；
+        // 这里**只放唯一需要用户动手的那一样**——系统那份的「使用情况访问」权限。
+        root.addView(Ui.sectionTitle(this, "最近使用"))
+        usageAccessRow =
+            Ui.entryRow(
+                context = this,
+                text = "读取系统使用记录",
+                // 状态放副标题：标题是固定身份、副标题是「现在怎么样」（会变的放副标题）。
+                detail = usageAccessStatus(),
+            ) {
+                AppContext.startActivity(this, RecentUsage.usageAccessIntent(this))
+            }
+        usageAccessRow?.let { root.addView(CardGroup(this).row(it)) }
+        root.addView(
+            Ui.hint(
+                this,
+                "打开后，「最近使用」读的是**系统那份使用记录**；不开则退回本应用自己观测到的" +
+                    "前台应用。",
             ),
         )
 
@@ -204,4 +252,13 @@ class DrawerSettingsActivity : Activity() {
             ),
         )
     }
+
+    /**
+     * 「读取系统使用记录」那一行的副标题：当前有没有拿到「使用情况访问」。
+     *
+     * 未开启时的文案要**顺带说清「点它会发生什么」**——这一行点了是跳到系统设置，
+     * 只写「未开启」用户不知道下一步该干嘛。
+     */
+    private fun usageAccessStatus(): String =
+        if (RecentUsage.hasUsageAccess(this)) "已开启" else "未开启，点这里去系统设置里打开"
 }

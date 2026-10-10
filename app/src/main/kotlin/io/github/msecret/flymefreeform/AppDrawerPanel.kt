@@ -84,7 +84,12 @@ class AppDrawerPanel(
      * **只对横屏生效**（见 [sideMode]）：竖屏无论选什么都走「居中 + 底栏在卡片下方」那一套。
      */
     private val landscapeSide: String = SettingsStore.SIDE_CENTER,
-    /** 「最近使用」的应用（有序，最近用的在最前，最多 [SettingsStore.MAX_RECENT] 个）。 */
+    /**
+     * 「最近使用」的应用（有序，最近用的在最前，最多 [SettingsStore.MAX_RECENT] 个）。
+     *
+     * 由调用方算好递进来——面板只管显示，取数与合并规则在 [RecentUsage]。
+     * 里面装的一定是 [apps] 里的组件（同一个包在目录里的那个入口），所以 [appsByComponent] 反查得到。
+     */
     recent: List<ComponentName>,
     private val onSelected: (AppEntry) -> Unit,
     /** 切换「轮盘固定」。返回 null 表示成功，否则返回给用户看的失败原因。 */

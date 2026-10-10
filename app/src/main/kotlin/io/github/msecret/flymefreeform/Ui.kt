@@ -476,10 +476,17 @@ object Ui {
             setTextColor(COLOR_ON_SURFACE)
         }
 
-    /** `bodySmall` + onSurfaceVariant：行里的次级说明。 */
+    /**
+     * `bodySmall` + onSurfaceVariant：行里的次级说明。
+     *
+     * ★ 和 [hint] / [AppDialog] 一样认 `**加粗**`（走 [boldSpans]）。
+     * 这里原来直接 `this.text = text`，于是 `detail` 里写了 `**` 的地方**星号会原样显示**出来
+     * （用户 2026-10-10 报的「没加粗，是样式没识别」——出在「小窗尺寸」页那两条滑块说明上）。
+     * 副标题、[switchRow] / [choiceRow] / [seekRow] 的说明都走这个函数，改这一处就全好了。
+     */
     fun rowDetail(context: Context, text: String): TextView =
         TextView(context).apply {
-            this.text = text
+            this.text = boldSpans(text)
             m3(context, 11.5f)
             setTextColor(COLOR_ON_SURFACE_VARIANT)
             setPadding(0, dpF(context, 3f), 0, 0)
@@ -1064,6 +1071,9 @@ class TabStrip(
                     gravity = Gravity.CENTER
                     setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(LABEL_SP))
                     maxLines = 1
+                    // 关掉字体自带的上下 padding：单行标签用不上它，开着白送几像素高度，
+                    // 而这几像素直接进底栏总高（用户连着三轮要的就是「矮下来」）。
+                    includeFontPadding = false
                 }
             // 药丸只裹图标：它就是 M3 navigation bar 的 indicator，尺寸固定在
             // [PILL_WIDTH_DP] × [PILL_HEIGHT_DP]，所以背景直接铺满这一层即可、不用再算居中的图层。
@@ -1166,29 +1176,92 @@ class TabStrip(
     }
 
     /**
-     * 按系统底栏高度决定留白，并把图标+文字这一整块在底栏里**上下居中**。
+     * 按系统底栏高度决定留白，并把图标+文字这一整块在**整段底栏里视觉居中**。
      *
-     * 要居中的是「上方那条分隔线 → 屏幕底（或系统底栏上沿）」这一段，所以留白必须加在
-     * **分隔线与行之间**、以及**行与屏底之间**：做成 TabStrip 自身的上内边距是不行的——
-     * padding 落在第一个子 View（分隔线）上面，分隔线被推下来、行却紧贴着它，底下空出
-     * 长长一条（用户反馈「图标+文字整体没上下居中」）。这里改给 [row] 加**上下外边距**。
+     * 要居中的是「上方那条分隔线 → **屏幕底**」这一段，所以留白必须加在**分隔线与行之间**、
+     * 以及**行与屏底之间**：做成 TabStrip 自身的上内边距是不行的——padding 落在第一个子 View
+     * （分隔线）上面，分隔线被推下来、行却紧贴着它，底下空出长长一条（用户反馈「图标+文字
+     * 整体没上下居中」）。这里改给 [row] 加**上下外边距**。
      *
-     * [systemBottom] 是系统底栏占掉的高度，它**整个**落在下方——那一段本来就画不到，
-     * 不能拿来当「留白的一半」，所以是「下外边距 slack/2 + 底部 padding systemBottom」，
-     * 屏幕上看得见的下方空隙正好也是 slack/2。
+     * ## ★★ 为什么要算到「屏幕底」而不是「系统横条上沿」（2026-10-09 HyperOS 真机取证）
+     *
+     * 本应用的底栏背景色与页面背景色**完全相同**（都是 M3 的 surface，实测 `#F5F6F8`），
+     * 连手势小横条那一段也是同一个色。于是屏幕上唯一能看出「这里是底栏」的，只有顶上那条
+     * 1dp 分隔线 —— 用户眼里的「底栏」= **分隔线到屏幕底这一整段**。
+     *
+     * 那么图标+文字就必须在**这一整段**里居中。早先的写法是「上下各 slack/2，再把
+     * systemBottom 整个垫在下面」，等于只让内容在「分隔线 → 横条上沿」里居中，于是
+     * 整段看下来内容**偏上**。
+     *
+     * 小米 15 / HyperOS 4.0 实测（1200×2670 @480dpi，`dumpsys window displays`）：
+     *
+     * | 来源 | 底部高度 |
+     * | --- | --- |
+     * | `navigationBars` | **60px**（就是那条手势小横条） |
+     * | `mandatorySystemGestures` | 60px |
+     * | `tappableElement` | 0 |
+     *
+     * ⇒ `systemBottom = 60px`。按老写法，内容中心比整段中心**偏上 55px**（像素量出来的：
+     * 内容中心 y=2468，整段中心 y=2523），观感就是「底栏很高、内容挤在上半截、下面空一大条」。
+     *
+     * ## ★★ 系统栏那段**可能已经被外层让掉了**，别再让第二次（2026-10-09 真机定位）
+     *
+     * 小米 15 / HyperOS 4.0 实测（`TAB_SIZE` 日志）：
+     *
+     * ```
+     * strip=220  top=2390  bottomOnScreen=2610  screenH=2670  decorPadB=0
+     * ```
+     *
+     * `DecorView` 的 padding 是 **0**，可本 View 的底边已经在 **y=2610**（屏幕是 2670）——
+     * 也就是说系统栏那 60px **已经被 content 层让掉了**。老写法在这里又
+     * `setPadding(0, 0, 0, 60)` 让了**第二次** ⇒ 内容被凭空顶高 60px，这正是用户连着
+     * 两轮说的「**底栏太高**」；而 slack 被劈成两半、每边只剩 4dp，又成了「**离上面分割线
+     * 太紧**」。一个 bug 两个症状。
+     *
+     * 所以让位改成**按实际空隙算**（见 [ownBottomPadding]）：外层让过了就一点都不用让。
+     *
+     * ## 留白怎么分
+     *
+     * 上下各 `slack/2`（本 View 底边已经在外层让位后的正确位置上，不用再区分系统栏）。
+     * ColorOS 上 `systemBottom = 0`，走 [SLACK_FALLBACK_DP]。
      */
     private fun setGap(systemBottom: Int) {
         val slack = dp(if (systemBottom > 0) SLACK_DP else SLACK_FALLBACK_DP)
+        val top = slack / 2
+        val bottom = slack / 2
+        val ownPad = ownBottomPadding(systemBottom)
         // 刻意绕开 DebugLog 的开关直接写 logcat：**窗口 inset 是排版前提**，以后凡是
         // 「底栏位置不对 / 被手势条压住」，第一件事都是看这一行。它只在 attach 与 inset
         // 变化时打，不会刷屏（旋转、切导航方式、弹键盘才各来一次）。
-        android.util.Log.i(TAG, "TAB_INSET system=$systemBottom slackPx=$slack")
+        android.util.Log.i(TAG, "TAB_INSET system=$systemBottom slackPx=$slack ownPad=$ownPad")
         (row.layoutParams as? LayoutParams)?.let {
-            it.topMargin = slack / 2
-            it.bottomMargin = slack / 2
-            row.requestLayout()
+            // 值没变就别 requestLayout：本方法会在 onLayout 里被再调一次，无条件重排会打架。
+            if (it.topMargin != top || it.bottomMargin != bottom) {
+                it.topMargin = top
+                it.bottomMargin = bottom
+                row.requestLayout()
+            }
         }
-        setPadding(0, 0, 0, systemBottom)
+        // setPadding 传相同值时自身就不会触发重排，可以放心重复调。
+        setPadding(0, 0, 0, ownPad)
+    }
+
+    /**
+     * 本 View 自己还需要在底部让出多少像素。
+     *
+     * 判据是「**本 View 底边到屏幕底还剩多远**」：只要这个距离已经不小于 `systemBottom`，
+     * 就说明外层已经把系统栏那段让出来了（本 View 根本压不到系统栏），自己一点都不用让。
+     *
+     * 这个距离只由**外层布局**决定，不受本 View 的 padding 影响，所以来回调用不会震荡
+     * （这一点很关键：如果拿「本 View 的高度」去推，就会和 padding 互相影响、来回重排）。
+     */
+    private fun ownBottomPadding(systemBottom: Int): Int {
+        if (systemBottom <= 0) return 0
+        if (!isLaidOut) return systemBottom // 还没量过，先按老办法保守让一次；布局完成后 onLayout 会纠正
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        val gapBelow = resources.displayMetrics.heightPixels - (location[1] + height)
+        return (systemBottom - gapBelow.coerceAtLeast(0)).coerceAtLeast(0)
     }
 
     /**
@@ -1197,6 +1270,17 @@ class TabStrip(
      * `attach` 当下 [rootWindowInsets] 可能还没分发到位（返回 null），`post` 一发就稳了——
      * 那时 `init` 里那次用兜底值画的 padding 会被这里替换成按真实 inset 算的结果。
      */
+    /**
+     * 布局完成后再算一次留白。
+     *
+     * 「本 View 底边离屏幕底多远」要等布局完才量得到（见 [ownBottomPadding]），而它决定
+     * 要不要自己让系统栏 —— 所以这里必须补一次。[setGap] 对相同的值不会重排，不会循环。
+     */
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        setGap(windowBottomInset())
+    }
+
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         post { applyBottomGap() }
@@ -1263,18 +1347,21 @@ class TabStrip(
         /**
          * 内容上下**合计**的呼吸量（一半在上、一半在下）。**系统报得出底栏高度时**用这一档。
          *
-         * 从 28 收到 14：这几档留白是底栏「高」的主要来源，而用户连着两轮要的就是它矮下来。
+         * 28 → 14 → 8 → **18**：中间那两轮是在「重复让位」的 bug 上做补偿 —— 底栏被系统栏
+         * 白顶了 60px，只好拼命压留白，结果上留白只剩 4dp、内容贴着分割线（用户 2026-10-09：
+         * 「**离上面分割线太紧了**」）。让位修好（见 [setGap] / [ownBottomPadding]）之后，
+         * 留白回到正常值：上下各 9dp，底栏反而比出 bug 时更矮。
          */
-        const val SLACK_DP = 14
+        const val SLACK_DP = 18
 
         /**
-         * 系统**报不出**底栏高度时的兜底呼吸量（从 36 收到 18，理由同上）。
+         * 系统**报不出**底栏高度时的兜底呼吸量（36 → 18 → 12 → **14**，理由同上）。
          *
          * `targetSdk 37` 下窗口本来就画到系统栏底下，正常该由 inset 把这一段让出来；但 inset
          * 也可能在传递途中被别处消费掉、到这一层已经是 0（本机实测三个来源全是 0）。那时如果
-         * 只留 [SLACK_DP] 这么一点，底栏就贴住了屏幕底、被手势条压着。
+         * 一点都不留，底栏就贴住屏幕底、被手势条压着。
          */
-        const val SLACK_FALLBACK_DP = 18
+        const val SLACK_FALLBACK_DP = 14
 
         /** 图标边长；药丸比它大一圈，正好是 M3 indicator 的观感。 */
         const val ICON_DP = 22
@@ -1291,7 +1378,9 @@ class TabStrip(
 
         /** 格子的内边距：横向撑开触摸区，纵向只留一点点——底栏的高度主要不该喂给这里。 */
         const val CELL_PAD_H = 4
-        const val CELL_PAD_V = 5
+
+        /** 纵向内边距，5 → 3：这一项直接乘二进底栏高度，是除留白外唯一能省的。 */
+        const val CELL_PAD_V = 3
 
         /** logcat 标签，与 [DebugLog] 用同一个，便于一条 `-s` 全捞出来。 */
         const val TAG = "FlymeFreeformNoRoot"
