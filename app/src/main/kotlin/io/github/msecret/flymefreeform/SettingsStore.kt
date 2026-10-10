@@ -1308,6 +1308,27 @@ class SettingsStore(context: Context) {
         set(value) = preferences.edit().putString(KEY_TOOL_ICON_STYLE, value).apply()
 
     /**
+     * **分身角标**的画法，两个取值：
+     *
+     * - [CLONE_BADGE_STYLE_SYSTEM]（默认）：各系统**自己那张**角标图形 ——
+     *   小米是 `ic_clone_badge.png`（从 HyperOS 桌面提取的），
+     *   ColorOS 是 `ic_clone_badge_coloros.xml`（从 OplusLauncher 提取的）；
+     * - [CLONE_BADGE_STYLE_NUMBER]：不分系统，统一画一个**白色数字**（`1` / `2` / `3`…）。
+     *
+     * ★★ 无论选哪种，**位置都跟随各系统** —— 小米贴**左下角**、ColorOS 贴**右下角**
+     *   （用户 2026-10-10：「俩系统都支持，但是**位置跟随各系统**」）。
+     *   所以「样式」和「位置」是两件事，别把它们绑在一起。
+     *
+     * ⚠️ 改这个值必须让**应用目录重读**：角标是**烤进图标位图**里的，
+     *   不重读面板 / 轮盘上还是旧角标。两处都要接：
+     *   ① [AppCatalog.sourceSignature] 把它算进签名（否则「要呼出两次才生效」）；
+     *   ② `IconSettingsActivity` 落盘后调 `OverlayGestureService.reload`。
+     */
+    var cloneBadgeStyle: Int
+        get() = preferences.getInt(KEY_CLONE_BADGE_STYLE, DEFAULT_CLONE_BADGE_STYLE)
+        set(value) = preferences.edit().putInt(KEY_CLONE_BADGE_STYLE, value).apply()
+
+    /**
      * 要不要跟随 ColorOS 的**系统图标集**（主题里那套图标）。默认**开**。
      *
      * 资源在 `/data/theme/icons`（世界可读，普通应用就能读，见 [SystemIconSet]）——
@@ -2169,6 +2190,18 @@ class SettingsStore(context: Context) {
         /** 工具图标的样式，见 [SettingsStore.toolIconStyle]。 */
         private const val KEY_TOOL_ICON_STYLE = "tool_icon_style"
 
+        /** 分身角标的画法，见 [SettingsStore.cloneBadgeStyle]。 */
+        private const val KEY_CLONE_BADGE_STYLE = "clone_badge_style"
+
+        /** 分身角标 = **各系统自己那张**图形（小米 / ColorOS 各一份）。默认。 */
+        const val CLONE_BADGE_STYLE_SYSTEM = 0
+
+        /** 分身角标 = 统一的**白色数字**（`1` / `2` / `3`…）。 */
+        const val CLONE_BADGE_STYLE_NUMBER = 1
+
+        /** 默认用**官方样式**（各系统自己那张）。 */
+        const val DEFAULT_CLONE_BADGE_STYLE = CLONE_BADGE_STYLE_SYSTEM
+
         /**
          * 轮盘离角落距离的调节区间（占屏幕短边 %）。
          *
@@ -2324,7 +2357,7 @@ class SettingsStore(context: Context) {
                 KEY_HAPTIC_ENABLED, KEY_PANEL_HAPTIC_TAB_SWITCH,
                 KEY_PANEL_HAPTIC_LONG_PRESS, KEY_PANEL_HAPTIC_INDEX, KEY_HAPTIC_STRENGTH,
                 // 图标
-                KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE,
+                KEY_ICON_PACK, KEY_USE_SYSTEM_ICON_SET, KEY_TOOL_ICON_STYLE, KEY_CLONE_BADGE_STYLE,
                 // 其它
                 KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
                 KEY_AUTO_UPDATE_INTERVAL_HOURS,

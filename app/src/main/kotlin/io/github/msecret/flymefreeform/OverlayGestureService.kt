@@ -2499,6 +2499,7 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 「最近使用」只记真实应用——它属于面板里「应用」那一栏，工具自有它的网格。
         // 记的是「用户点了它」而不是「它启动成功」：启动后立刻退出也算最近用过。
         store.noteRecent(entry.component)
+        // 用户号由组件里的 `@<userId>` 标记带出来（见 [CloneApps.markUser]），不用另传。
         val target = LaunchTarget.of(entry.component)
         if (!launcher.isLaunchable(this, target)) {
             DebugLog.warn("LAUNCH_TARGET_UNAVAILABLE", target.flattened)

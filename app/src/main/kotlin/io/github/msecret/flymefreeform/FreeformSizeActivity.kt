@@ -384,7 +384,18 @@ class FreeformSizeActivity : Activity() {
                 when (outcome) {
                     is XiaomiFreeformCalibration.Outcome.Success -> {
                         XiaomiFreeformCalibration.save(this, outcome.result)
+                        // ★★ 校准写的就是**这一页三个区块里的值**，写完必须把受影响的区块**都重画**，
+                        //    否则滑块还停在旧数字上，看着像「校准没生效」——用户 2026-10-10 报的
+                        //    「hyperos 大小校准的时候，**没改小窗位置那块的显示**」就是这个。
+                        //    ⚠️ 滑块上的数字是**构建时写死**的（[Ui.seekRow] 的 `value` 只在建行时读一次），
+                        //    不重画不会自己变。三个一个都不能漏：
+                        //      · [renderValues]          —— 「当前值」那张卡（大小% · 宽高比 · 缩放）
+                        //      · [renderSizeSection]     —— 「尺寸与叠加」的两个占屏比例滑块
+                        //      · [renderPositionSection] —— 「小窗位置」的上沿滑块（`save` 会写
+                        //        `aospFreeformTopInsetPercent` 与 `aospFreeformTopCustomPercent`）
                         renderValues()
+                        renderSizeSection()
+                        renderPositionSection()
                         status.text = "已对齐到系统小窗。"
                         result.text = outcome.result.describe()
                         result.visibility = View.VISIBLE

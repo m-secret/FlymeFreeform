@@ -59,6 +59,28 @@ object SystemSupport {
     /** Flyme 独有的系统属性（魅族）。有值 = 这台机器跑的是 Flyme。 */
     private val FLYME_PROPS = listOf("ro.build.flyme.version", "ro.flyme.version")
 
+    /** 小米独有的系统属性（MIUI 用 `miui.*`，HyperOS 用 `mi.os.*`）。有值 = 这台机器是小米。 */
+    private val XIAOMI_PROPS = listOf(
+        "ro.miui.ui.version.name",
+        "ro.miui.ui.version.code",
+        "ro.mi.os.version.name",
+        "ro.mi.os.version.code",
+    )
+
+    /** 小米的 framework 类，只在 MIUI / HyperOS 的 boot classpath 上（见 [classPresent]）。 */
+    private const val MIUI_BUILD_CLASS = "miui.os.Build"
+
+    /** 小米系品牌名。**只在前两条都读不到时兜底**（刷过第三方 ROM 的机器可能只剩品牌名）。 */
+    private val XIAOMI_BRANDS = listOf("xiaomi", "redmi", "poco")
+
+    /**
+     * 从 `Build.VERSION.INCREMENTAL` 里抠 HyperOS 版本，例如真机小米 15 上是
+     * `OS4.0.0.7.XOBCNXM` ⇒ 抓出 `4.0`（⇒ 显示成「HyperOS 4.0」）。
+     *
+     * 只给 [romLabel] 兜底用：两个版本属性都读不到时才轮到它。
+     */
+    private val HYPEROS_INCREMENTAL = Regex("""^OS(\d+(?:\.\d+)?)""")
+
     private class Probe(
         val zoomWindowClass: Boolean,
         val oplusFeatureCount: Int,
@@ -93,12 +115,18 @@ object SystemSupport {
     fun freeformUsable(context: Context): Boolean = probe(context).oplus
 
     /**
-     * 「运行环境」那一行给用户看的**系统名**，例如「ColorOS 16.0.10」「Flyme 12.6.0.0A」。
+     * 「运行环境」那一行给用户看的**系统名**，例如「ColorOS 16.0.10」「Flyme 12.6.0.0A」
+     * 「HyperOS 4.0」。
      *
      * ★ **只报「这是什么系统 + 什么版本」，不以 ColorOS 为参照**（用户 2026-10-09：
      * 「不要有非 coloros 之类的了」）。原来认不出来时写的是「非 ColorOS（meizu · Android 16）」，
      * 那种说法在别家机器上读起来像「你这系统不是正牌」，而且**每加一家都得回头改这一句**。
      * 现在按**已知系统画像**分派，认不出的就老实报品牌 + Android 版本。
+     *
+     * ★★ **已知的三家一律报系统名，不许哪一家掉到品牌兜底**（用户 2026-10-10：
+     * 「运行环境写的是**小米**，但是 OPPO 就显示 **ColorOS**」）——
+     * 两边口径不一致看着就像没做完。现在：ColorOS / Flyme / **HyperOS** 各自报自己的系统名，
+     * 只有真正认不出的机器才落到 `${Build.BRAND} · Android x`。
      */
     fun romLabel(context: Context): String {
         val probe = probe(context)
@@ -116,6 +144,26 @@ object SystemSupport {
             } else {
                 "Flyme ${Build.VERSION.RELEASE}"
             }
+        }
+        // ★★ **小米要报系统名（HyperOS / MIUI），不是品牌名**（用户 2026-10-10：
+        //    「运行环境写的是**小米**，但是 OPPO 就显示 **ColorOS**」）。
+        //    两边口径必须一致 —— 都是「**系统名 + 版本**」：OPPO 报 ColorOS、魅族报 Flyme、
+        //    小米就该报 HyperOS，而不是掉到下面那句「品牌 · Android x」。
+        if (isHyperOS(context)) {
+            // ① 先看 `Build.VERSION.INCREMENTAL`：HyperOS 上是 `OS4.0.0.7.XOBCNXM` 这种
+            //    （**以 `OS` 开头**，判据最明确），MIUI 上则是 `V14.0…`、匹配不到 ⇒ 往下走。
+            HYPEROS_INCREMENTAL.find(Build.VERSION.INCREMENTAL)?.let {
+                return "HyperOS ${it.groupValues[1]}"
+            }
+            // ② HyperOS 自己的版本属性（HyperOS 2 起有），值形如 `OS2.0`。
+            val hyper = systemProperty("ro.mi.os.version.name")
+            if (hyper.isNotBlank()) return "HyperOS ${hyper.removePrefix("OS")}"
+            // ③ 老 MIUI 机器只剩这个（值形如 `V14`）。
+            //    ⚠️ 它排在 ① 之后是故意的：HyperOS 上这个属性**可能还留着旧值**，
+            //       先判它会显示成「MIUI 816」那种四不像。
+            val miui = systemProperty("ro.miui.ui.version.name")
+            if (miui.isNotBlank()) return "MIUI ${miui.removePrefix("V")}"
+            return "小米 · Android ${Build.VERSION.RELEASE}"
         }
         return "${Build.BRAND} · Android ${Build.VERSION.RELEASE}"
     }
@@ -242,6 +290,53 @@ object SystemSupport {
             Build.MANUFACTURER.contains("meizu", ignoreCase = true) ||
             Build.DISPLAY.contains("flyme", ignoreCase = true)
 
+    /**
+     * 这台机器是不是**小米**（MIUI / HyperOS）。
+     *
+     * ## 它和 [isColorOs] 的分工，同样按**代价**分
+     *
+     * [isColorOs] 决定「功能开不开」，判错 = 功能消失 ⇒ 只认硬信号。
+     * 而这个目前只用在**两处「判错代价小」的地方**（用户 2026-10-10 明确要求
+     * 「只对 HyperOS 生效，不要影响别的」）：
+     *
+     * ① **分身角标** —— 那个角标是**小米自己的图形**，别的 ROM 上出现只会驴唇不对马嘴；
+     * ② **`am start` 给原体补 `--user 0`** —— HyperOS 专治「小窗里打开已双开的应用会弹
+     *    『选原生还是分身』」的兼容补丁。
+     *
+     * ⇒ 所以它敢用「类 + 属性 + 品牌」这类软信号，与 [isFlyme] 的取向一致。
+     * 小窗 / 识屏那类「判错 = 功能消失」的地方**不许**用它（各自走能力信号）。
+     *
+     * 判据三条 OR（与 [HapticsVendor] 的 `XIAOMI` 分支**共用这一份实现**，那边改成调本函数）：
+     * 1. [MIUI_BUILD_CLASS] 类在不在 —— 小米 framework 只在 MIUI / HyperOS 的 boot classpath 上；
+     * 2. [XIAOMI_PROPS] 里有没有非空值；
+     * 3. `Build.BRAND` / `MANUFACTURER` 是不是 [XIAOMI_BRANDS]。
+     *
+     * ⚠️ 先排除 Oplus：ColorOS 机器上偶尔也会留着小米的属性（刷机残留），别认错。
+     */
+    fun isHyperOS(context: Context): Boolean =
+        xiaomi ?: synchronized(this) {
+            xiaomi ?: runProbeXiaomi(context).also {
+                xiaomi = it
+                Log.i(
+                    TAG,
+                    "SYSTEM_PROFILE hyperos=$it brand=${Build.BRAND}/${Build.MANUFACTURER} " +
+                        "miui类=${classPresent(MIUI_BUILD_CLASS)} display.id=${Build.DISPLAY}",
+                )
+            }
+        }
+
+    @Volatile
+    private var xiaomi: Boolean? = null
+
+    private fun runProbeXiaomi(context: Context): Boolean =
+        !probe(context).oplus &&
+            (
+                classPresent(MIUI_BUILD_CLASS) ||
+                    XIAOMI_PROPS.any { systemProperty(it).isNotBlank() } ||
+                    XIAOMI_BRANDS.any { Build.BRAND.contains(it, ignoreCase = true) } ||
+                    XIAOMI_BRANDS.any { Build.MANUFACTURER.contains(it, ignoreCase = true) }
+                )
+
     private fun probe(context: Context): Probe =
         cached ?: synchronized(this) {
             cached ?: runProbe(context.applicationContext ?: context).also {
@@ -274,9 +369,9 @@ object SystemSupport {
      * `initialize = false` + 引导类加载器（`null`）：静态初始化块一行都不会跑，
      * 既不会拖慢启动，也不会因为那个类的静态块碰了什么而抛异常。
      */
-    private fun classPresent(): Boolean =
+    private fun classPresent(className: String = ZOOM_WINDOW_CLASS): Boolean =
         try {
-            Class.forName(ZOOM_WINDOW_CLASS, false, null) != null
+            Class.forName(className, false, null) != null
         } catch (_: ClassNotFoundException) {
             false
         } catch (_: LinkageError) {

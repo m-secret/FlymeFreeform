@@ -609,15 +609,30 @@ object Ui {
      * 标题与副标题两个 TextView 一起挂在返回 View 的 `tag` 上（[RowTexts]）——需要动态改文案的
      * 入口取出来直接用。**会变的数字放副标题，别塞进标题**：标题长短随计数跳（「管理应用
      * （轮盘 3 / 6）」），整卡的文字左边缘就参差不齐了。
+     *
+     * [selected]：入口行**自己的值也有「选中」语义**时打开（例如「图标包」那行 —— 选了一个图标包
+     * 就等于这一行生效了）。打开后**整行的样式与 [choiceRow] 的选中态完全一致**：标题变主题绿 +
+     * `sans-serif-medium`、行尾箭头也变绿。两行放在同一张卡里，用户一眼就能看出"生效的是哪一个"
+     * （用户 2026-10-10：「如果选中了把那个箭头变绿，这样用户更清晰，上面俩都是选中了有个绿色对勾」，
+     * 紧接着追加：「**os 图标包的文字也和别的一样变绿啊**」）。
+     *
+     * ★ 为什么**连标题一起**染、而不是只染箭头：只染箭头时标题还是黑的，和上面两行 `choiceRow`
+     * 的选中态**对不上**，看着像"这一行只是能点进去"而不是"这一行是当前生效的"。
+     * 副标题（[rowDetail]）**不染** —— [choiceRow] 的选中态也没染它，两处保持一致。
      */
     fun entryRow(
         context: Context,
         text: String,
         detail: String? = null,
+        selected: Boolean = false,
         onClick: () -> Unit,
     ): LinearLayout {
         val container = row(context)
-        val titleView = rowTitle(context, text)
+        val titleView =
+            rowTitle(context, text).apply {
+                setTextColor(if (selected) COLOR_PRIMARY else COLOR_ON_SURFACE)
+                typeface = if (selected) mediumTypeface else Typeface.DEFAULT
+            }
         val detailView = if (!detail.isNullOrBlank()) rowDetail(context, detail) else null
         val texts =
             LinearLayout(context).apply {
@@ -626,7 +641,11 @@ object Ui {
                 if (detailView != null) addView(detailView)
             }
         container.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        container.addView(chevron(context))
+        container.addView(
+            chevron(context).apply {
+                setTextColor(if (selected) COLOR_PRIMARY else COLOR_ON_SURFACE_VARIANT)
+            },
+        )
         container.tag = RowTexts(titleView, detailView)
         container.isClickable = true
         container.setOnClickListener { onClick() }

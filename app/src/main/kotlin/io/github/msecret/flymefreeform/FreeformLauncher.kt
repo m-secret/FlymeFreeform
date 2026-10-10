@@ -6,9 +6,11 @@ import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.LauncherApps
 import android.content.pm.PackageManager
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.UserHandle
 import android.view.WindowManager
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -16,14 +18,45 @@ import java.lang.reflect.Modifier
 data class LaunchTarget(
     val packageName: String,
     val className: String,
+    /**
+     * 目标应用所在的**用户**（`am start --user`）。**0 = 当前用户**（原体）；
+     * 分身（克隆）住在另一个用户里（ColorOS / MIUI 都是 **999**，见 [CloneApps]）。
+     *
+     * ★★ 分身和原体的 `ComponentName` **完全一样** ⇒ 只靠组件名分不开两者，
+     * 用户号必须一路带着。
+     */
+    val userId: Int = 0,
 ) {
     val flattened: String get() = "$packageName/$className"
 
     companion object {
-        fun of(component: ComponentName): LaunchTarget =
-            LaunchTarget(component.packageName, component.className)
+        fun of(component: ComponentName): LaunchTarget {
+            // ★ 分身：类名带着 `@<用户>` 标记（见 [CloneApps.markUser]）—— 这里**剥掉它**，
+            //   换成 `am start --user`。原体没有标记，[CloneApps.splitUser] 原样返回，
+            //   行为与以前**逐字一致**。
+            val (className, userId) = CloneApps.splitUser(component)
+            return LaunchTarget(component.packageName, className, userId)
+        }
     }
 }
+
+/**
+ * `am start` 的 `--user` 参数（**含前导空格**；不需要时返回空串）。
+ *
+ * - **分身**（[LaunchTarget.userId] ≠ 0）：目标在**别的用户**里，必须带。
+ * - **原体 + 小米**：也显式带 `--user 0`。
+ *   ★ 2026-10-10 用户报「在小窗里打开已双开的应用，会弹『选原生还是分身』」—— HyperOS 对
+ *   **已双开**的应用，非桌面调用方去启动时它就要问一句；给出**明确的用户号**它就不问了。
+ *   ⚠️ **只对小米加**（用户同日要求「user0 只对 HyperOS 生效，不要影响别的」）：
+ *   判据用 [MiuiFreeformOptions.isAvailable]（小米的框架类在不在，见那边注释）。
+ * - **其余（原体 + 非小米）**：**一个字符都不加** —— 那是已经真机验证过的老命令，别动。
+ */
+private fun amUserArgument(target: LaunchTarget): String =
+    when {
+        target.userId != 0 -> " --user ${target.userId}"
+        MiuiFreeformOptions.isAvailable() -> " --user 0"
+        else -> ""
+    }
 
 sealed interface StrategyOutcome {
     data class Success(val detail: String) : StrategyOutcome
@@ -875,9 +908,17 @@ object AospFreeformWindow {
         val rect = "${bounds.left} ${bounds.top} ${bounds.right} ${bounds.bottom}"
         val startCmd =
             "am start --windowingMode ${AospFreeform.WINDOWING_MODE}" +
+                // 用户号：分身必带；**小米上原体也带 `--user 0`**（见 [amUserArgument]）。
+                amUserArgument(target) +
                 " -f ${AospFreeform.LAUNCH_FLAGS} -n ${target.flattened} >/dev/null 2>&1"
-        // 取「这个包的任务」那两行：`RootTask …`（带 mWindowingMode）+ `taskId=…`（带 taskId/bounds）。
-        val snapshot = "am stack list 2>/dev/null | grep -B1 '${target.packageName}/' | head -2"
+        // 取「这个包**在这个用户里**的任务」那两行：上面那行 `configuration=…`（带 mWindowingMode）
+        // 与匹配行 `taskId=…`（带 taskId/bounds/userId）。
+        // ★★ **必须带上 `userId=`**（2026-10-10 用户报「分身和主应用打开的都是主应用」时顺手查出）：
+        //   分身和原体是**同一个包名**，小米上两者可以**同时**有任务 —— 真机实测
+        //   `taskId=176: com.xiaomi.smarthome/… userId=0` 与 `taskId=209: … userId=999`
+        //   就并排在 `am stack list` 里。只按包名 grep 会命中**另一个用户**的任务，
+        //   于是 `am task resize` 把**主应用**那个窗改了尺寸（分身反而没动）。
+        val snapshot = taskSnapshot(target.packageName, target.userId)
         val pickTask = "sed -n 's/.*taskId=\\([0-9]*\\).*/\\1/p' | head -1"
         val pickMode = "sed -n 's/.*mWindowingMode=\\([a-z]*\\).*/\\1/p' | head -1"
         val script =
@@ -885,8 +926,12 @@ object AospFreeformWindow {
                 append("t=\$(").append(snapshot).append(" | ").append(pickTask).append(")\n")
                 append("[ -n \"\$t\" ] && am task resizeable \$t 2 >/dev/null 2>&1\n")
                 append(startCmd).append('\n')
-                // `am start` 是同步的（返回时 Activity 已 started），再给 150ms 让窗口登记进 WM。
-                append("sleep 0.15\n")
+                // `am start` 是同步的（返回时 Activity 已 started、任务已建），这里**只留很短**的
+                // 缓冲让任务登记进 WM —— **越短越好**：窗口的首帧还在应用冷启动里，
+                // 抢在它显示之前 resize 完，用户就看不到「先小后大」那一跳
+                // （用户 2026-10-10：「**resize 是一个很糟糕的体验**」）。
+                // 原来那 150ms 恰好够窗口先画出来，跳变就看得见了。
+                append("sleep 0.03\n")
                 append("b=\$(").append(snapshot).append(")\n")
                 append("t=\$(echo \"\$b\" | ").append(pickTask).append(")\n")
                 append("m=\$(echo \"\$b\" | ").append(pickMode).append(")\n")
@@ -905,7 +950,7 @@ object AospFreeformWindow {
                 val result = ShizukuShell.run(script, timeoutMs = LAUNCH_TIMEOUT_MS)
                 DebugLog.info(
                     "LAUNCH_FREEFORM",
-                    "${target.flattened} ${(result.stdout + result.stderr).trim()}",
+                    "${target.flattened}@${target.userId} ${(result.stdout + result.stderr).trim()}",
                 )
             },
             "aosp-freeform-launch",
@@ -914,6 +959,19 @@ object AospFreeformWindow {
 
     /** 启动那条链路的超时：`am start` + 两次 `am stack list` + `am task resize`，给足 20 秒。 */
     private const val LAUNCH_TIMEOUT_MS = 20_000L
+
+    /**
+     * `am stack list` 里**某个包、某个用户**那个任务的两行（`configuration=…` + `taskId=…`）。
+     *
+     * `grep -B1` 取到的正是紧邻上一行的 `configuration=…` —— `mWindowingMode` 就在那行上
+     * （[launchInBackground] / [resizeScript] 都靠它判「到底进没进小窗」）。
+     *
+     * ★★ **`userId=` 这一段不能省**（见 [launchInBackground] 里的理由）：分身与它的原体
+     * 包名一样，同一个包在两个用户里的任务会并排出现，只按包名找会改错窗口。
+     * ⚠️ 找不到任何任务时返回空串 —— 两个调用方都会因此**什么都不做**（比改错窗口强）。
+     */
+    private fun taskSnapshot(packageName: String, userId: Int): String =
+        "am stack list 2>/dev/null | grep -B1 'taskId=.*$packageName/.*userId=$userId' | head -2"
 
     /**
      * 起完小窗之后，在**后台线程**上把它的尺寸调成 [bounds]，顺手修「没进小窗」的情况。
@@ -928,8 +986,23 @@ object AospFreeformWindow {
      * ⚠️ 这是**尽力而为**：`am task resize` 在部分 ROM 上不存在或需要额外条件，
      * 失败只写日志、不影响「应用已经被打开」这个结果。
      */
-    fun scheduleResize(context: Context, packageName: String, restartCommand: String) {
-        val bounds = bounds(context) ?: return
+    fun scheduleResize(
+        context: Context,
+        packageName: String,
+        restartCommand: String,
+        /**
+         * **调用方在 `startActivity` 【之前】算好的矩形**。
+         *
+         * ★★ 为什么必须由调用方给（2026-10-10 用户：「位置没到默认位置，有点偏移，似乎是
+         *   第二个小窗的位置」）：[bounds] 里的位置靠 [sameSideIndex] 数「这一侧已经有几个窗」，
+         *   而**新窗口一创建就计入**。直启那条路是在 `startActivity` **之后**才调本函数 ——
+         *   那时窗已经在跑了，计数多 1 ⇒ 落到「位置 2」。**必须在起之前算。**
+         */
+        fixedBounds: Rect? = null,
+        /** 目标所在用户（见 [taskSnapshot]）—— 分身必传，否则会把主应用那个任务改了。 */
+        userId: Int = 0,
+    ) {
+        val bounds = fixedBounds ?: bounds(context) ?: return
         Thread(
             {
                 // 顺手把小米原生那套几何（bounds + freeformScale）记下来：它是「窗口该多大、
@@ -937,12 +1010,12 @@ object AospFreeformWindow {
                 val native = MiuiFreeformOptions.describe(context, packageName)
                 val result =
                     ShizukuShell.run(
-                        resizeScript(packageName, bounds, restartCommand),
+                        resizeScript(packageName, bounds, restartCommand, userId),
                         timeoutMs = RESIZE_TIMEOUT_MS,
                     )
                 DebugLog.info(
                     "LAUNCH_FREEFORM_RESIZE",
-                    "$packageName 目标=${bounds.flattenToString()} " +
+                    "$packageName@$userId 目标=${bounds.flattenToString()} " +
                         "$native | ${(result.stdout + result.stderr).trim()}",
                 )
             },
@@ -977,10 +1050,18 @@ object AospFreeformWindow {
      * ⚠️ **只在读到 `mWindowingMode=fullscreen` 时才重试**，读不到或读到别的值都不动 ——
      * 宁可不修，也不要为了修而把好好的窗口再起一遍（那会闪一下）。
      */
-    fun resizeScript(packageName: String, bounds: Rect, restartCommand: String): String {
+    fun resizeScript(
+        packageName: String,
+        bounds: Rect,
+        restartCommand: String,
+        /**
+         * 目标所在用户（见 [taskSnapshot]）。默认 **0**（原体 / 内置工具）——
+         * 分身必须把真实用户号传进来，否则会改到主应用那个任务上。
+         */
+        userId: Int = 0,
+    ): String {
         val rect = "${bounds.left} ${bounds.top} ${bounds.right} ${bounds.bottom}"
-        // 取「这个包的任务」那两行：`RootTask …`（带 mWindowingMode）+ `taskId=…`（带 taskId/bounds）。
-        val snapshot = "am stack list 2>/dev/null | grep -B1 '$packageName/' | head -2"
+        val snapshot = taskSnapshot(packageName, userId)
         val pickTaskId = "sed -n 's/.*taskId=\\([0-9]*\\).*/\\1/p' | head -1"
         val pickMode = "sed -n 's/.*mWindowingMode=\\([a-z]*\\).*/\\1/p' | head -1"
         val pickBounds =
@@ -1083,10 +1164,16 @@ private fun platformWindowModeOptions(mode: Int, bounds: Rect? = null): Bundle? 
             // 但它那份 `getActivityOptions` 在**横屏**下会被我们自己的校验拒掉 —— 它给的
             // 1200×1800 超出横屏高度 1200（见 [MiuiFreeformOptions.build] 的 bounds 校验）
             // ⇒ 走到这里时动画还是开着的。所以在这份上再关一次。
+            // ⚠️ 必须用 `getDeclaredMethod` + `isAccessible`，**不能用 `getMethod`** ——
+            //   后者会被 hidden API 过滤掉（真机实测一直抛 `NoSuchMethodException`），
+            //   而紧邻的 `setLaunchWindowingMode` 那一步用的正是 `getDeclaredMethod`、一次就成。
+            //   ★ 关掉这个动画很关键：不关的话窗口会**先按动画起始形态出现、再动画到目标尺寸**
+            //   ——用户看到的「先到默认位置、再闪到第二位置」就是它（2026-10-10）。
             val animResult =
                 runCatching {
                     ActivityOptions::class.java
-                        .getMethod("setFreeformAnimation", Boolean::class.javaPrimitiveType)
+                        .getDeclaredMethod("setFreeformAnimation", Boolean::class.javaPrimitiveType)
+                        .also { it.isAccessible = true }
                         .invoke(options, false)
                 }
             android.util.Log.i(
@@ -1149,6 +1236,20 @@ private fun directOptions(context: Context, packageName: String, isAosp: Boolean
     if (!isAosp) return FreeformProtocol.bundle(context)
     val native = MiuiFreeformOptions.build(context, packageName)
     if (native != null) {
+        // ★★ **用【我们配置的】几何覆盖小米那份**（2026-10-10 用户：「打开的主应用小窗
+        //   不在默认位置」）：`MiuiFreeformOptions.build` 给的是**系统默认**
+        //   （真机实测 587×1200 = 屏 49%×45%），用户配的「小窗尺寸 / 小窗位置」它完全不认。
+        //   ⇒ 在这份上再 `setLaunchBounds` 一次，把用户配的矩形顶上去。
+        //   ⚠️ 顺带**关掉自由窗展开动画**：用户报的「上下拉伸」就是「先按我们的矩形开一帧、
+        //      再被动画拉回系统默认」那一段，关掉它这一帧就没有了。
+        val ourBounds = AospFreeformWindow.bounds(context)
+        val applied =
+            if (ourBounds != null) runCatching { native.setLaunchBounds(ourBounds) } else null
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "DIRECT_OPTIONS native=${runCatching { native.launchBounds }.getOrNull()} " +
+                "ours=$ourBounds applied=${applied?.isSuccess}",
+        )
         DebugLog.info(
             "LAUNCH_MIUI_OPTIONS",
             "$packageName 小米原生 ActivityOptions " +
@@ -1163,6 +1264,68 @@ private fun directOptions(context: Context, packageName: String, isAosp: Boolean
 }
 
 /**
+ * 让 MIUI 对这个 Activity **默认打开【主应用】**，不再弹出**要用户点**的「选原生还是分身」。
+ *
+ * ## ★★ 出处与原理（2026-10-10，用户提示去社区查）
+ *
+ * 酷安 @小鸠下汐 的办法：**MIUI 的双开偏好就存在 `secure` settings 里** ——
+ * **键 = Activity 全限定名**，**值：`0` 每次询问 / `1` 主应用 / `2` 双开应用**。
+ * 写入 `1` 之后，MIUI 的 `XSpaceResolveActivity` 会**直接选中「主应用」**（`Direct to 0`），
+ * **不再等用户点** —— 这就是它存在的理由。
+ *
+ * ## ⚠️ 但它**并不能让那个选择器窗口不出现**（2026-10-10，OS 升到 `4.0.9` 后重新取证）
+ *
+ * 真机日志：每次直启**都有** `XSpaceManagerServiceImpl: pop up ResolverActivity`，
+ * 紧接着 `XSpaceResolverActivity: Direct to 0`（自动选主应用）—— 也就是**窗口还是会闪一下**，
+ * 只是不用用户选。更要紧的是：**我们那份 `setLaunchBounds` 会被这个选择器窗口用掉**
+ * （`MiuiFreeFormManagerNotifier: Stack id=228 bounds=[180,660][1380,2580]` 逐字等于我们的矩形），
+ * 真正的目标应用随后**由 MIUI 自己挑位置**
+ * ⇒ 用户 2026-10-10 报的「**主应用不 resize，但位置不是设定的**」。
+ *
+ * ★★ **结论（别再往这条路上找补）**：HyperOS 上「原体小窗落在我们配置的位置」**做不到**，
+ * 除非改走 shell（`am start` + `am task resize`）—— 而那条会 resize，用户 2026-10-10
+ * 明确选了「**保持不 resize**」。这张偏好表**仍然要写**：不写就会弹出**要用户点**的选择器，
+ * 写了至少是自动过。见 `MEMORY.md` / `LAUNCH.md`。
+ *
+ * ## ★★ 它是**设备级**的写，而且**只服务于主应用那条路**
+ *
+ * 这张表是 MIUI 自己的记忆，**键只有 Activity 全限定名、没有用户号** ⇒ 它天然表达不了
+ * 「原体走 0、分身走 999」两件事。所以：
+ * - **原体（userId = 0）**：写 `1`（主应用）—— 正是它存在的理由（不弹选择器）；
+ * - **分身（userId ≠ 0）**：**不许走 XSpace 那条路**，见 [DirectStartStrategy.launch] 里那段
+ *   （HyperOS 上分身一律交给 shell，shell 根本不查这张表，所以这一行怎么设都不影响它）。
+ *   ⚠️ 反过来说：**只要分身还走 `startActivity` / `LauncherApps`，这一行就会把它吃掉**
+ *   （2026-10-10 用户报的「分身和主应用打开的都是主应用」就是这个）。
+ *
+ * ⚠️ 需要 Shizuku（`settings put secure` 普通应用写不了）；写失败不影响启动，顶多还弹一次框。
+ * ⚠️ 只对**小米 + 带双开的包**调（其余包没有这张表的行，写进去是垃圾数据）。
+ * ⚠️ **同一个 Activity 只写一次**（[preferredMains]）：`settings put` 是一次 Shizuku 往返
+ * （百毫秒级），而这条代码在**每一次**点开那个应用时都会走到 —— 每点一次卡一下不值当。
+ */
+private fun preferMainApp(context: Context, target: LaunchTarget) {
+    if (!ShizukuShell.hasPermission) return
+    // 键就是 Activity 的全限定名（`ComponentName.className` 本来就是全名）。
+    val key = target.className
+    if (!preferredMains.add(key)) return
+    val result = ShizukuShell.run("settings put secure $key 1", timeoutMs = 3_000L)
+    // 写失败就把它从「已写过」里拿掉，下次点还再试一遍（别因为一次超时就永久放弃）。
+    if (!result.isSuccess) preferredMains.remove(key)
+    android.util.Log.i(
+        "FlymeFreeformNoRoot",
+        "PREFER_MAIN key=$key ok=${result.isSuccess} out=${(result.stdout + result.stderr).trim()}",
+    )
+}
+
+/**
+ * 本进程里已经写过「默认打开主应用」的 Activity（见 [preferMainApp]）。
+ *
+ * 进程重启后重写一遍不算负担（每次启动最多一次往返），换来的是**点一次只花一次**。
+ * 用同步集合：启动链路在 worker 线程上，但理论上可以并发。
+ */
+private val preferredMains: MutableSet<String> =
+    java.util.Collections.synchronizedSet(HashSet<String>())
+
+/**
  * 策略一：零特权的 `startActivity` + ColorOS 自由窗参数。
  *
  * 这是原模块 [ColorOsFreeformLauncher] 的同一套协议，只是调用方从系统进程换成了普通 App。
@@ -1175,28 +1338,106 @@ class DirectStartStrategy : FreeformLaunchStrategy {
 
     override fun launch(context: Context, target: LaunchTarget): StrategyOutcome =
         try {
-            val intent =
-                Intent(Intent.ACTION_MAIN)
-                    .addCategory(Intent.CATEGORY_LAUNCHER)
-                    .setComponent(ComponentName(target.packageName, target.className))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            val isAosp = FreeformProtocol.isAosp(context)
-            // AOSP 形态补一位 NO_ANIMATION（同 [AospFreeform.LAUNCH_FLAGS]）：小窗是
-            // 「先按整屏起、再缩成小窗」的，带动画就会先闪一下全屏。ColorOS 那条不加。
-            if (isAosp) intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
-            // ★★ AOSP 形态的尺寸**已经在这份 ActivityOptions 里**（`setLaunchBounds` + 隐藏的
-            // `setLaunchWindowingMode`，见 [AospFreeform.bundle]）⇒ 窗口**一步到位**，
-            // 不再补 `am task resize`（用户 2026-10-09：「能不能别 resize，直接打开」）。
-            context.startActivity(intent, directOptions(context, target.packageName, isAosp))
-            // 这条打点是 direct 那条路**唯一**的取证窗口（它不走 shell，没有 `am stack list` 可看）：
-            // 窗口到底有没有按这份逻辑矩形开出来，事后只看这一行。
-            DebugLog.info(
-                "LAUNCH_DIRECT",
-                "${target.flattened} aosp=$isAosp " +
-                    "逻辑=${AospFreeformWindow.bounds(context)?.flattenToString() ?: "?"} " +
-                    "windowingMode=${FreeformProtocol.windowMode(context)}",
-            )
-            StrategyOutcome.Success("已提交 windowingMode=${FreeformProtocol.windowMode(context)}")
+            // ★★ **HyperOS + 分身：这条路【走不通】，必须让给 shell**
+            //   （2026-10-10 用户报：「怎么分身和主应用打开的都是主应用」）。
+            //
+            // 真机取证（小米 15 / HyperOS 4.0，点「米家(分身)」那一瞬间的系统日志）：
+            // ```
+            // 我们：       LAUNCH_PATH=launcherApps com.xiaomi.smarthome/… user=999
+            // 系统：XSpaceManagerServiceImpl: checkXSpaceControl, from:io.github.msecret.flymefreeform,
+            //                                to:com.xiaomi.smarthome, callingUserId:999, toUserId:0
+            // 系统：XSpaceResolverActivity: Direct to 0
+            // 系统：PreStartupAnimationController: tryTriggerPendingAnimation … userId=0   ← 真起来的
+            // ```
+            // 即：**请求的是 999，真的起来的却是主应用**。`LauncherApps` 调用本身没抛异常，
+            // 所以光看「调用成功」是发现不了的 —— 只有 `userId=0` 那一行露了馅。
+            //
+            // ## 为什么躲不开
+            //
+            // MIUI 的这道 XSpace 拦在 `ActivityStarter` 里，**拦的是「调用方」**：
+            // `startActivity` 和 `LauncherApps` 一视同仁。它只放行桌面（`com.miui.home`）
+            // 和 **shell**（`com.android.shell`）—— 实测同一条命令以 shell 身份跑、
+            // 带 `--user 999`，直接进 u999，一次框都不弹。
+            // ⇒ 分身一律交给 [ShizukuAmStrategy]（它就是 shell 的 `am start`）。
+            //
+            // ⚠️ **这与 [preferMainApp] 写的那张偏好表无关**：那张表是「XSpace 自己的记忆」，
+            //   只影响**经过 XSpace 的**启动；shell 那条压根不经过它（实测：表里写着
+            //   `…SmartHomeMainActivity=1`（主应用）时，shell 带 `--user 999` 照样进 u999）。
+            // ⚠️ 后果是分身那条要退化成「先起再 resize」（shell 的 `am start` 没有 bounds 参数，
+            //   真机 `--bounds` 直接报 `Unknown option`）—— 这是 MIUI 不给口子的代价，
+            //   **不是我们没做**，别再试图从 [DirectStartStrategy] 里找补。
+            if (target.userId != 0 && hyperOsReroutesUser(context)) {
+                StrategyOutcome.Skipped(
+                    "HyperOS 的 XSpace 会把跨用户启动重解析成主应用，交给 shell",
+                )
+            } else if (target.userId != 0) {
+                // （非 HyperOS 的分身）`startActivity` 只能打当前用户；跨用户只有
+                // `LauncherApps.startMainActivity(component, user, sourceBounds, opts)` 这一条
+                // —— **给桌面用的公开 API**，天生能跨用户，`opts` 就是 `ActivityOptions` 的 bundle
+                // ⇒ **bounds 能在启动那一刻就带上**，窗口一步到位、不 resize。
+                // ⚠️ 失败（不是 launcher / 跨 profile group / 类不在…）就返回 null，
+                // 让调用方继续走 [ShizukuAmStrategy] 那条「先起再 resize」——
+                // **不能让分身变成打不开**。
+                val isAospClone = FreeformProtocol.isAosp(context)
+                val cloneOptions = directOptions(context, target.packageName, isAospClone)
+                startCloneWithOptions(context, target, cloneOptions)
+                    ?: StrategyOutcome.Skipped(
+                        "分身 user=${target.userId}：LauncherApps 不可用，交给 shell",
+                    )
+            } else {
+                val intent =
+                    Intent(Intent.ACTION_MAIN)
+                        .addCategory(Intent.CATEGORY_LAUNCHER)
+                        .setComponent(ComponentName(target.packageName, target.className))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val isAosp = FreeformProtocol.isAosp(context)
+                // AOSP 形态补一位 NO_ANIMATION（同 [AospFreeform.LAUNCH_FLAGS]）：小窗是
+                // 「先按整屏起、再缩成小窗」的，带动画就会先闪一下全屏。ColorOS 那条不加。
+                if (isAosp) intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                // ★★ AOSP 形态的尺寸**已经在这份 ActivityOptions 里**（`setLaunchBounds` + 隐藏的
+                // `setLaunchWindowingMode`，见 [AospFreeform.bundle]）⇒ 窗口**一步到位**，
+                // 不再补 `am task resize`（用户 2026-10-09：「能不能别 resize，直接打开」）。
+                // 无条件直写 logcat（绕开 DebugLog 开关）：用户报「还是弹框」时要能一眼看出
+                // 这次走的是哪条路 —— 直启那条**没法带 `--user`**，小米上就是弹框的来源。
+                val options = directOptions(context, target.packageName, isAosp)
+                // ★★ 小米 + 这个包**有双开** ⇒ 先让 MIUI「默认打开主应用」（见 [preferMainApp]），
+                //   否则它会把这个 startActivity 整个换成 `XSpaceResolveActivity`（选择器）。
+                //   ⚠️ 试过 `setLaunchUserHandle` / `startActivityAsUser` —— **MIUI 都不看**，
+                //   它只看调用方是不是 shell / 桌面。只有写这张偏好表管用。
+                //   ⚠️ **绝不能按 ROM 一刀切**（那是更早一版的错）：那样**所有**应用都得走
+                //   「先起再 resize」，用户实测后明确否掉 ——「**resize 是一个很糟糕的体验**」。
+                val needsPrefer =
+                    SystemSupport.isHyperOS(context) && CloneApps.hasClone(target.packageName)
+                if (needsPrefer) preferMainApp(context, target)
+                android.util.Log.i(
+                    "FlymeFreeformNoRoot",
+                    "LAUNCH_PATH=direct ${target.flattened} preferMain=$needsPrefer",
+                )
+                context.startActivity(intent, options)
+                // ★★ **这里不再补 `am task resize`**（2026-10-10 调研后删掉）。
+                //
+                // 原来对**带双开**的包补了一刀，理由是「直启给的几何是系统默认（`setLaunchBounds`
+                // 系统不认）」。**那个理由后来被证伪了**：真机实测 `setLaunchBounds` 是生效的，
+                // 早先「传 1200×1920、实际 587×1200」是因为 [AospFreeformWindow.bounds] 的
+                // 宽高比口径算反了（修完之后日志与实际**逐字一致**）。
+                // 现在 [directOptions] 已经把我们的 bounds 交给 `setLaunchBounds` ⇒ 这一刀纯多余，
+                // 而它正是用户看到的「**带分身的应用打开小窗 resize**」。
+                //
+                // ⚠️ **别再加回来。** 真要兜底也**不能一刀切给所有应用**：14:0x 那版给**每个**
+                //   应用都补了 resize，结果每个都「先到默认位置、再闪到第二位置」，用户当场否掉
+                //   （「一个多小时前还是好的」）。
+                // ⚠️ `needsPrefer` 本身**仍然要** —— 那是上面 [preferMainApp] 的开关
+                //   （防 MIUI 弹「选原生还是分身」的选择器），与尺寸无关。
+                // 这条打点是 direct 那条路**唯一**的取证窗口（它不走 shell，没有
+                // `am stack list` 可看）：窗口有没有按这份逻辑矩形开出来，事后只看这一行。
+                DebugLog.info(
+                    "LAUNCH_DIRECT",
+                    "${target.flattened} aosp=$isAosp " +
+                        "逻辑=${AospFreeformWindow.bounds(context)?.flattenToString() ?: "?"} " +
+                        "windowingMode=${FreeformProtocol.windowMode(context)}",
+                )
+                StrategyOutcome.Success("已提交 windowingMode=${FreeformProtocol.windowMode(context)}")
+            }
         } catch (exception: SecurityException) {
             StrategyOutcome.Failure("被拒绝（SecurityException）：${exception.message}")
         } catch (exception: ActivityNotFoundException) {
@@ -1205,6 +1446,97 @@ class DirectStartStrategy : FreeformLaunchStrategy {
             StrategyOutcome.Failure("启动失败：${exception.javaClass.simpleName}: ${exception.message}")
         }
 }
+
+/**
+ * 这台小米会不会把我们**跨用户**的启动重解析掉（判据 + 理由见 [DirectStartStrategy.launch] 里那段）。
+ *
+ * 真机取证：小米 15 / HyperOS 4.0 上会（`XSpaceResolverActivity` 那一条链路）。
+ * 判据按项目惯例**问能力、不问品牌**：这里问的其实是「有没有那条只能以 shell 身份走的路」
+ * —— 拿不到 shell 就只能照旧赌一把 [startCloneWithOptions]（至少别让分身点不开）。
+ *
+ * ⚠️ 这里**不**跑 shell：只是一次品牌属性读 + 一次 `ShizukuShell.hasPermission` 读。
+ * （真正会跑 shell 的是 `CloneApps.hasClone`，它自己带 60 秒缓存。）
+ */
+private fun hyperOsReroutesUser(context: Context): Boolean =
+    SystemSupport.isHyperOS(context) && ShizukuShell.hasPermission
+
+/**
+ * 用 **`LauncherApps.startMainActivity`** 启动**分身**（住在另一个用户里的那个应用）。
+ *
+ * ## 为什么是它（2026-10-10 调研「带分身的应用打开小窗 resize」得出的结论）
+ *
+ * `startActivity` 只能打当前用户；跨用户要么有 `INTERACT_ACROSS_USERS`（我们没被授予）、
+ * 要么是系统进程身份。而 `LauncherApps` 是**给桌面用的公开 API** ——
+ * `startMainActivity` 天生**接受一个 `UserHandle`**，并且**第四个参数就是 `ActivityOptions`
+ * 的 bundle** ⇒ `setLaunchBounds` / `setLaunchWindowingMode` 都能带进去，
+ * **窗口一步到位、不需要事后 `am task resize`**。
+ *
+ * 对比 shell 那条（[ShizukuAmStrategy] → [AospFreeformWindow.launchInBackground]）：
+ * `am start` **根本没有 bounds 参数**（真机实测报 `Unknown option: --bounds`），
+ * 只能「先按系统默认起（小米实测 **587×1200**）、再 `am task resize` 到目标（**1200×1920**）」
+ * ⇒ 用户看到的就是那个「**先小后大**」的 resize。
+ *
+ * ## 失败就返回 null
+ *
+ * 它不是谁都能调：`LauncherAppsService` 会查 ① 调用方能不能"看见"这个 launcher activity、
+ * ② 目标用户与调用方是否在**同一个 profile group**（小米双开用户 `999` 的 `parentId=0`，
+ * 真机上满足）。任一条不满足就抛 `SecurityException` —— 那时**返回 null**，
+ * 让调用方继续走 shell 那条。**分身的兜底不能丢**：宁可 resize，也不能打不开。
+ *
+ * @return 成功 = [StrategyOutcome.Success]；不可用 / 被拒 = **null**（交给下一条策略）
+ */
+private fun startCloneWithOptions(
+    context: Context,
+    target: LaunchTarget,
+    options: Bundle,
+): StrategyOutcome? {
+    val launcherApps = context.getSystemService(LauncherApps::class.java) ?: return null
+    val user = userHandleOf(target.userId) ?: return null
+    return try {
+        launcherApps.startMainActivity(
+            ComponentName(target.packageName, target.className),
+            user,
+            null,
+            options,
+        )
+        // 无条件直写 logcat（绕开 DebugLog 开关）：这条新路成不成，排查时第一眼就看它。
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "LAUNCH_PATH=launcherApps ${target.flattened} user=${target.userId}",
+        )
+        StrategyOutcome.Success("LauncherApps.startMainActivity user=${target.userId}")
+    } catch (exception: SecurityException) {
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "CLONE_LAUNCHERAPPS_DENIED ${target.flattened} ${exception.message}",
+        )
+        null
+    } catch (exception: RuntimeException) {
+        android.util.Log.i(
+            "FlymeFreeformNoRoot",
+            "CLONE_LAUNCHERAPPS_FAILED ${target.flattened} " +
+                "${exception.javaClass.simpleName}: ${exception.message}",
+        )
+        null
+    }
+}
+
+/**
+ * 造一个 [UserHandle]（`UserHandle.of(int)`）。
+ *
+ * ⚠️ `UserHandle.of(int)` 是**隐藏 API** —— SDK 里根本没有，直接写会**编译不过**
+ * （`Unresolved reference 'of'`），所以走反射。本文件里 `setLaunchBounds` /
+ * `setLaunchWindowingMode` 都是同一个路子，真机实测反射能过（HyperOS 没有硬拦 hidden API）。
+ *
+ * 读不到就返回 null —— 调用方据此退回 shell 那条（**分身的兜底不能丢**）。
+ */
+private fun userHandleOf(userId: Int): UserHandle? =
+    runCatching {
+        UserHandle::class.java
+            .getDeclaredMethod("of", Int::class.javaPrimitiveType)
+            .also { it.isAccessible = true }
+            .invoke(null, userId) as? UserHandle
+    }.getOrNull()
 
 /**
  * 策略二：Shizuku 以 shell 身份执行 `am start`。
@@ -1228,6 +1560,12 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
         // 主线程立刻返回（面板能马上收起），窗口从出现到目标尺寸只差一个 `sleep 0.15`
         // —— 见 [AospFreeformWindow.launchInBackground]。
         if (FreeformProtocol.isAosp(context)) {
+            // 无条件直写 logcat（绕开 DebugLog 开关）—— 这条路上带了 `--user`（见 [amUserArgument]），
+            // 是小米上「不再被问双开」的关键，排查时第一眼就看它。
+            android.util.Log.i(
+                "FlymeFreeformNoRoot",
+                "LAUNCH_PATH=shell(aosp) ${target.flattened}${amUserArgument(target)}",
+            )
             AospFreeformWindow.launchInBackground(context, target)
             return StrategyOutcome.Success(
                 "已提交（后台）windowingMode=${FreeformProtocol.windowMode(context)}",
@@ -1275,6 +1613,8 @@ class ShizukuAmStrategy : FreeformLaunchStrategy {
             buildString {
                 if (preflight) append(resizeablePreflight(target.packageName)).append('\n')
                 append("am start --windowingMode ").append(windowMode)
+                // 用户号：分身必带；**小米上原体也带 `--user 0`**（见 [amUserArgument]）。
+                append(amUserArgument(target))
                 if (flags != 0) append(" -f ").append(flags)
                 append(" -n ").append(target.flattened)
             }
@@ -1490,6 +1830,12 @@ class FreeformLauncher(
             // ⚠️ 代价：小米/澎湃会拦「后台应用启动 Activity」，可能弹一次
             // 「Flyme 小窗 想要打开 XX，是否允许？」。用户点过「始终允许」之后就不再弹。
             // 一旦被拒，下面的 [ShizukuAmStrategy] 仍会兜底（那时只能走「先起再 resize」那条）。
+            // ★★ **直启优先**（2026-10-10 用户：「**resize 是一个很糟糕的体验**」）——
+            //   直启能把尺寸**在启动那一刻**定死、全程不跳；它唯一的毛病是「小米上启动
+            //   **有双开**的应用会被 MIUI 弹『选原生还是分身』」。
+            //   ⇒ 而那个弹框**只对有双开的包**发生，所以交给 [DirectStartStrategy] **按包**跳过自己、
+            //   让给 shell —— **千万不要在这里按 ROM 一刀切**：那会让**所有**应用都退化成
+            //   「先起再 resize」（用户实测后明确否掉）。
             strategies.sortedBy { if (it is DirectStartStrategy) 0 else 1 }
         } else {
             strategies

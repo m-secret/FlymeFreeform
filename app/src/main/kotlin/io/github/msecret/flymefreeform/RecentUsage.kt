@@ -27,10 +27,14 @@ import android.provider.Settings
  *    这是 1、2 都拿不到时（没授权 + 无障碍被系统摘掉）的最后一层，
  *    也就是加这个功能之前的那套行为。
  *
- * 三路都先化成「包名 + 时间戳」，按时间戳合并去重（同一个包只留最新那次），
- * 再拿**包名**去 [AppEntry] 目录里反查组件。★ 按包名反查、不按组件：系统与无障碍给的
- * 都只有包名，而一个包在目录里通常只有一个入口，用包名对齐最稳，也顺带把
+ * 三路都先化成「包名 + 时间戳」，按时间戳合并去重，再拿**包名**去 [AppEntry] 目录里反查组件。
+ * ★ 按包名反查、不按组件：系统与无障碍给的都只有包名，用包名对齐最稳，也顺带把
  * 桌面 / 输入法 / SystemUI 这些**根本不在应用目录里**的东西自然滤掉。
+ *
+ * ★★ **分身与原体各占一格**（用户 2026-10-10：「最近任务里没有区分分身主应用，只会显示
+ * 最近用的那个」）：两者**包名相同**，前两路来源分不出是谁，所以「某个包出几条」由
+ * **我们自己那份**（[SettingsStore.recentComponents]，带 `@<用户>` 标记）说了算，
+ * 详见 [recentComponents] 里的合并逻辑。
  *
  * ## 为什么「清除」要记一个水位线
  *
@@ -170,8 +174,26 @@ object RecentUsage {
         store: SettingsStore,
         apps: List<AppEntry>,
     ): List<ComponentName> {
-        val componentByPackage = HashMap<String, ComponentName>()
-        for (app in apps) componentByPackage.putIfAbsent(app.component.packageName, app.component)
+        // 目录里**全部**组件（含分身）—— 白名单用它判「反查得到实体」。
+        val allComponents = apps.mapTo(HashSet()) { it.component }
+        // ★★ **某一个包在「最近使用」里出几条，由我们自己那份说了算。**
+        //
+        // 为什么：分身与原体**包名相同**，而上面那两路来源（系统使用记录、无障碍观测前台）
+        // 都**只有包名**、分不出是谁 ⇒ 只能落到目录里第一条（= 原体）。
+        // 只有我们自己那份（[SettingsStore.recentComponents]）**带 `@<用户>` 标记**
+        // （见 [CloneApps.markUser]）能认出「刚才点的是分身」。
+        //
+        // ★★ 于是这里从「同一个包只留一条」改成「**主应用与每个用过的分身各占一格**」——
+        //    用户 2026-10-10 报的「最近任务里没有区分分身主应用，只会显示最近用的那个」
+        //    就是指这一行：原体与分身**同时开过**时，两条都该在。
+        //    我们自己那份没记过这个包时，才退回目录里第一条（= 老行为）。
+        val ownByPackage = HashMap<String, MutableList<ComponentName>>()
+        for (component in store.recentComponents) {
+            if (component !in allComponents) continue
+            ownByPackage.getOrPut(component.packageName) { mutableListOf() }.add(component)
+        }
+        val firstByPackage = HashMap<String, ComponentName>()
+        for (app in apps) firstByPackage.putIfAbsent(app.component.packageName, app.component)
 
         val clearedAt = store.recentClearedAt
         val stamps = LinkedHashMap<String, Long>()
@@ -183,16 +205,25 @@ object RecentUsage {
         val ordered = LinkedHashSet<ComponentName>()
         for ((packageName, _) in stamps.entries.sortedByDescending { it.value }) {
             if (ordered.size >= SettingsStore.MAX_RECENT) break
-            componentByPackage[packageName]?.let { ordered.add(it) }
+            val own = ownByPackage[packageName]
+            if (own.isNullOrEmpty()) {
+                firstByPackage[packageName]?.let { ordered.add(it) }
+            } else {
+                // 同一个包的那几条**挨在一起**（原体在前、分身在后，按我们自己的时间倒序），
+                // 读起来才像「这一个应用的几个入口」，而不是散落在整行里。
+                for (component in own) {
+                    if (ordered.size >= SettingsStore.MAX_RECENT) break
+                    ordered.add(component)
+                }
+            }
         }
 
         // 兜底：上面两路都是空的（没授权、无障碍又被系统摘掉）时，退回「我们自己点过的」那份。
         // 它的顺序本来就是最近在前，直接按原序补在后面即可。
         if (ordered.size < SettingsStore.MAX_RECENT) {
-            val known = componentByPackage.values.toHashSet()
             for (component in store.recentComponents) {
                 if (ordered.size >= SettingsStore.MAX_RECENT) break
-                if (known.contains(component)) ordered.add(component)
+                if (component in allComponents) ordered.add(component)
             }
         }
         return ordered.toList()

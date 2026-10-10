@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ColorOS 桌面的「应用分身」角标底板。
+
+  ★★ 来源：**从系统里拿的**，不是自己画的 ——
+  ColorOS launcher（`/system_ext/priv-app/OplusLauncher/OplusLauncher.apk`）里的
+  `res/drawable/ic_oplus_clone_app_badge_new.xml`，原样抄过来（2026-10-10）。
+
+  结构（自下而上四层，与 launcher 里那份逐字一致）：
+    1. 白色圆角底板（整块 18×18、圆角 4）
+    2. 蓝色卡片（5.625~15.375、圆角 2.25）—— 偏右下
+    3. 白色卡片（2.625~13.499、圆角 2.509）—— 偏左上
+    4. 绿色卡片（2.625~12.375、圆角 2.25）—— 最上层，压在白色卡片上
+
+  ★ **数字不在这份 vector 里** —— 官方是 launcher 用代码把「第几个分身」画在
+  **绿色那张卡片上**（真机实测：数字中心 = 绿卡中心 = 整块角标的 41.7% 处，
+  不在角标正中）。我们照做，见 `AppCatalog.withCloneNumberBadge`。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="18dp"
+    android:height="18dp"
+    android:viewportWidth="18"
+    android:viewportHeight="18">
+
+    <!-- 1. 白色圆角底板 -->
+    <path
+        android:fillColor="#ffffffff"
+        android:pathData="M4,0L14,0A4,4 0,0 1,18 4L18,14A4,4 0,0 1,14 18L4,18A4,4 0,0 1,0 14L0,4A4,4 0,0 1,4 0z" />
+
+    <!-- 2. 蓝色卡片（右下） -->
+    <path
+        android:fillColor="#ff0575fa"
+        android:pathData="M7.875,5.625L13.125,5.625A2.25,2.25 0,0 1,15.375 7.875L15.375,13.125A2.25,2.25 0,0 1,13.125 15.375L7.875,15.375A2.25,2.25 0,0 1,5.625 13.125L5.625,7.875A2.25,2.25 0,0 1,7.875 5.625z" />
+
+    <!-- 3. 白色卡片（左上） -->
+    <path
+        android:fillColor="#ffffffff"
+        android:pathData="M5.134,2.625L10.99,2.625A2.509,2.509 0,0 1,13.499 5.134L13.499,10.99A2.509,2.509 0,0 1,10.99 13.499L5.134,13.499A2.509,2.509 0,0 1,2.625 10.99L2.625,5.134A2.509,2.509 0,0 1,5.134 2.625z" />
+
+    <!-- 4. 绿色卡片（最上层，数字画在这张上） -->
+    <path
+        android:fillColor="#ff2eb85a"
+        android:pathData="M4.875,2.625L10.125,2.625A2.25,2.25 0,0 1,12.375 4.875L12.375,10.125A2.25,2.25 0,0 1,10.125 12.375L4.875,12.375A2.25,2.25 0,0 1,2.625 10.125L2.625,4.875A2.25,2.25 0,0 1,4.875 2.625z" />
+</vector>

@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.pm.LauncherApps
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PorterDuff
@@ -22,6 +23,12 @@ data class AppEntry(
     val component: ComponentName,
     val label: String,
     val icon: Bitmap,
+    /**
+     * 所在用户：**0 = 主用户**（普通应用）；非 0 = 分身（克隆，见 [CloneApps]）。
+     *
+     * ★★ 分身与它的原体**包名 / 类名完全一样** ⇒ 组件名分不开两者，用户号是唯一的区分依据。
+     */
+    val userId: Int = 0,
 )
 
 /**
@@ -205,7 +212,27 @@ object AppCatalog {
     fun sourceSignature(context: Context): String {
         val store = SettingsStore(context)
         val pack = usableIconPack(context, store)
-        return "$pack|${systemIconSetEnabled(store, pack)}"
+        // ⚠️ 分身角标的样式也进签名：它是**烤进图标位图**里的，
+        //    不把这一项算进来，改完样式呼出面板看到的还是旧角标（「要呼出两次才生效」）。
+        return "$pack|${systemIconSetEnabled(store, pack)}|${store.cloneBadgeStyle}"
+    }
+
+    /**
+     * 设置页「分身角标」那两行的**预览图**：在一块中性底板上按 [style] 叠好角标。
+     *
+     * 为什么不拿真实应用图标当底：那要异步读图标（本页已经在读 5 个做「对比」了），
+     * 而这里只需要让人看清**角标长什么样、贴哪个角** —— 一块灰底就够，
+     * 还不会因为某个应用图标本身太白 / 太花而看不清。
+     *
+     * ★ 走的是和真机**同一条** [applyCloneBadge]，所以预览和实际不会不一致。
+     */
+    fun cloneBadgePreview(context: Context, style: Int, sizePx: Int): Bitmap {
+        val tile = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(tile)
+        val radius = sizePx * 0.22f
+        val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFC8CDD4.toInt() }
+        canvas.drawRoundRect(RectF(0f, 0f, sizePx.toFloat(), sizePx.toFloat()), radius, radius, fill)
+        return applyCloneBadge(context, tile, 1, style)
     }
 
     private fun cachedIcon(key: String): Bitmap? = synchronized(iconCacheLock) { iconCache[key] }
@@ -317,13 +344,277 @@ object AppCatalog {
             }
         if (apps.isNotEmpty()) {
             swapIcons(icons)
+        }
+        // ★★ 分身（克隆）**必须在这之后拼**：它的 `ComponentName` 与原体**一模一样**，
+        // 混进上面那条 `.distinctBy(AppEntry::component)` 会被去重掉。
+        val clones = cloneEntries(context, apps)
+        if (apps.isNotEmpty()) {
             DebugLog.info(
                 "APP_ICONS",
-                "apps=${apps.size} 图标包=${iconPackPkg.ifBlank { "无" }} " +
+                "apps=${apps.size} 分身=${clones.size} 图标包=${iconPackPkg.ifBlank { "无" }} " +
                     "系统图标集=${if (useSystemIconSet) "开" else "关"} 命中=$systemHits",
             )
         }
-        return apps
+        if (clones.isEmpty()) return apps
+        return (apps + clones).sortedWith { first, second ->
+            val byLabel = collator.compare(first.label, second.label)
+            // 同名（原体与它的分身，名字已经一样了）时**原体在前** —— userId 0 < 999。
+            // ⚠️ 不写这条的话顺序取决于输入顺序（稳定排序），改一处调用就会飘。
+            if (byLabel != 0) byLabel else first.userId - second.userId
+        }
+    }
+
+    /**
+     * 分身（克隆）应用的条目：**图标复用主用户里同包名那一条**（克隆体和原体是同一个 APK，
+     * 图标资源一模一样）。
+     *
+     * ## 只在**小米**上叠角标（用户 2026-10-10：「这个图标只对 HyperOS 生效，不要影响别的」）
+     *
+     * - **小米**（[SystemSupport.isHyperOS]）：左下角叠一个分身角标（见 [withCloneBadge]）、
+     *   **名字和原体完全一样** —— HyperOS 桌面上分身就是这么区分的，我们照做；
+     * - **其余 ROM**（ColorOS 等）：**名字加后缀 + 右下角叠它自己的角标**。
+     *   **同一个应用可以有多个分身**，后缀按「第几个」变 —— 这是 ColorOS 桌面的写法
+     *   （用户 2026-10-10：「qq 有俩分身，桌面显示 QQ, QQ(分身), QQ 2」）：
+     *   `QQ` / `QQ(分身)` / `QQ 2` / `QQ 3`……
+     *   ★ 第 1 个那个括号必须是**半角**（用户：「**括号是英文的**」），
+     *   别写成全角「（分身）」。编号由 [CloneApps.Clone.index] 带出来。
+     *   ★ 角标图形**也是从系统里拿的**（ColorOS launcher 那份 vector，见
+     *   [R.drawable.ic_clone_badge_coloros]），不是我们照着画的。
+     *   ⚠️ 小米那张（`ic_clone_badge.png`）是**小米自己的图形**，别家机器上出现只会驴唇不对马嘴 ——
+     *   两个 ROM 各用各的，别互相套。
+     *
+     * ★★ 小米上名字相同**不影响区分**：组件带着 `@用户` 标记（见 [CloneApps.markUser]），
+     *   「已添加」判断、收藏键、最近使用全按组件名比 —— 原体与分身分得开。
+     *
+     * ⚠️ 会跑 shell（见 [CloneApps]）—— 本函数本身就在后台线程；Shizuku 没连上时返回空。
+     */
+    private fun cloneEntries(context: Context, apps: List<AppEntry>): List<AppEntry> {
+        if (apps.isEmpty()) return emptyList()
+        // ★★ 整段兜住：分身枚举要跑 shell，而**它跑在 [load] 那个 try 之外** ——
+        //    一旦 Shizuku 那边抛（binder 死掉、命令被系统拦、机型不认这条命令…），
+        //    会把**整个应用目录的加载**一起带崩。分身是锦上添花，
+        //    任何异常都只该让它自己消失（一个都不显示），绝不能影响正常应用。
+        val clones = runCatching { CloneApps.list() }.getOrDefault(emptyList())
+        if (clones.isEmpty()) return emptyList()
+        val hyperOs = SystemSupport.isHyperOS(context)
+        // 角标样式（官方 / 数字），见 [applyCloneBadge]。位置不在这里决定 —— 它跟着各系统走。
+        val badgeStyle = SettingsStore(context).cloneBadgeStyle
+        val byPackage = apps.associateBy { it.component.packageName }
+        return clones.mapNotNull { clone ->
+            val origin = byPackage[clone.component.packageName] ?: return@mapNotNull null
+            AppEntry(
+                // ★ 组件带「用户」标记（`pkg/类@999`，见 [CloneApps.markUser]）——
+                //   收藏 / 底栏 / 最近使用 / 管理应用页的「已添加」全按组件名比，
+                //   带上标记它们才分得开原体与分身。
+                component = CloneApps.markUser(clone.component, clone.userId),
+                label =
+                    when {
+                        // 小米：名字和原体一样，靠左下角那张角标区分（见本函数注释）。
+                        hyperOs -> origin.label
+                        // 第 1 个分身：`微信(分身)` —— ★ **半角括号**（用户 2026-10-10：
+                        // 「括号是英文的」）。
+                        clone.index == 1 -> "${origin.label}(分身)"
+                        // 第 2 个往后：`微信 2` / `微信 3` —— 同一台机器可以开多个分身，
+                        // ColorOS 桌面就是这么排的（用户：「qq 有俩分身，桌面显示
+                        // QQ, QQ(分身), QQ 2」）。
+                        else -> "${origin.label} ${clone.index}"
+                    },
+                icon =
+                    // 角标画失败就退回原图 —— 宁可少个角标，不能没图标。
+                    // 样式（官方 / 数字）与位置（小米左下 / ColorOS 右下）都在 [applyCloneBadge] 里决定。
+                    runCatching {
+                        applyCloneBadge(context, origin.icon, clone.index, badgeStyle)
+                    }.getOrDefault(origin.icon),
+                userId = clone.userId,
+            )
+        }
+    }
+
+    /**
+     * 按当前设置把**分身角标**叠到图标上 —— 面板 / 轮盘 / 管理应用页所有图标都走这一个入口。
+     *
+     * ## ★★ 两件事是分开的（用户 2026-10-10 明确）
+     *
+     * - **样式**（[SettingsStore.cloneBadgeStyle]）：**官方**（各系统自己那张图形）
+     *   还是**数字**（统一画白色数字 `1` / `2` / `3`…）；
+     * - **位置**：**跟随各系统** —— 小米贴**左下角**、ColorOS 贴**右下角**。
+     *   原话：「俩系统都支持，但是**位置跟随各系统**」。
+     *
+     * 所以四种组合都成立：
+     *
+     * | | 小米 | ColorOS |
+     * | --- | --- | --- |
+     * | **官方** | 左下角，那张小米图形（`ic_clone_badge.png`，图形里没有数字） | 右下角，launcher 那份 vector + 数字 |
+     * | **数字** | 左下角，白色数字 | 右下角，白色数字 |
+     *
+     * ⚠️ 角标是**烤进图标位图**的，改样式必须让应用目录重读 ——
+     *   见 [sourceSignature]（把样式算进签名）与 `IconSettingsActivity` 落盘后的 `reload`。
+     */
+    private fun applyCloneBadge(context: Context, base: Bitmap, number: Int, style: Int): Bitmap {
+        val atLeft = SystemSupport.isHyperOS(context)
+        return when {
+            // 数字样式：不分系统，统一白数字；**位置仍跟着各系统走**。
+            style == SettingsStore.CLONE_BADGE_STYLE_NUMBER -> withNumberBadge(base, number, atLeft)
+            // 小米官方那张**本身就是左下角**、图形里没有数字（桌面上靠它区分，名字是一样的）。
+            atLeft -> withCloneBadge(context, base)
+            // ColorOS 官方：launcher 那份 vector + 数字（数字画在绿卡上）。
+            else -> withCloneNumberBadge(context, base, number)
+        }
+    }
+
+    /**
+     * **数字样式**：一个白色数字（`1` / `2` / `3`…）+ 一圈深色阴影，贴在 [atLeft] 指定的那一角。
+     *
+     * 用户 2026-10-10：「一个是官方样式，**一个是你画的 1、2**」——
+     * 这就是「你画的」那一个；两个系统共用，位置仍各随各的系统。
+     *
+     * ⚠️ 白字必须带一圈深色阴影 —— 白底图标（QQ 那种）上纯白数字会直接糊掉。
+     * ⚠️ **不能就地改 `base`**：它来自共享的 [iconCache]，原体和分身引用的是**同一张位图**，
+     *   就地改会把原体也画上角标。
+     */
+    private fun withNumberBadge(base: Bitmap, number: Int, atLeft: Boolean): Bitmap {
+        val out = Bitmap.createBitmap(base.width, base.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(base, 0f, 0f, null)
+        val size = base.width * NUMBER_STYLE_FRACTION
+        val paint =
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = size
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                textAlign = if (atLeft) Paint.Align.LEFT else Paint.Align.RIGHT
+                color = android.graphics.Color.WHITE
+                setShadowLayer(size * 0.2f, 0f, 0f, 0xA0000000.toInt())
+            }
+        val margin = base.width * NUMBER_STYLE_MARGIN
+        canvas.drawText(
+            number.toString(),
+            if (atLeft) margin else base.width - margin,
+            base.height - margin,
+            paint,
+        )
+        return out
+    }
+
+    /**
+     * **ColorOS 官方样式**：在图标**右下角**叠 launcher 那份 vector + 数字，返回一张新位图 ——
+     * 图形用的是**系统自己的那张**（[R.drawable.ic_clone_badge_coloros]，从 ColorOS launcher
+     * 里提取，来历见该文件注释）。
+     *
+     * ★★ 角标是**从系统里拿的**（2026-10-10 用户：「能不能像 HyperOS 那样从系统里拿到那个角标」）：
+     *   和小米那张 `ic_clone_badge.png` 一个路子 —— 去 launcher apk 里把资源提出来。
+     *   ColorOS 那份是 vector（`ic_oplus_clone_app_badge_new.xml`），四层叠加：
+     *   **白色底板 + 蓝色卡片 + 绿色卡片**。
+     *
+     * ★★ **数字画在绿色那张卡片上，不画在角标正中** —— 这是官方摆法。真机逐像素实测
+     *   （ColorOS 平板 `QQ 2` 图标）：数字中心 = 绿卡中心 = 角标边长的 **41.7%** 处，
+     *   而角标中心是 50%，两者差得不小。见 [CLONE_NUMBER_CENTER]。
+     *
+     * ⚠️ **不能就地改 `base`**：它来自共享的 [iconCache]，原体和分身引用的是**同一张位图**，
+     *   就地改会把原体也画上角标（与 [withCloneBadge] 同一个坑）。
+     * ⚠️ 白字带一圈淡阴影 —— QQ 那种**白底**图标上，纯白数字压在绿卡上也容易糊边。
+     * ⚠️ 与小米那张（[withCloneBadge]）**不是一回事**：那张贴**左下角**、是小米自己的图形；
+     *   这张贴**右下角**、是 ColorOS 的图形。两条路别合并。
+     */
+    private fun withCloneNumberBadge(context: Context, base: Bitmap, number: Int): Bitmap {
+        val out = Bitmap.createBitmap(base.width, base.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(base, 0f, 0f, null)
+        val size = (base.width * CLONE_NUMBER_BADGE_FRACTION).toInt().coerceAtLeast(1)
+        val margin = (base.width * CLONE_NUMBER_BADGE_MARGIN).toInt()
+        val left = base.width - size - margin
+        val top = base.height - size - margin
+        // 角标图形本身。读不到就只画数字 —— 宁可少个底板，不能没图标。
+        runCatching {
+            context.getDrawable(R.drawable.ic_clone_badge_coloros)?.let { badge ->
+                badge.setBounds(left, top, left + size, top + size)
+                badge.draw(canvas)
+            }
+        }
+        val paint =
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = size * CLONE_NUMBER_FRACTION
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                textAlign = Paint.Align.CENTER
+                color = android.graphics.Color.WHITE
+                setShadowLayer(size * 0.05f, 0f, 0f, 0x66000000)
+            }
+        val cx = left + size * CLONE_NUMBER_CENTER
+        val cy = top + size * CLONE_NUMBER_CENTER - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText(number.toString(), cx, cy, paint)
+        return out
+    }
+
+    /**
+     * 数字的字号占**角标边长**的比例（注意：不是占图标 —— 数字画在角标里那张绿卡上）。
+     *
+     * 绿卡只占角标的 **54%**，数字再大就压出卡片了。
+     */
+    private const val CLONE_NUMBER_FRACTION = 0.46f
+
+    /**
+     * 数字中心在**角标**里的位置（占角标边长）—— 官方画在绿卡正中，不是角标正中。
+     *
+     * 绿卡在 vector 里是 2.625~12.375（共 18）⇒ 中心 7.5/18 = **41.7%**。
+     * 真机实测的白色数字中心也是这个位置（见 [withCloneNumberBadge]）。
+     */
+    private const val CLONE_NUMBER_CENTER = 0.417f
+
+    /** 分身数字角标的边长占图标边长的比例（比小米那张略大：里面还嵌着一圈卡片）。 */
+    private const val CLONE_NUMBER_BADGE_FRACTION = 0.38f
+
+    /** 角标离图标右下角的留白（占图标边长）。 */
+    private const val CLONE_NUMBER_BADGE_MARGIN = 0.02f
+
+    /**
+     * **数字样式**的字号（占**图标**边长）—— ⚠️ 和上面那组**不是一个口径**：
+     * 官方样式那个是「占**角标**」，这个是「占**图标**」，因为数字不装在角标里、直接贴角上。
+     *
+     * 0.30 是原来那版实测好用的值（用户 2026-10-10：「你画的 1、2 也挺好看」）。
+     */
+    private const val NUMBER_STYLE_FRACTION = 0.30f
+
+    /** **数字样式**离图标角落的留白（占图标边长）。 */
+    private const val NUMBER_STYLE_MARGIN = 0.04f
+
+    /** 分身角标相对图标的边长比。照抄 HyperOS 桌面自己的 1x1 模板：角标 56px / 画布 160px。 */
+    private const val CLONE_BADGE_FRACTION = 0.35f
+
+    /** 缩放好的角标（图标边长 px → 角标位图）。同一档尺寸只缩一次，所有分身共用。 */
+    private val badgeCache = HashMap<Int, Bitmap>()
+    private val badgeCacheLock = Any()
+
+    /**
+     * 把**分身角标**画到图标**左下角**，返回一张新位图。
+     *
+     * ★★ **不能就地改 `base`**：它来自共享的 [iconCache]，原体和分身引用的是**同一张位图**，
+     *   就地改会把原体也画上角标。
+     *
+     * 角标图形取自 HyperOS 桌面自己的那张（`res/drawable-nodpi/ic_clone_badge.png`，
+     * 来源见 NOTICE.md），位置与大小照抄小米的 1x1 模板：**边长 = 图标边长 × 35%，贴左下角**。
+     *
+     * ★ 这是**官方样式在小米上的那一支**（见 [applyCloneBadge]）—— 图形里**没有数字**，
+     *   桌面上小米就是靠它区分原体与分身（名字是一样的）。别给它加数字。
+     */
+    private fun withCloneBadge(context: Context, base: Bitmap): Bitmap {
+        val badge = cloneBadge(context, base.width) ?: return base
+        val out = Bitmap.createBitmap(base.width, base.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(base, 0f, 0f, null)
+        canvas.drawBitmap(badge, 0f, (base.height - badge.height).toFloat(), null)
+        return out
+    }
+
+    /** 取指定图标尺寸下缩放好的角标；资源读不到时返回 null。 */
+    private fun cloneBadge(context: Context, iconSize: Int): Bitmap? {
+        synchronized(badgeCacheLock) { badgeCache[iconSize] }?.let { return it }
+        val raw =
+            runCatching {
+                BitmapFactory.decodeResource(context.resources, R.drawable.ic_clone_badge)
+            }.getOrNull() ?: return null
+        val px = (iconSize * CLONE_BADGE_FRACTION).toInt().coerceAtLeast(1)
+        val scaled = if (px == raw.width) raw else Bitmap.createScaledBitmap(raw, px, px, true)
+        synchronized(badgeCacheLock) { badgeCache[iconSize] = scaled }
+        return scaled
     }
 
     /**

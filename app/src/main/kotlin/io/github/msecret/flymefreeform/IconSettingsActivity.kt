@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
@@ -43,6 +44,9 @@ class IconSettingsActivity : Activity() {
     /** 「工具图标」那张选项卡。换样式后要整组重画（对勾要跟着走），所以留引用。 */
     private lateinit var toolStyleGroup: CardGroup
 
+    /** 「分身角标」那张选项卡。同上，换样式后要整组重画。 */
+    private lateinit var badgeStyleGroup: CardGroup
+
     /** 对比预览的容器。 */
     private lateinit var previewBox: LinearLayout
 
@@ -72,6 +76,7 @@ class IconSettingsActivity : Activity() {
         // 读它们的资源，很慢，不能压在进页面的路上。
         renderSources()
         renderToolStyles()
+        renderBadgeStyles()
         detectIconPacksAsync()
         refreshPreview()
     }
@@ -95,6 +100,10 @@ class IconSettingsActivity : Activity() {
         root.addView(Ui.sectionTitle(this, "工具图标"))
         toolStyleGroup = CardGroup(this)
         root.addView(toolStyleGroup)
+
+        root.addView(Ui.sectionTitle(this, "分身角标"))
+        badgeStyleGroup = CardGroup(this)
+        root.addView(badgeStyleGroup)
 
         root.addView(Ui.sectionTitle(this, "对比"))
         previewBox =
@@ -167,6 +176,11 @@ class IconSettingsActivity : Activity() {
                         } else {
                             "已装 ${iconPacks.size} 个，点这里选一个"
                         },
+                    // ★ 选中了图标包 ⇒ **整行按「选中」渲染**：标题变主题绿 + medium、箭头也变绿，
+                    //   和上面两行 `Ui.choiceRow` 的选中态（绿色对勾 + 绿标题）对上。
+                    //   用户 2026-10-10：「如果选中了把那个箭头变绿，这样用户更清晰，上面俩都是
+                    //   选中了有个绿色对勾」，紧接着追加：「**os 图标包的文字也和别的一样变绿啊**」。
+                    selected = picked.isNotBlank(),
                 ) {
                     showIconPackPicker()
                 }
@@ -399,6 +413,129 @@ class IconSettingsActivity : Activity() {
     }
 
     /**
+     * 重画「分身角标」那张卡：**两种样式各一行**，行首一个真实渲染的预览。
+     *
+     * ★★ 用户 2026-10-10 要的是「**样式可选**，但**位置跟随各系统**」——
+     *   所以这里**只有**「官方 / 数字」两项，**不做「贴哪边」的选项**：
+     *   小米永远贴左下角、ColorOS 永远贴右下角（见 `AppCatalog.applyCloneBadge`）。
+     *   给一个「位置」选项反而会让人以为可以把它挪到任意角落，那是假的。
+     *
+     * 用 [badgeStyleRow] 而不是 [Ui.choiceRow]：两种样式光看名字分不清（「官方」到底是哪张图？），
+     * 得看到**贴哪个角、长什么样**才好选 —— 和上面「工具图标」是同一个理由。
+     */
+    private fun renderBadgeStyles() {
+        val current = store.cloneBadgeStyle
+        val iconPx = Ui.dp(this, BADGE_PREVIEW_ICON_DP)
+        badgeStyleGroup.setRows(
+            listOf(
+                badgeStyleRow(
+                    title = "官方样式",
+                    detail = "系统自己那张角标，和桌面一致",
+                    selected = current == SettingsStore.CLONE_BADGE_STYLE_SYSTEM,
+                    preview =
+                        AppCatalog.cloneBadgePreview(
+                            this,
+                            SettingsStore.CLONE_BADGE_STYLE_SYSTEM,
+                            iconPx,
+                        ),
+                    onClick = { applyBadgeStyle(SettingsStore.CLONE_BADGE_STYLE_SYSTEM) },
+                ),
+                badgeStyleRow(
+                    title = "数字",
+                    detail = "统一画白色数字（1、2、3…）",
+                    selected = current == SettingsStore.CLONE_BADGE_STYLE_NUMBER,
+                    preview =
+                        AppCatalog.cloneBadgePreview(
+                            this,
+                            SettingsStore.CLONE_BADGE_STYLE_NUMBER,
+                            iconPx,
+                        ),
+                    onClick = { applyBadgeStyle(SettingsStore.CLONE_BADGE_STYLE_NUMBER) },
+                ),
+            ),
+        )
+    }
+
+    /**
+     * 一行角标样式：**名字 + 对勾** / 说明 / **该样式下的角标预览**。
+     *
+     * 竖排布局（和 [toolStyleRow] 同构）：`Ui.row` 默认是给横排用的
+     * （`gravity = CENTER_VERTICAL`），这里要显式改成竖排 + 左对齐。
+     */
+    private fun badgeStyleRow(
+        title: String,
+        detail: String,
+        selected: Boolean,
+        preview: Bitmap,
+        onClick: () -> Unit,
+    ): View {
+        val container = Ui.row(this)
+        container.orientation = LinearLayout.VERTICAL
+        container.gravity = Gravity.START
+
+        // 第一行：名字（占满剩余宽度）+ 对勾。对勾固定宽度，所以换选项时标题不会左右抖。
+        val head =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+        head.addView(
+            Ui.rowTitle(this@IconSettingsActivity, title).apply {
+                setTextColor(if (selected) Ui.COLOR_PRIMARY else Ui.COLOR_ON_SURFACE)
+                typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            },
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        val markSize = Ui.dp(this, 22)
+        head.addView(
+            TextView(this).apply {
+                text = if (selected) "✓" else ""
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Ui.COLOR_PRIMARY)
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(markSize, markSize)
+            },
+        )
+        container.addView(
+            head,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        container.addView(Ui.rowDetail(this@IconSettingsActivity, detail))
+
+        val iconPx = Ui.dp(this, BADGE_PREVIEW_ICON_DP)
+        container.addView(
+            ImageView(this).apply {
+                setImageBitmap(preview)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            },
+            LinearLayout.LayoutParams(iconPx, iconPx).apply {
+                topMargin = Ui.dp(this@IconSettingsActivity, 10)
+            },
+        )
+
+        container.isClickable = true
+        container.setOnClickListener { onClick() }
+        return container
+    }
+
+    /**
+     * 落盘 + 让服务重读目录。
+     *
+     * ⚠️ **必须重读**：角标是**烤进图标位图**里的（见 `AppCatalog.cloneEntries`），
+     *   不重读的话面板 / 轮盘上还是旧角标 —— 目录是服务启动 / 后台刷新时读的**快照**。
+     *   签名里也带了这一项（`AppCatalog.sourceSignature`），两条一起才「一次到位」。
+     */
+    private fun applyBadgeStyle(style: Int) {
+        store.cloneBadgeStyle = style
+        OverlayGestureService.reload(this)
+        renderBadgeStyles()
+    }
+
+    /**
      * 刷新「默认 vs 当前来源」的对比预览。
      *
      * 读图标、渲染位图都要时间，所以**放后台线程**，回来再填 View。
@@ -516,5 +653,13 @@ class IconSettingsActivity : Activity() {
 
         /** 预览里相邻两个工具图标的间距（dp）。 */
         const val TOOL_PREVIEW_GAP_DP = 14
+
+        /**
+         * 「分身角标」每行预览里那块样例底板的边长（dp）。
+         *
+         * 比工具那个（[TOOL_PREVIEW_ICON_DP]）大一圈：角标本身只占图标的 1/3 上下，
+         * 28dp 的底板上那个角标根本看不清是「贴哪个角、有没有数字」。
+         */
+        const val BADGE_PREVIEW_ICON_DP = 40
     }
 }

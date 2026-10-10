@@ -195,9 +195,9 @@ object HapticsVendor {
         fun prop(name: String): String = probe.props[name].orEmpty()
         fun anyProp(vararg names: String) = names.any { prop(it).isNotBlank() }
 
-        if (probe.miuiClass || anyProp("ro.miui.ui.version.name", "ro.miui.ui.version.code", "ro.mi.os.version.name", "ro.mi.os.version.code") ||
-            brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco")
-        ) {
+        // ★ 判据只有一份：整体搬去 [SystemSupport.isHyperOS] 了（那边同时给分身角标、
+        //   `am start --user 0` 那两处用）。这里不再各写一套 —— 同名属性抄两遍迟早走样。
+        if (SystemSupport.isHyperOS(context)) {
             return Vendor.XIAOMI
         }
         // ★ 判据只有一份：整体搬去 [SystemSupport.isFlyme] 了 —— 那边同时给小窗那一行的说明、
