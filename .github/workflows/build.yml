@@ -75,15 +75,54 @@ jobs:
           name: FlymeFreeform-debug-apk
           path: apk
 
-      # 本 job 没有 checkout，目录不是 git 仓库，`gh release create` 会报
-      # "fatal: not a git repository"。用 --repo 显式指定目标仓库即可。
-      # --verify-tag 保证只在标签已存在时创建，避免 gh 自作主张基于默认分支新建标签。
-      - name: Create GitHub Release
+      # ★ 读标签注解要用它 ⇒ 必须 checkout，而且 `fetch-depth: 0`（默认只拉一个提交，
+      #   拿不到标签对象）。
+      - name: Checkout（为了读标签注解）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ★★ 两处都修过（2026-10-10）：
+      #
+      # ① **能重跑**：早先只有 `gh release create` 一条路 ⇒ 重跑 tag **必定失败**
+      #    （`a release with the same tag name already exists: v1.1.5`，v1.1.5 的 tag run
+      #    就是这么挂的）。现在先探测，已存在就只**覆盖附件**。
+      #    ⚠️ 覆盖时**故意不带 --notes / --notes-file** —— 正文是人工写的，
+      #       重跑把那段话冲掉才是更糟的事。
+      #
+      # ② **正文不再是空的**：原来用 `--generate-notes`，而本仓库**直接推 main、没有 PR**，
+      #    GitHub 只能生成一行 compare 链接 ⇒ 应用内「更新日志」等于空白
+      #    （用户 2026-10-10 当场发现：「没有更新日志啊」）。
+      #    现在改为**用标签注解当正文**（`--notes-from-tag`）⇒ 发版时这样打标签即可：
+      #        git tag -a v1.1.7 -F <写好的更新日志.md>
+      #    ⚠️ 所以**打标签时就要把更新日志写好**（用户视角的 `### 新增 / ### 改进 / ### 修复`），
+      #       别再写一行摘要 —— 那段文字现在会**原样出现在 Release 页和应用内更新日志里**。
+      #    ⚠️ 标签没注解（轻量标签）时兜底回 `--generate-notes`，至少有个对比链接。
+      #    ⚠️ 本 job 有 checkout 了，但仍显式带 `--repo`：不依赖 cwd 是不是 git 仓库。
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" apk/*.apk \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME 已存在 —— 只覆盖附件，保留现有正文"
+            gh release upload "$GITHUB_REF_NAME" apk/*.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+            exit 0
+          fi
+          if [ -n "$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")" ]; then
+            echo "用标签注解当更新日志"
+            gh release create "$GITHUB_REF_NAME" apk/*.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-from-tag
+          else
+            echo "标签没有注解 —— 退回自动生成（只会有一行 compare 链接）"
+            gh release create "$GITHUB_REF_NAME" apk/*.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
