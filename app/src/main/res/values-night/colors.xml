@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        深色（`values-night`）。**与 `Ui.DARK` 那份手写调色板是同一套值**。
+
+        为什么两处都要有：Activity 自己画的 View 走 `Ui.kt` 的 palette（那套是运行时算的，
+        因为「跟随系统 / 浅色 / 深色」三档里有两档会覆盖系统）；这里这份是给**系统控件**读的
+        —— `Switch` / `SeekBar` / `AlertDialog` 的按钮与正文 / 文本选择柄，它们只认资源。
+        改颜色时两边一起改，否则会出现「卡片是深的、开关还是浅色那套」的割裂。
+
+        ★ 「浅色 / 深色」档位是靠 `UiModeManager.setApplicationNightMode()` 施加到应用上的
+        （见 `Ui.applyAppNightMode`），所以用户强制浅色时**这份目录不会被选中**，两套不会打架。
+    -->
+    <color name="m3_surface">#101413</color>
+    <color name="m3_primary">#4FD8AC</color>
+    <color name="m3_on_primary">#00382A</color>
+    <color name="m3_state_layer">#1FFFFFFF</color>
+
+    <!-- 兼容旧引用 -->
+    <color name="page_background">#101413</color>
+    <color name="accent">#4FD8AC</color>
+</resources>

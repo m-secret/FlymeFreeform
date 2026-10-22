@@ -100,21 +100,21 @@ class AlphabetIndexView(
     private val normalPaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textAlign = Paint.Align.CENTER
-            color = 0xFF8A8A8A.toInt()
+            color = Ui.COLOR_ON_SURFACE_VARIANT
         }
 
     /** 当前命中的字母：绿色，且明显比其它字母大一号。 */
     private val activePaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textAlign = Paint.Align.CENTER
-            color = 0xFF1D9E75.toInt()
+            color = Ui.COLOR_PRIMARY
             isFakeBoldText = true
         }
 
     /** 顶部那颗五角星。 */
     private val starPaint =
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFF1D9E75.toInt()
+            color = Ui.COLOR_PRIMARY
             style = Paint.Style.FILL
         }
 
@@ -123,11 +123,14 @@ class AlphabetIndexView(
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textAlign = Paint.Align.CENTER
             textSize = shortEdgePx * BUBBLE_TEXT_FRACTION
-            color = 0xFFFFFFFF.toInt()
+            color = Ui.COLOR_ON_PRIMARY
             isFakeBoldText = true
         }
     private val bubblePaint =
-        Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCC1D9E75.toInt() }
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            // 主色压到 80%：气泡要能透出后面的字母列，但不能淡到看不清。
+            color = (Ui.COLOR_PRIMARY and 0x00FFFFFF) or (0xCC shl 24)
+        }
 
     /** 当前命中的条目下标：`0` = 五角星；`i + 1` = `letters[i]`；null = 没按住。 */
     private var activeIndex: Int? = null

@@ -54,6 +54,8 @@ class LogActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 主题：**建界面前**解析配色（夜间模式），见 [Ui.attach]。
+        Ui.attach(this)
         // 同步日志开关到进程内 DebugLog（Service/无障碍同进程共享）。
         DebugLog.enabled = SettingsStore(this).debugLogEnabled
         setContentView(buildContent())

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        深色的「落地」主题。
+
+        `values-night` 里同名的 style 会**整份替换**掉 `values/` 那一份（item 不合并），
+        所以这里必须把浅色那份的 item 全抄一遍，只改与深浅有关的三处：
+        - 父主题换成**深色基准**（`Theme.DeviceDefault.NoActionBar`，不带 `.Light`）
+          —— Switch / SeekBar / AlertDialog 的默认前景色都来自它；
+        - `windowLightStatusBar` / `windowLightNavigationBar` 改成 `false`：深色底要浅色图标；
+        - 颜色仍读 `@color/m3_surface` 这些 role，它们在 `values-night/colors.xml` 里换成了深色值。
+    -->
+    <style name="Theme.FlymeFreeformNoRoot" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@color/m3_surface</item>
+        <item name="android:colorBackground">@color/m3_surface</item>
+        <item name="android:statusBarColor">@color/m3_surface</item>
+        <item name="android:navigationBarColor">@color/m3_surface</item>
+        <!-- 深色背景必须配浅色状态栏图标，否则黑字压在深底上看不清。 -->
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+
+        <item name="android:colorAccent">@color/m3_primary</item>
+        <item name="android:colorControlActivated">@color/m3_primary</item>
+        <item name="android:colorControlHighlight">@color/m3_state_layer</item>
+
+        <item name="android:alertDialogTheme">@style/Theme.FlymeFreeformNoRoot.Dialog</item>
+
+        <item name="android:fitsSystemWindows">true</item>
+    </style>
+
+    <style name="Theme.FlymeFreeformNoRoot.Dialog" parent="@android:style/Theme.DeviceDefault.Dialog.Alert">
+        <item name="android:colorAccent">@color/m3_primary</item>
+        <item name="android:colorControlActivated">@color/m3_primary</item>
+    </style>
+</resources>

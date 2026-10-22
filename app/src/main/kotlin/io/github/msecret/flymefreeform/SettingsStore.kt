@@ -1279,6 +1279,30 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean(KEY_HIDE_FROM_RECENTS, false)
         set(value) = preferences.edit().putBoolean(KEY_HIDE_FROM_RECENTS, value).apply()
 
+    /**
+     * 外观：**跟随系统 / 浅色 / 深色**三档，见 [THEME_MODE_AUTO] 等。
+     *
+     * 默认 [THEME_MODE_AUTO]（用户 2026-10-20 要的「夜间模式，模式自适应」）：
+     * 跟着系统的深色开关走，不额外做一个需要用户自己记得切的开关。
+     *
+     * ⚠️ 改它**只是写个字符串**。要让界面真的变，调用方还得：
+     * ① [Ui.applyAppNightMode]（把应用级 uiMode 同步给系统控件与 `values-night`）；
+     * ② 重建界面（Activity `recreate()` / 浮层关掉重开）——颜色是建 View 时烘进去的，
+     *    改设置不会回头刷已经画出来的东西。见 [Ui.attach] 的说明。
+     */
+    var themeMode: String
+        get() = normalizeThemeMode(preferences.getString(KEY_THEME_MODE, null))
+        set(value) {
+            // ★ **必须 `commit()`（同步落盘），不能用 `apply()`**：
+            //   调用方紧接着就会 `Ui.applyAppNightMode()`，那会触发一次配置变更、Activity 当场
+            //   重建；重建时新的 SettingsStore 是**重新打开 prefs 文件**读的。`apply()` 只改内存、
+            //   异步写盘，撞上那种「毫秒级重建」就会读回旧值（真机表现：点「深色」，页面重建后
+            //   变回浅色）。一个键的同步写只有几十微秒，代价可以忽略。
+            preferences.edit()
+                .putString(KEY_THEME_MODE, normalizeThemeMode(value))
+                .commit()
+        }
+
     /** 调试日志开关。默认关闭，只在排查问题时打开（否则 WINDOW_SCAN 等日志会刷爆）。 */
     var debugLogEnabled: Boolean
         get() = preferences.getBoolean(KEY_DEBUG_LOG, false)
@@ -1952,6 +1976,31 @@ class SettingsStore(context: Context) {
         private const val KEY_AUTO_UPDATE_INTERVAL_HOURS = "auto_update_interval_hours"
         private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
 
+        /** 外观三档，见 [SettingsStore.themeMode]。 */
+        private const val KEY_THEME_MODE = "theme_mode"
+
+        /** 外观：跟随系统深色开关（默认）。 */
+        const val THEME_MODE_AUTO = "auto"
+
+        /** 外观：强制浅色。 */
+        const val THEME_MODE_LIGHT = "light"
+
+        /** 外观：强制深色。 */
+        const val THEME_MODE_DARK = "dark"
+
+        /**
+         * 把任意字符串收敛成三档之一。
+         *
+         * 走读也要过一遍：老备份 / 手改 prefs / 以后新增的档位都可能塞进来一个不认识的值，
+         * 那种一律按 [THEME_MODE_AUTO]（宁可跟系统，也不要因为一个怪值把界面画成意外的一套）。
+         */
+        private fun normalizeThemeMode(raw: String?): String =
+            when (raw) {
+                THEME_MODE_LIGHT -> THEME_MODE_LIGHT
+                THEME_MODE_DARK -> THEME_MODE_DARK
+                else -> THEME_MODE_AUTO
+            }
+
         /**
          * 自动查更新的**默认**间隔（24 小时），见 [autoUpdateIntervalHours]。
          *
@@ -2568,7 +2617,7 @@ class SettingsStore(context: Context) {
                 KEY_TOOL_ICONS,
                 // 其它
                 KEY_HIDE_FROM_RECENTS, KEY_AUTO_CHECK_UPDATE, KEY_LAST_UPDATE_CHECK_AT,
-                KEY_AUTO_UPDATE_INTERVAL_HOURS,
+                KEY_AUTO_UPDATE_INTERVAL_HOURS, KEY_THEME_MODE,
                 KEY_LAST_AUTO_A11Y_GRANT, KEY_DEBUG_LOG,
                 // 一次性迁移标记（见上面的说明，必须一起还原）
                 KEY_TOUCH_MIGRATED, KEY_RANGE_MIGRATED_40_70, KEY_INSET_MIGRATED_TO_10,

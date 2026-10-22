@@ -134,7 +134,7 @@ class ScreenTextPanel(
             TextView(context).apply {
                 text = "复制全部"
                 sizeByScreen(0.028f)
-                setTextColor(0xFFFFFFFF.toInt())
+                setTextColor(Ui.COLOR_ON_PRIMARY)
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
                 setPadding(dp(10), dp(11), dp(10), dp(11))
@@ -228,12 +228,17 @@ class ScreenTextPanel(
         const val ENTER_SCALE_FROM = 0.94f
         const val COPY_FEEDBACK_MS = 1_200L
 
+        /** 面板外的遮罩：不随主题变（它压的是下层应用，不是我们自己的表面）。 */
         const val BACKDROP_COLOR = 0x99000000.toInt()
-        const val CARD_COLOR = 0xFFFFFFFF.toInt()
-        const val CARD_STROKE_COLOR = 0x14000000
-        const val TEXT_PRIMARY = 0xFF1A1A1A.toInt()
-        const val TEXT_SECONDARY = 0xFF8A8A8A.toInt()
-        const val TEXT_WEAK = 0xFFB0B0B0.toInt()
-        const val ACCENT_COLOR = 0xFF1D9E75.toInt()
+
+        // 卡片与文字**跟着主题走**（2026-10-20 夜间模式）：原来是写死的白底黑字。
+        // ⚠️ 这些必须在这里就取到值（`val get()` 也行，但面板是一次建完的，构造时读一次足够），
+        //    所以写成 getter，建面板那一刻的 palette 说了算。
+        val CARD_COLOR: Int get() = Ui.COLOR_SURFACE_CONTAINER
+        val CARD_STROKE_COLOR: Int get() = Ui.COLOR_OUTLINE
+        val TEXT_PRIMARY: Int get() = Ui.COLOR_ON_SURFACE
+        val TEXT_SECONDARY: Int get() = Ui.COLOR_ON_SURFACE_VARIANT
+        val TEXT_WEAK: Int get() = Ui.COLOR_TEXT_WEAK
+        val ACCENT_COLOR: Int get() = Ui.COLOR_PRIMARY
     }
 }

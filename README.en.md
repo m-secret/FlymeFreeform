@@ -58,6 +58,7 @@ One hard-won lesson is recorded in the source comments: `setMotionEventSources()
   - **The mask automatically avoids the soft keyboard**, so typing inside the floating window will not accidentally close it.
   - The page shows only the switch and the "open accessibility settings" entry by default; everything else lives in a collapsible **"Advanced (you normally don't need this)"** section.
 - **Corner tap passthrough**: a press eaten by the corner strip is re-injected at the original coordinates and duration, equivalent to the user actually tapping there (long presses stay long presses).
+- **Dark mode (follows the system by default)**: the app follows the system light/dark setting out of the box, and "Settings → Appearance" can lock it to Light or Dark. Switching between "Follow system" and a locked option that resolves to the same palette only moves the check mark — the page is not rebuilt, so it does not flash. The whole UI switches together: main screen, sub-pages, radial menu, "More" panel, screen-text panel, dialogs and system controls all read one palette.
 - **Keeping the accessibility toggle alive**: ColorOS clears the accessibility toggle in several situations and the app itself may not write it back. Three channels cover this:
   - **Quick Settings tile**: bright = ready, dim = tap to write it back through Shizuku.
   - **Automatic restore**: on boot, after an app update, and once Shizuku connects, the toggle is checked and re-added — appending only itself, never disturbing other accessibility services.

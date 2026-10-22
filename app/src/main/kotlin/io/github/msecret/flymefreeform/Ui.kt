@@ -1,5 +1,7 @@
 package io.github.msecret.flymefreeform
 
+import android.app.Activity
+import android.app.UiModeManager
 import android.content.Context
 import android.content.res.ColorStateList
 import android.content.res.Configuration
@@ -16,6 +18,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -35,7 +38,7 @@ import kotlin.math.min
  * 普通 View，加依赖会牵出一整套 ui/appcompat 传递依赖）。所以这里直接用原生 View 复刻
  * M3 的四个要点：**color roles、shape scale、type scale、state layer（ripple）**。
  *
- * ## 1. Color roles（绿色种子，light scheme）
+ * ## 1. Color roles（绿色种子，light / dark 两套）
  *
  * M3 的关键不是「用了什么颜色」，而是**颜色按角色分配**——同一个值只做一件事：
  *
@@ -44,11 +47,21 @@ import kotlin.math.min
  * | `primary` | 强调文字、选中态、开关/滑块、主按钮底 |
  * | `primaryContainer` | 主按钮以外的浅色强调底（胶囊、徽标） |
  * | `surface` | 页面底色 |
- * | `surfaceContainerLowest` | 卡片 / 列表容器（纯白，浮在页面上） |
+ * | `surfaceContainerLowest` | 卡片 / 列表容器（浮在页面上的一层） |
  * | `onSurface` | 正文标题 |
  * | `onSurfaceVariant` | 次级说明 |
  * | `outlineVariant` | 分隔线 |
  * | `error` / `errorContainer` | 危险操作 |
+ *
+ * ### 深色（2026-10-20）
+ *
+ * 同一套 role 有**两份取值**（[LIGHT] / [DARK]），`COLOR_*` 都是「读当前 palette」的 getter。
+ * 谁来决定用哪份：设置 → 外观，三档（跟随系统 / 浅色 / 深色，见 [SettingsStore.themeMode]）。
+ *
+ * ★ **建界面前必须调一次 [attach]**：颜色是在建 View 时烘进 drawable / Paint 的，
+ *   建完之后改 palette 不会回头刷。Activity 的 `onCreate` 第一件事、服务建浮层前都要调。
+ * ★ 深色下有一条和浅色时代相反的硬规矩：**卡片要比页面亮一档**（浅色是白卡压灰底）。
+ *   两者同色时卡片边界消失，整页退化成「一堆块糊在一起」——这条在两种模式下都成立。
  *
  * 上一版的毛病是「想到什么颜色写什么颜色」，绿、黑、灰、红各自为政；按角色分配之后，
  * 同一个语义在全 App 里永远同一个色。
@@ -83,78 +96,241 @@ import kotlin.math.min
  */
 object Ui {
 
-    // ---- Material 3 color roles ----
+    // ---- 主题：明 / 暗两套配色 ----
+    //
+    // 颜色**不再是** `const val`：夜间模式要求同一套 role 在运行时给出不同的值，
+    // 而 Kotlin 的 const 会在编译期内联死。现在每个 role 都是「读当前 palette」的 getter，
+    // **调用点一个字都不用改**（`Ui.COLOR_PRIMARY` 仍然照写），面板类里那些
+    // `const val = Ui.COLOR_*` 改成 `val get()` 即可。
+    //
+    // ★ 谁负责切换：[attach] 必须在**建任何界面之前**调一次（每个 Activity 的 onCreate、
+    //   服务建浮层前）。palette 是进程级单例，不 attach 就沿用上一次（首次是浅色）。
+    //   「模式自适应」= 默认 [SettingsStore.THEME_MODE_AUTO]，按系统 uiMode 走；
+    //   用户在「设置 → 外观」里可以强制浅色 / 深色（见 [applyAppNightMode]）。
 
     /**
-     * primary：强调色本体（选中文字、开关、主按钮底）。
+     * 一套配色。
      *
-     * **就是重构前那一版的绿（`#1D9E75`）**，原样搬回来。中间试过 M3 的 `#1B7A55` 和压深过的
-     * `#17875F`，用户两次反馈「颜色没之前好看」——它以前鲜亮通透，压深之后整页发闷。
-     * 观感优先，这里不再为 4.5:1 的正文对比度折中：它主要出现在标题字重、图标、按钮这种
-     * 大字号/大面积的位置，3.4:1 够用。
+     * 两个 role 之外的东西（尺寸、形状、字重）不随主题变，所以只装颜色。
      */
-    const val COLOR_PRIMARY = 0xFF1D9E75.toInt()
+    private class Palette(
+        val primary: Int,
+        val onPrimary: Int,
+        val primaryContainer: Int,
+        val onPrimaryContainer: Int,
+        val surface: Int,
+        val surfaceContainer: Int,
+        val onSurface: Int,
+        val onSurfaceVariant: Int,
+        val outline: Int,
+        val outlineVariant: Int,
+        val error: Int,
+        val errorContainer: Int,
+        val onErrorContainer: Int,
+        val stateLayer: Int,
+        val accentSoft: Int,
+        val textWeak: Int,
+    )
+
+    /**
+     * 浅色（沿用重构前那一版，用户两次否掉了 M3 压深的绿）。
+     *
+     * `primary` 就是 `#1D9E75`：它以前鲜亮通透，压深之后整页发闷。观感优先，不为 4.5:1
+     * 的正文对比度折中——它主要用在标题字重、图标、按钮这种大字号/大面积的位置。
+     * `surface` 是**中性冷灰** `#F5F6F8`（不是带绿的灰），白卡压上去才干净。
+     */
+    private val LIGHT =
+        Palette(
+            primary = 0xFF1D9E75.toInt(),
+            onPrimary = 0xFFFFFFFF.toInt(),
+            primaryContainer = 0xFFB7EFDC.toInt(),
+            onPrimaryContainer = 0xFF00301C.toInt(),
+            surface = 0xFFF5F6F8.toInt(),
+            surfaceContainer = 0xFFFFFFFF.toInt(),
+            onSurface = 0xFF1A1A1A.toInt(),
+            onSurfaceVariant = 0xFF8A8A8A.toInt(),
+            outline = 0xFFD8DDE2.toInt(),
+            outlineVariant = 0x0F000000,
+            error = 0xFFBA1A1A.toInt(),
+            errorContainer = 0xFFFFDAD6.toInt(),
+            onErrorContainer = 0xFF410002.toInt(),
+            stateLayer = 0x1F1A1A1A,
+            accentSoft = 0x1F1D9E75,
+            textWeak = 0xFFB0B0B0.toInt(),
+        )
+
+    /**
+     * 深色（M3 dark，同一个绿色种子）。
+     *
+     * 三条硬要求，改色值时别破坏：
+     * 1. **卡片必须比页面亮一档**（[COLOR_SURFACE_CONTAINER] vs [COLOR_SURFACE]）——
+     *    两者同色时卡片边界消失，就退化成「一堆块糊在一起」（类注释里那条浅色时代的铁律，
+     *    在深色下同样成立，只是方向反过来：卡片亮、页面暗）。
+     * 2. **primary 要比浅色版更亮**：`#1D9E75` 压在 `#101413` 上对比度只有 3.1:1，
+     *    标题和开关会发闷。`#4FD8AC` 是同一色相提亮的结果，深底上通透、和浅色版是同一个绿。
+     * 3. **半透明的 state layer / 分隔线要换成白色系**：`0x1F1A1A1A`（黑 12%）压在深色上
+     *    等于「更黑」，按下去完全没有反馈。
+     */
+    private val DARK =
+        Palette(
+            primary = 0xFF4FD8AC.toInt(),
+            onPrimary = 0xFF00382A.toInt(),
+            primaryContainer = 0xFF0B4C39.toInt(),
+            onPrimaryContainer = 0xFF9FF2D3.toInt(),
+            surface = 0xFF101413.toInt(),
+            surfaceContainer = 0xFF1A1E1D.toInt(),
+            onSurface = 0xFFE6E8E7.toInt(),
+            onSurfaceVariant = 0xFF9BA1A0.toInt(),
+            outline = 0xFF3A4140.toInt(),
+            outlineVariant = 0x1FFFFFFF,
+            error = 0xFFFFB4AB.toInt(),
+            errorContainer = 0xFF93000A.toInt(),
+            onErrorContainer = 0xFFFFDAD6.toInt(),
+            stateLayer = 0x1FFFFFFF,
+            accentSoft = 0x334FD8AC,
+            textWeak = 0xFF6E7473.toInt(),
+        )
+
+    /** 当前生效的配色，由 [attach] 写入。 */
+    @Volatile
+    private var theme: Palette = LIGHT
+
+    /** 当前是不是深色。给需要「按深浅分叉」的地方用（例如自绘控件选描边色）。 */
+    val isDark: Boolean get() = theme === DARK
+
+    /**
+     * 按当前设置 / 系统重新解析配色，并把 Activity 的系统栏也对齐。
+     *
+     * ★ **必须在建任何 View 之前调用**：所有 `COLOR_*` 都是「读这一刻的 palette」，
+     * View 一旦建好，颜色就烘进 drawable / Paint 里了，改 palette 不会回头刷已存在的 View。
+     *
+     * [context] 传 Activity 时顺手把状态栏 / 导航栏的图标深浅也设对（见 [styleSystemBars]）。
+     */
+    fun attach(context: Context) {
+        theme = if (resolveDark(context)) DARK else LIGHT
+        (context as? Activity)?.let(::styleSystemBars)
+    }
+
+    /**
+     * 按设置解析「现在该不该用深色」。
+     *
+     * ★ **先看设置、再看系统**：`setApplicationNightMode` 触发的配置变更要过一拍才落到
+     * `resources.configuration` 上，而界面是当场建的。只读系统的话，从「深色」切到「浅色」
+     * 会有一瞬间仍按旧 uiMode 画（用户看到的就是「切了没反应，退出再进才好」）。
+     */
+    fun resolveDark(context: Context): Boolean =
+        when (SettingsStore(context).themeMode) {
+            SettingsStore.THEME_MODE_LIGHT -> false
+            SettingsStore.THEME_MODE_DARK -> true
+            else ->
+                (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                    Configuration.UI_MODE_NIGHT_YES
+        }
+
+    /**
+     * 把「外观」三档同步给系统：应用级 uiMode 一改，资源目录（`values-night`）、
+     * 系统控件（Switch / SeekBar / 对话框）就都跟着走，不用逐个手写。
+     *
+     * ⚠️ 只在 [FlymeApp.onCreate]（启动）和设置页改档时调：它会触发一次配置变更，
+     * 前台 Activity 会被重建。**别放进 [attach]**，那会每建一页就请求一次变更。
+     */
+    fun applyAppNightMode(context: Context) {
+        val manager = context.getSystemService(UiModeManager::class.java) ?: return
+        manager.setApplicationNightMode(
+            when (SettingsStore(context).themeMode) {
+                SettingsStore.THEME_MODE_LIGHT -> UiModeManager.MODE_NIGHT_NO
+                SettingsStore.THEME_MODE_DARK -> UiModeManager.MODE_NIGHT_YES
+                else -> UiModeManager.MODE_NIGHT_AUTO
+            },
+        )
+    }
+
+    /**
+     * 状态栏 / 导航栏：底色与页面同底，图标深浅跟着主题走。
+     *
+     * targetSdk 35+ 强制 edge-to-edge，`statusBarColor` 在多数 ROM 上已经不起作用（留着无害，
+     * 老 ROM 上仍有效）；真正决定「白色图标还是深色图标」的是 insetsController 的 appearance。
+     *
+     * ⚠️ **必须先摸一下 `window.decorView`**：本函数是在 `Activity.onCreate` 最开头调的
+     * （配色要在建 View 之前定好），那时 DecorView 还没建。Android 16 / ColorOS 17 上
+     * `PhoneWindow.getWindowInsetsController()` 内部直接取 `mDecor.getWindowInsetsController()`，
+     * mDecor 为 null 就是**空指针崩溃**（真机复现：启动即闪退，`am_crash` 里的
+     * `NullPointerException ... DecorView.getWindowInsetsController()`）。
+     * 摸一下 decorView 会当场 `installDecor()`，之后取 controller 就安全了。
+     */
+    private fun styleSystemBars(activity: Activity) {
+        val window = activity.window ?: return
+        @Suppress("DEPRECATION")
+        window.statusBarColor = COLOR_SURFACE
+        @Suppress("DEPRECATION")
+        window.navigationBarColor = COLOR_SURFACE
+        // ★ 这一行不是为了用它的返回值，是为了逼 DecorView 就位（见上面的 NPE 说明）。
+        window.decorView
+        val controller = window.insetsController ?: return
+        val mask =
+            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        controller.setSystemBarsAppearance(if (isDark) 0 else mask, mask)
+    }
+
+    // ---- Material 3 color roles ----
+    //
+    // 每一个都是**当前 palette** 的投影（见上面的 [LIGHT] / [DARK]），文档写在 [Palette] 与
+    // 两个取值处，这里只留「这个 role 用在哪」。
+
+    /** primary：强调色本体（选中文字、开关、主按钮底）。 */
+    val COLOR_PRIMARY: Int get() = theme.primary
 
     /** onPrimary：放在 primary 上的文字。 */
-    const val COLOR_ON_PRIMARY = 0xFFFFFFFF.toInt()
+    val COLOR_ON_PRIMARY: Int get() = theme.onPrimary
 
     /** primaryContainer：浅色强调底（胶囊、徽标、选中底）。 */
-    const val COLOR_PRIMARY_CONTAINER = 0xFFB7EFDC.toInt()
+    val COLOR_PRIMARY_CONTAINER: Int get() = theme.primaryContainer
 
     /** onPrimaryContainer：放在 primaryContainer 上的文字。 */
-    const val COLOR_ON_PRIMARY_CONTAINER = 0xFF00301C.toInt()
+    val COLOR_ON_PRIMARY_CONTAINER: Int get() = theme.onPrimaryContainer
 
-    /**
-     * surface：页面底色。
-     *
-     * 用**中性冷灰**（重构前的 `#F5F6F8`），不是带绿的灰。绿灰底会把整页染上一层说不清的
-     * 色调，白卡压在上面显得脏；中性灰是干净的白卡衬底。
-     */
-    const val COLOR_SURFACE = 0xFFF5F6F8.toInt()
+    /** surface：页面底色。 */
+    val COLOR_SURFACE: Int get() = theme.surface
 
     /** surfaceContainerLowest：卡片 / 列表容器的底色。 */
-    const val COLOR_SURFACE_CONTAINER = 0xFFFFFFFF.toInt()
+    val COLOR_SURFACE_CONTAINER: Int get() = theme.surfaceContainer
 
     /** onSurface：正文与标题。 */
-    const val COLOR_ON_SURFACE = 0xFF1A1A1A.toInt()
+    val COLOR_ON_SURFACE: Int get() = theme.onSurface
 
-    /**
-     * onSurfaceVariant：次级说明文字。
-     *
-     * 沿用重构前的 `#8A8A8A`：说明文字在本应用里是成段的浅灰小字，用户明确说这一版的灰比
-     * M3 缺省那档「发闷的深灰」好看。它不承担正文职责，浅一档换来的是整页的透气感。
-     */
-    const val COLOR_ON_SURFACE_VARIANT = 0xFF8A8A8A.toInt()
+    /** onSurfaceVariant：次级说明文字（浅色是 `#8A8A8A`，深色相应提亮）。 */
+    val COLOR_ON_SURFACE_VARIANT: Int get() = theme.onSurfaceVariant
 
     /** outline：组件描边。 */
-    const val COLOR_OUTLINE = 0xFFD8DDE2.toInt()
+    val COLOR_OUTLINE: Int get() = theme.outline
 
     /**
      * outlineVariant：分隔线色。
      *
      * **现在基本用不到了**：卡片组内部不再画分隔线（见 [CardGroup.restyle]）——用户两轮反馈
-     * 「横线太显眼 / 还是不好看」，而重构前那一版根本没有组内横线。留这个常量给少数确实需要
+     * 「横线太显眼 / 还是不好看」，而重构前那一版根本没有组内横线。留这个 role 给少数确实需要
      * 一条细分隔的地方（如日志框的表头）。
      */
-    const val COLOR_OUTLINE_VARIANT = 0x0F000000
+    val COLOR_OUTLINE_VARIANT: Int get() = theme.outlineVariant
 
-    const val COLOR_ERROR = 0xFFBA1A1A.toInt()
-    const val COLOR_ERROR_CONTAINER = 0xFFFFDAD6.toInt()
-    const val COLOR_ON_ERROR_CONTAINER = 0xFF410002.toInt()
+    val COLOR_ERROR: Int get() = theme.error
+    val COLOR_ERROR_CONTAINER: Int get() = theme.errorContainer
+    val COLOR_ON_ERROR_CONTAINER: Int get() = theme.onErrorContainer
 
-    /** state layer 覆盖色：onSurface 的 12%。 */
-    internal const val STATE_LAYER = 0x1F1A1A1A
+    /** state layer 覆盖色：onSurface 的 12%（深色下是白色 12%）。 */
+    internal val STATE_LAYER: Int get() = theme.stateLayer
 
     // 兼容旧调用点：语义等价于新角色，保留别名免得一次改散。
-    const val COLOR_PAGE_BG = COLOR_SURFACE
-    const val COLOR_CARD = COLOR_SURFACE_CONTAINER
-    const val COLOR_ACCENT = COLOR_PRIMARY
-    const val COLOR_ACCENT_SOFT = 0x1F1D9E75
-    const val COLOR_TEXT_PRIMARY = COLOR_ON_SURFACE
-    const val COLOR_TEXT_SECONDARY = COLOR_ON_SURFACE_VARIANT
-    const val COLOR_TEXT_WEAK = 0xFFB0B0B0.toInt()
-    const val COLOR_DANGER = COLOR_ERROR
-    const val COLOR_DIVIDER = COLOR_OUTLINE_VARIANT
+    val COLOR_PAGE_BG: Int get() = COLOR_SURFACE
+    val COLOR_CARD: Int get() = COLOR_SURFACE_CONTAINER
+    val COLOR_ACCENT: Int get() = COLOR_PRIMARY
+    val COLOR_ACCENT_SOFT: Int get() = theme.accentSoft
+    val COLOR_TEXT_PRIMARY: Int get() = COLOR_ON_SURFACE
+    val COLOR_TEXT_SECONDARY: Int get() = COLOR_ON_SURFACE_VARIANT
+    val COLOR_TEXT_WEAK: Int get() = theme.textWeak
+    val COLOR_DANGER: Int get() = COLOR_ERROR
+    val COLOR_DIVIDER: Int get() = COLOR_OUTLINE_VARIANT
 
     // ---- Material 3 shape scale ----
 

@@ -84,6 +84,8 @@ class CornerSettingsActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 主题：**建界面前**解析配色（夜间模式），见 [Ui.attach]。
+        Ui.attach(this)
         store = SettingsStore(this)
         setContentView(buildContent())
     }

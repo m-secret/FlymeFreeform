@@ -107,6 +107,14 @@ class MainActivity : Activity() {
     private lateinit var aboutUpdateRow: LinearLayout
 
     /**
+     * 「外观」那三行所在的容器。
+     *
+     * 切档时**只把这三行重画一遍**，不动整页 —— 配色没变的切换（跟随系统 ↔ 同色的浅/深）
+     * 因此一点都不会闪，见 [applyThemeMode]。
+     */
+    private lateinit var appearanceBox: LinearLayout
+
+    /**
      * [UpdateCenter] 状态一变就把「更新与下载」入口行的副标题重写一遍。
      *
      * 这条链路正是「自动检测更新」存在的意义：不订阅的话，自动查到新版本也没人告诉用户，
@@ -130,6 +138,16 @@ class MainActivity : Activity() {
 
     /** 当前停在哪一格；`-1` = 还没铺过。切页动画靠它判断方向（新页从哪边滑进来）。 */
     private var currentTab = -1
+
+    /**
+     * 这一页**铺起来时**该停在哪一格。
+     *
+     * 只在 `onCreate` 从 `savedInstanceState` 里读一次（见 [onSaveInstanceState]）。
+     * 为什么需要它：改「外观」、系统切深浅色、旋屏都会让 Activity 重建，而颜色/宽度全是在
+     * `onCreate` 里重新建出来的 —— 重建后如果无条件 `selectTab(TAB_CALL)`，用户刚在「设置」
+     * 点完深色就被一脚踢回首页（用户 2026-10-20 原话：「切换颜色强制回首页」）。
+     */
+    private var initialTab = TAB_CALL
 
     /**
      * 无障碍「连上 / 断开」的回调，注册在服务端（见 [FreeformAccessibilityService.addConnectionListener]）。
@@ -190,8 +208,13 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // ★ 主题必须在**建界面之前**解析：所有 `Ui.COLOR_*` 都是「读这一刻的 palette」，
+        //   View 建好之后颜色就烘进去了，再改不会回头刷（见 [Ui.attach]）。
+        Ui.attach(this)
         AppContext.attach(this)
         store = SettingsStore(this)
+        // 重建（改外观 / 旋屏 / 系统切深浅色）后回到原来那一格，别把人踢回首页。
+        initialTab = savedInstanceState?.getInt(STATE_TAB, TAB_CALL) ?: TAB_CALL
         setContentView(buildContent())
         // **先挂监听、再刷状态**：反过来的话，「刷状态」与服务「连上」挤在同一瞬间时，
         // 那次回调会因为监听还没挂上而丢掉，界面就停在旧状态（用户报的「重进后显示未开启」）。
@@ -212,6 +235,12 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         refreshStatus()
+    }
+
+    /** 见 [initialTab]：把当前那一格记进实例状态，重建后据此恢复。 */
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if (currentTab >= 0) outState.putInt(STATE_TAB, currentTab)
     }
 
     override fun onResume() {
@@ -284,7 +313,7 @@ class MainActivity : Activity() {
         page.content.addView(featureTab)
         page.content.addView(settingsTab)
 
-        selectTab(TAB_CALL)
+        selectTab(initialTab)
         return page
     }
 
@@ -640,6 +669,8 @@ class MainActivity : Activity() {
 
     /** 「设置」tab：常规杂项 + 调试 + 关于。 */
     private fun buildSettingsTab() {
+        buildAppearanceSection()
+
         // 这一节叫「常规」而不是「设置」：底栏那一格已经叫「设置」了，再套一层同名会把
         // 「这里是什么」和「我在哪一格」搅在一起。
         settingsTab.addView(Ui.sectionTitle(this, "常规"))
@@ -706,6 +737,102 @@ class MainActivity : Activity() {
     /** `1.1.0（110）`。 */
     private fun installedVersionText(): String =
         "${UpdateChecker.installedVersionName(this)}（${UpdateChecker.installedVersionCode(this)}）"
+
+    /**
+     * 「外观」：跟随系统 / 浅色 / 深色，三选一。
+     *
+     * 放在「设置」tab 最上面：它是整页的观感，不属于「常规」里那些功能开关。
+     *
+     * 三行都是 [Ui.choiceRow]（对勾 + 选中项染绿），和「小窗关闭方式」那类单选同一套长相；
+     * **不做开关**——「夜间模式」不是开 / 关两态，而是「跟系统 / 我要浅 / 我要深」三态。
+     *
+     * ★ 三行装在一个**单独的容器**里（[appearanceBox]）：切档时只重画这三行，
+     *   不重建整页（见 [applyThemeMode]）。
+     */
+    private fun buildAppearanceSection() {
+        settingsTab.addView(Ui.sectionTitle(this, "外观"))
+        appearanceBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        settingsTab.addView(appearanceBox)
+        renderAppearanceRows()
+        // 说明这一档的代价：轮盘 / 「更多」面板是浮在别人的界面上的，深色只影响**卡片**，
+        // 不影响下层应用（用户容易以为「选了深色，小窗里的应用也该变」）。
+        settingsTab.addView(
+            Ui.hint(this, "只影响本应用自己的界面与浮层面板；小窗里的应用各用各的主题。"),
+        )
+    }
+
+    /** 按 [store] 里的当前档位把「外观」那三行画一遍（切档后就地重画，不动整页）。 */
+    private fun renderAppearanceRows() {
+        if (!::appearanceBox.isInitialized) return
+        val current = store.themeMode
+        appearanceBox.removeAllViews()
+        appearanceBox.addView(
+            CardGroup(this)
+                .row(
+                    Ui.choiceRow(
+                        this,
+                        "跟随系统",
+                        "系统切到深色时自动变深（默认）",
+                        selected = current == SettingsStore.THEME_MODE_AUTO,
+                    ) { applyThemeMode(SettingsStore.THEME_MODE_AUTO) },
+                )
+                .row(
+                    Ui.choiceRow(
+                        this,
+                        "浅色",
+                        selected = current == SettingsStore.THEME_MODE_LIGHT,
+                    ) { applyThemeMode(SettingsStore.THEME_MODE_LIGHT) },
+                )
+                .row(
+                    Ui.choiceRow(
+                        this,
+                        "深色",
+                        selected = current == SettingsStore.THEME_MODE_DARK,
+                    ) { applyThemeMode(SettingsStore.THEME_MODE_DARK) },
+                ),
+        )
+    }
+
+    /**
+     * 改「外观」档位。
+     *
+     * ## ★ 配色没变时**绝不重建整页**（用户 2026-10-20：「跟随系统和下面颜色切换时，
+     *    颜色也一样还会闪一下」）
+     *
+     * 「跟随系统」和「浅色」在系统是浅色时**看起来是同一个配色**，可档位语义不同（对勾要挪、
+     * 以后系统切深色时行为不同）。早先这里一律「写完就 300ms 后 `recreate()`」，
+     * 于是这种「颜色其实没变」的切换也把整页拆了重建一遍 —— 用户看到的就是白闪一下。
+     *
+     * 现在分两条路：
+     * - **配色不变**（[Ui.isDark] == 目标色）→ 只重画那三行（[renderAppearanceRows]），
+     *   页面本身一动不动，自然也就不用 `recreate`。
+     * - **配色要变** → 颜色是建 View 时烘进 drawable / Paint 的，**必须重建**。
+     *   首选让系统来做：[Ui.applyAppNightMode] 会触发一次配置变更，系统自己重建本页
+     *   （那时这个兜底回调跑在被销毁的旧实例上，`isDestroyed` 直接短路，不会重建第二次）。
+     *   个别 ROM 不发那次配置变更时，才由这里补一刀。
+     */
+    private fun applyThemeMode(mode: String) {
+        if (store.themeMode == mode) return
+        val wasDark = Ui.isDark
+        store.themeMode = mode
+        val wantDark = Ui.resolveDark(this)
+        if (wantDark == wasDark) {
+            // 配色没变：只挪对勾。**不碰 applyAppNightMode 之外的东西，也不 recreate。**
+            Ui.applyAppNightMode(this)
+            renderAppearanceRows()
+            return
+        }
+        Ui.applyAppNightMode(this)
+        // 兜底：系统没有因为这次变更重建本页时，自己补一次（实例还活着 = 没被重建）。
+        mainHandler.postDelayed(
+            {
+                if (isFinishing || isDestroyed) return@postDelayed
+                Ui.attach(this)
+                recreate()
+            },
+            THEME_SETTLE_MS,
+        )
+    }
 
     /** 「更新与下载」入口行的默认副标题：**里面有什么**（版本号在它上面那一行）。 */
     private fun aboutUpdateDetail(): String = "自动更新 / 更新日志 / 下载"
@@ -1305,6 +1432,15 @@ class MainActivity : Activity() {
         const val SERVICE_RESTART_GAP_MS = 400L
 
         /**
+         * 改「外观」档位后，自检「系统到底重建了没有」的等待时间（ms）。
+         *
+         * 太短会在系统那次配置变更到达之前就抢先 `recreate()` —— 那就是**多重建一次、白闪一下**。
+         * 700ms 足够 `setApplicationNightMode` 的一次 IPC + 配置派发 + Activity 重建走完；
+         * 它只在「系统压根没重建」那条兜底路上等，正常路径用户感知不到这段延迟。
+         */
+        const val THEME_SETTLE_MS = 700L
+
+        /**
          * 「图标」那一行**没有副标题**。
          *
          * 原来这里挂着 `ICON_SOURCE_DETAIL`（「跟随系统图标集 / 默认 / 第三方图标包」），
@@ -1318,6 +1454,9 @@ class MainActivity : Activity() {
         const val TAB_CALL = 0
         const val TAB_FEATURE = 1
         const val TAB_SETTINGS = 2
+
+        /** `savedInstanceState` 里「当前停在哪一格」的键，见 [initialTab]。 */
+        const val STATE_TAB = "main_tab"
 
         /** 底栏三格。图标见 `res/drawable/ic_tab_*.xml`，画成单色、由 [TabStrip] 上色。 */
         val TAB_ITEMS =

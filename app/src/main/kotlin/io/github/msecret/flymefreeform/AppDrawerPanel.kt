@@ -1862,7 +1862,9 @@ class AppDrawerPanel(
         if (!::tabApps.isInitialized) return
         listOf(tabApps to TAB_APPS, tabTools to TAB_TOOLS).forEach { (view, tab) ->
             val selected = activeTab == tab
-            view.setTextColor(if (selected) 0xFFFFFFFF.toInt() else TEXT_SECONDARY)
+            // 选中是「强调色实心 + onPrimary 字」：深色下强调色变亮绿，白字会糊掉，
+            // 所以这里跟 [Ui.COLOR_ON_PRIMARY] 走（浅色是白、深色是深绿）。
+            view.setTextColor(if (selected) Ui.COLOR_ON_PRIMARY else TEXT_SECONDARY)
             view.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
             view.background =
                 GradientDrawable().apply {
@@ -1871,7 +1873,7 @@ class AppDrawerPanel(
                         setColor(ACCENT_COLOR)
                     } else {
                         // 未选中的那个也得有自己的边界，否则「两个独立按钮」看起来只剩一个。
-                        setColor(0xFFFFFFFF.toInt())
+                        setColor(CARD_COLOR)
                         setStroke(dp(1), TAB_IDLE_STROKE_COLOR)
                     }
                 }
@@ -2995,7 +2997,7 @@ class AppDrawerPanel(
     /** 「?」的开 / 关配色：开着是强调色实心 + 白字，关着是浅灰圆片。 */
     private fun setHintToggleActive(active: Boolean) {
         if (!::hintToggle.isInitialized) return
-        hintToggle.setTextColor(if (active) 0xFFFFFFFF.toInt() else TEXT_WEAK)
+        hintToggle.setTextColor(if (active) Ui.COLOR_ON_PRIMARY else TEXT_WEAK)
         hintToggle.background =
             GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -3078,7 +3080,7 @@ class AppDrawerPanel(
     private fun refreshDefaultChip() {
         val isDefault = defaultPinPage.coerceIn(0, pinPages.lastIndex) == pinPage
         pageDefault.text = if (isDefault) "默认" else "设为默认"
-        pageDefault.setTextColor(if (isDefault) 0xFFFFFFFF.toInt() else TEXT_SECONDARY)
+        pageDefault.setTextColor(if (isDefault) Ui.COLOR_ON_PRIMARY else TEXT_SECONDARY)
         pageDefault.background =
             GradientDrawable().apply {
                 cornerRadius = dp(10).toFloat()
@@ -3959,7 +3961,7 @@ class AppDrawerPanel(
             IconBadgeView(context).apply {
                 plus = true
                 badgeColor = ACCENT_COLOR
-                symbolColor = 0xFFFFFFFF.toInt()
+                symbolColor = Ui.COLOR_ON_PRIMARY
                 outlineWidth = dp(1).toFloat()
                 layoutParams =
                     FrameLayout.LayoutParams(badgePx, badgePx, Gravity.TOP or Gravity.END)
@@ -3971,7 +3973,7 @@ class AppDrawerPanel(
                     GradientDrawable().apply {
                         shape = GradientDrawable.OVAL
                         setColor(ACCENT_COLOR)
-                        setStroke(dp(1), 0xFFFFFFFF.toInt())
+                        setStroke(dp(1), Ui.COLOR_ON_PRIMARY)
                     }
                 layoutParams =
                     FrameLayout.LayoutParams(ui(0.024f), ui(0.024f), Gravity.END or Gravity.BOTTOM)
@@ -4232,11 +4234,22 @@ class AppDrawerPanel(
         /** 网格单个图标的直径（占屏幕短边的比例，与「已选」条、底栏共用，保证大小一致）。 */
         const val GRID_ICON_FRACTION = 0.080f
 
-        /** 卡片外的遮罩：半透明，压暗下层以衬托白色卡片。 */
+        /**
+         * 卡片外的遮罩：半透明，压暗下层以衬托卡片。
+         *
+         * **不随主题变**：它压的是下层应用，不是我们自己的表面；深色下再压一层反而会让
+         * 「面板边界」糊掉（卡片本身已经是深色）。
+         */
         const val BACKDROP_COLOR = 0x99000000.toInt()
 
-        /** 卡片本体：白色。 */
-        const val CARD_COLOR = 0xFFFFFFFF.toInt()
+        /**
+         * 卡片本体。
+         *
+         * ★ 从 2026-10-20 起**跟着主题走**（这一组颜色原先是写死的白底黑字）：值来自
+         * [Ui.COLOR_SURFACE_CONTAINER]，浅色 `#FFFFFF`、深色 `#1A1E1D`。
+         * 所以这里是 `val get()` 而不是 `const val` —— 建面板时才读，改主题后重开就是新配色。
+         */
+        val CARD_COLOR: Int get() = Ui.COLOR_SURFACE_CONTAINER
 
         /**
          * 卡片 / 操作卡 / 提示气泡那圈 1dp 细描边。
@@ -4247,10 +4260,10 @@ class AppDrawerPanel(
          * outline，`clipToOutline` 就**一点也没裁**——卡片的圆角裁不住列表内容，两张底角
          * 会漏出白边。观感上两者完全一致（描边就 1dp，叠的又都是浅色底）。
          */
-        const val CARD_STROKE_COLOR = 0xFFEBEBEB.toInt()
+        val CARD_STROKE_COLOR: Int get() = Ui.COLOR_OUTLINE
 
-        /** 操作卡：白底。 */
-        const val SHEET_COLOR = 0xFFFFFFFF.toInt()
+        /** 操作卡：与卡片同色（浮在卡片上的第二层，靠描边分开）。 */
+        val SHEET_COLOR: Int get() = Ui.COLOR_SURFACE_CONTAINER
         const val SCRIM_COLOR = 0x66000000.toInt()
 
         /**
@@ -4552,7 +4565,7 @@ class AppDrawerPanel(
          */
         const val TAB_MIN_WIDTH_DP = 96
         const val TAB_GAP_DP = 10
-        const val TAB_IDLE_STROKE_COLOR = 0xFFE2E5E9.toInt()
+        val TAB_IDLE_STROKE_COLOR: Int get() = Ui.COLOR_OUTLINE
 
 
         /** 翻页手势：判定为「横向」所需的纵横比（纵向位移的倍数）。 */
@@ -4574,12 +4587,12 @@ class AppDrawerPanel(
 
         const val SHEET_WIDTH_DP = 250
 
-        const val TEXT_PRIMARY = 0xFF1A1A1A.toInt()
-        const val TEXT_SECONDARY = 0xFF8A8A8A.toInt()
-        const val TEXT_WEAK = 0xFFB0B0B0.toInt()
+        val TEXT_PRIMARY: Int get() = Ui.COLOR_ON_SURFACE
+        val TEXT_SECONDARY: Int get() = Ui.COLOR_ON_SURFACE_VARIANT
+        val TEXT_WEAK: Int get() = Ui.COLOR_TEXT_WEAK
 
-        /** 提示图标未展开时的底色（很浅的灰圆片）。 */
-        const val HINT_CHIP_COLOR = 0xFFEFF1F3.toInt()
+        /** 提示图标未展开时的底色（很浅的一层圆片，深色下是白色 12%）。 */
+        val HINT_CHIP_COLOR: Int get() = Ui.COLOR_OUTLINE_VARIANT
 
         /**
          * 角标（＋ / －）的余量、直径、符号比例，统一放在 [PinnedStripView] 里——
@@ -4590,13 +4603,13 @@ class AppDrawerPanel(
          * 不用逐层去关 `clipChildren`。
          */
 
-        /** 提示气泡：宽度占面板的比例、底色、文字色。 */
+        /** 提示气泡：宽度占面板的比例、底色、文字色（跟着主题走）。 */
         const val HINT_BUBBLE_WIDTH_FRACTION = 0.76f
-        const val HINT_BUBBLE_COLOR = 0xFFFCFCFD.toInt()
-        const val HINT_BUBBLE_TEXT_COLOR = 0xFF444444.toInt()
+        val HINT_BUBBLE_COLOR: Int get() = Ui.COLOR_SURFACE_CONTAINER
+        val HINT_BUBBLE_TEXT_COLOR: Int get() = Ui.COLOR_ON_SURFACE
 
         /** 破坏性动作（「清除」）的文字色，和删除角标同色。 */
-        const val DANGER_COLOR = 0xFFE53935.toInt()
+        val DANGER_COLOR: Int get() = Ui.COLOR_ERROR
 
         /**
          * 品牌绿。
@@ -4605,7 +4618,7 @@ class AppDrawerPanel(
          * 各自抄一份绿值迟早会飘。之前这里写的是 `#1D9E75`、`Ui` 里写的是 `#1B7A55`，
          * 同一个应用两种绿——统一到 [Ui] 这一份，改色只需改一处。
          */
-        const val ACCENT_COLOR = Ui.COLOR_PRIMARY
-        const val WARN_COLOR = 0xFFE53935.toInt()
+        val ACCENT_COLOR: Int get() = Ui.COLOR_PRIMARY
+        val WARN_COLOR: Int get() = Ui.COLOR_ERROR
     }
 }

@@ -408,7 +408,10 @@ class PinnedStripView(
             IconBadgeView(context).apply {
                 plus = initialBadge == BadgeState.PLUS
                 badgeColor = if (initialBadge == BadgeState.PLUS) ADD_BADGE_COLOR else REMOVE_BADGE_COLOR
-                symbolColor = 0xFFFFFFFF.toInt()
+                // 「＋」的底色跟主题走（深色下是亮绿），符号必须用 onPrimary 才看得清；
+                // 「－」底是固定的红，白符号在明暗两套下都够。
+                symbolColor =
+                    if (initialBadge == BadgeState.PLUS) Ui.COLOR_ON_PRIMARY else android.graphics.Color.WHITE
                 outlineWidth = dp(1).toFloat()
                 layoutParams = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.END)
                 visibility = if (initialBadge == BadgeState.NONE) View.GONE else View.VISIBLE
@@ -424,7 +427,7 @@ class PinnedStripView(
                 TextView(context).apply {
                     text = entry.label
                     setTextSize(TypedValue.COMPLEX_UNIT_PX, preferredIconPx * labelTextScale)
-                    setTextColor(0xFF1A1A1A.toInt())
+                    setTextColor(Ui.COLOR_ON_SURFACE)
                     gravity = Gravity.CENTER
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
@@ -1053,9 +1056,10 @@ class PinnedStripView(
         /** 红底白「－」：已固定，点它移出。与网格里的绿「＋」配成一对。 */
         const val REMOVE_BADGE_COLOR = 0xFFE53935.toInt()
 
-        /** 绿底白「＋」：未固定，点它加入。取值与面板的 `ACCENT_COLOR` 保持一致。 */
-        const val ADD_BADGE_COLOR = 0xFF1D9E75.toInt()
+        /** 绿底「＋」：未固定，点它加入。跟着主题走（深色下是亮绿），符号色用 onPrimary。 */
+        val ADD_BADGE_COLOR: Int get() = Ui.COLOR_PRIMARY
 
-        const val DRAG_BACKGROUND = 0xFFF0F0F0.toInt()
+        /** 拖动排序时的占位底色（跟着主题走）。 */
+        val DRAG_BACKGROUND: Int get() = Ui.COLOR_SURFACE
     }
 }
