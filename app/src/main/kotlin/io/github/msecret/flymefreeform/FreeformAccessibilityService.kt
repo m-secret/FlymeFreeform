@@ -73,6 +73,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     private var lastWindowScan = ""
 
     /**
+     * 上一次打过的键盘区域指纹（见 observeLayout 里的 `OUTSIDE_TAP_IME`）。
+     *
+     * 键盘弹着时窗口变化事件很密（微信输入法悬浮键盘自己也在动），不去重的话
+     * 一次打字能刷出十几条一模一样的日志。
+     */
+    private var lastImeLog = ""
+
+    /**
      * 最近一次探测到的窗口列表。
      *
      * 给 [triggerBarRects] 用：遮罩要不要给触摸条让路，取决于**触摸条窗口此刻真的在不在**，
@@ -123,6 +131,14 @@ class FreeformAccessibilityService : AccessibilityService() {
 
     /** 因判断为「正在收起」而空等的轮数，超过 [MAX_CLOSING_WAIT] 就不再等。 */
     private var closingWaitCount = 0
+
+    /**
+     * 这次关闭是因为「横条落点压在键盘上」被主动放弃的（[activateTarget] 里的 `CLOSE_SWIPE_ON_IME`）。
+     *
+     * 只用来换 [OUTSIDE_TAP_STILL_OPEN] 那句话：这种情况让用户去「校准落点」是白费功夫——
+     * 落点没错，是键盘把它盖住了。该说的是「先收起键盘」（2026-10-22 横屏 + 微信输入法）。
+     */
+    private var closeAbortedByIme = false
 
     /** 校准用的「关闭落点」准星窗。 */
     private var closeAnchorMarkerView: View? = null
@@ -656,10 +672,20 @@ class FreeformAccessibilityService : AccessibilityService() {
         // **不按面积筛**——它们本身就只有 132×12 上下，过不了面积那道门；真正的把关在
         // 「必须**落在**某扇内容窗内部」那一步（见下面 `miuiCaptionRects.any { bounds.contains(it) }`）。
         val miuiCaptionRects = ArrayList<Rect>(4)
+        // 键盘窗口（IME 类型 + **当前输入法自己的窗口**，判据见 [isKeyboardWindow]）。
+        // 在这一趟里顺手收集：`owner`/`bounds` 都是现成的，另起一趟等于白付一次 IPC
+        // （`window.root` 是跨进程调用，[safeRefresh] 那条慢路径告警就是被它拖出来的）。
+        val imePackage = currentImePackage()
+        val keyboardBounds = ArrayList<Rect>(4)
+        var imeUnion: Rect? = null
         for (window in windowList) {
             val owner = packageOf(window)
             val bounds = Rect().also { window.getBoundsInScreen(it) }
             if (bounds.isEmpty) continue
+            if (isKeyboardWindow(window.type, owner, imePackage)) keyboardBounds += Rect(bounds)
+            if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                imeUnion = imeUnion?.also { it.union(bounds) } ?: Rect(bounds)
+            }
             if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
                 if (owner == MIUI_CAPTION_PACKAGE) miuiCaptionRects += bounds
                 continue
@@ -773,18 +799,28 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 窗口一出现先学一次，等用户点窗外时坐标已经就绪，关闭动作就不用再多等一截。
         // 学习本身是「读一次 logcat 就退出」的子进程，不常驻，不额外耗电。
         maybeLearnCaption()
-        // 软键盘区域一并带出去：底部遮罩会收缩到它上沿。
+        // 软键盘区域一并带出去：底部遮罩收缩到 IME 窗口上沿，再把**键盘真正占的每一块**抠成洞。
         // 不这么做的话，在小窗里打字时点键盘字母会命中遮罩，小窗当场被关掉。
-        val ime = imeBounds(windowList)
-        if (ime != null) {
-            DebugLog.info("OUTSIDE_TAP_IME", "软键盘 ${ime.toShortString()}，底部遮罩已让开")
+        // 为什么必须两种都用：见 [isKeyboardWindow]（微信输入法横屏把键盘画在自己的应用窗口里）。
+        val ime = imeUnion
+        val keyboard = keyboardBounds
+        // 指纹变了才打：`refresh()` 挂在每一次窗口变化上，键盘弹着时这条一秒能来十几次。
+        val imeLog = (ime?.toShortString() ?: "-") + "|" + keyboard.joinToString(" ") { it.toShortString() }
+        if (imeLog != lastImeLog) {
+            lastImeLog = imeLog
+            if (keyboard.isNotEmpty()) {
+                DebugLog.info(
+                    "OUTSIDE_TAP_IME",
+                    "键盘 ${keyboard.joinToString(" ") { it.toShortString() }}（IME 窗口 ${ime?.toShortString()}），遮罩已让开",
+                )
+            }
         }
         // 屏上其它几扇也要交给遮罩当洞抠掉（见 [OutsideTapBlocker.Layout.others]）：
         // 不抠的话它们会被遮罩整块盖住，变成「点哪儿都在点窗外」。
         // 按**对象身份**排除，不按坐标——[picked] 本来就是 [all] 的元素，坐标比较会误伤
         // 边界恰好相同的那一扇（比如装饰窗还没来得及合并的情形）。
         val others = all.filter { it !== chosen }.map { it.bounds }
-        return OutsideTapBlocker.Layout(chosen.bounds, safe, ime, others)
+        return OutsideTapBlocker.Layout(chosen.bounds, safe, ime, others, keyboard)
     }
 
     /**
@@ -800,30 +836,63 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * 当前软键盘窗口占据的区域，未弹出时返回 null。
+     * 当前输入法的包名（`com.tencent.wetype/.plugin.hld.WxHldService` → `com.tencent.wetype`）。
      *
-     * 输入法可能拆成多个窗口（如候选栏 + 键盘本体），这里取并集，保证整块键盘都不被遮罩盖住。
+     * 只用来认「输入法自己另开的窗口」，判据见 [isKeyboardWindow]。
      */
-    private fun imeBounds(windowList: List<AccessibilityWindowInfo>): Rect? {
-        var result: Rect? = null
+    private fun currentImePackage(): String? =
+        runCatching { Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) }
+            .getOrNull()
+            ?.substringBefore('/')
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+
+    /**
+     * 这扇窗是不是「键盘」的一部分。
+     *
+     * ★★★ **只认 `TYPE_INPUT_METHOD` 是不够的**（2026-10-22 真机取证，PMX110 / ColorOS 17 /
+     * 微信输入法 / 横屏 2772×1272）。两种形态都实测到了：
+     *
+     * | 无障碍看到的 | 实际是什么 |
+     * | --- | --- |
+     * | `type=2 [143,1198][2772,1272]` | IME 窗口，但**只有底部 74px** —— 微信输入法给它设了 `mGivenContentInsets=[0,1055][0,0]`，WMS 里的真实 frame 是整屏 `[143,143][2772,1272]`，而 `getBoundsInScreen` 报的是**内容区** |
+     * | `type=1 pkg=com.tencent.wetype [1456,304][2586,1242]` | **真正的键盘**：它画在自己的应用窗口里（横屏悬浮键盘） |
+     *
+     * 只按 type=2 算「给键盘让位」的后果，用户原话：「横屏模式下，如果用的是微信输入法，
+     * 输入法会被遮盖，无法打字，点击就退出了小窗」——遮罩整块铺在键盘上，点每个字母都算
+     * 「点了窗外」。日志实证：落点 (2240,825)/(2002,863) 全在悬浮键盘里，全部
+     * `OUTSIDE_TAP_DISPATCH 单击模式：直接关闭`。
+     *
+     * 所以判据是**两条并集**，而且**不能拿 type=2 当门**：真机 12:14 那次，键盘明明弹着，
+     * 无障碍窗口表里**一扇 type=2 都没有**（只剩微信输入法的 `type=1` 那一扇）——早一版写的
+     * 「有 IME 窗口才算键盘」正好把这一状态挡在门外，遮罩照样盖住键盘。
+     * 代价是「输入法自己的窗口出现时一律当键盘」，而输入法不弹键盘时本来就没有窗口，
+     * 所以不会白抠遮罩。
+     */
+    private fun isKeyboardWindow(
+        type: Int,
+        owner: String?,
+        imePackage: String?,
+    ): Boolean =
+        type == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+            (imePackage != null && owner == imePackage)
+
+    /**
+     * 键盘占据的全部矩形，给「点窗外」的两处兜底判据用（[onOutsideTap] / [activateTarget]）。
+     *
+     * 布局那条路不走这里：它要每帧都算，代价必须是零，所以 [observeLayout] 在自己那一趟
+     * 循环里用 [isKeyboardWindow] 顺手收集（`owner` 现成，不再多付一次 `window.root` 的 IPC）。
+     */
+    private fun keyboardRects(windowList: List<AccessibilityWindowInfo>): List<Rect> {
+        val imePackage = currentImePackage()
+        val rects = ArrayList<Rect>(4)
         for (window in windowList) {
-            if (window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
+            val owner = packageOf(window)
+            if (!isKeyboardWindow(window.type, owner, imePackage)) continue
             val bounds = Rect().also { window.getBoundsInScreen(it) }
-            if (bounds.isEmpty) continue
-            val accumulated = result
-            result =
-                when (accumulated) {
-                    null -> bounds
-                    else ->
-                        Rect(
-                            minOf(accumulated.left, bounds.left),
-                            minOf(accumulated.top, bounds.top),
-                            maxOf(accumulated.right, bounds.right),
-                            maxOf(accumulated.bottom, bounds.bottom),
-                        )
-                }
+            if (!bounds.isEmpty) rects += bounds
         }
-        return result
+        return rects
     }
 
     private fun packageOf(window: AccessibilityWindowInfo): String? =
@@ -1020,6 +1089,56 @@ class FreeformAccessibilityService : AccessibilityService() {
             .getOrDefault(false)
     }
 
+    /**
+     * 把角落触摸条吃掉的**一次滑动**按原始轨迹还回下层。
+     *
+     * 和 [performTapThrough] 是同一件事，只是路径是一条直线：用户在角落滑动想滚动内容，
+     * 但触摸条是独占窗口，这一刀压根到不了应用（老逻辑甚至直接丢弃，见
+     * `OverlayGestureService.onSwipeThrough` 的说明）。
+     *
+     * **调用方同样必须先让开触摸条**，否则注入会重新命中它自己。
+     *
+     * [durationMs] 用真实按住时长：滚动距离由**手指走过的距离**决定，而 Fling 的速度由
+     * 「距离 ÷ 时长」决定。这里保留原时长，松手后的惯性才和用户手上一致。
+     */
+    fun performSwipeThrough(
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        durationMs: Long,
+        onFinished: (() -> Unit)?,
+    ): Boolean {
+        val duration = durationMs.coerceIn(MIN_SWIPE_MS, MAX_SWIPE_MS)
+        val path = Path().apply {
+            moveTo(x1, y1)
+            lineTo(x2, y2)
+        }
+        val gesture =
+            GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, duration))
+                .build()
+        return runCatching {
+            dispatchGesture(
+                gesture,
+                object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        onFinished?.invoke()
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        onFinished?.invoke()
+                    }
+                },
+                null,
+            )
+        }
+            .onFailure {
+                DebugLog.warn("CORNER_SWIPE_DISPATCH_FAILED", "($x1,$y1)->($x2,$y2)", it)
+            }
+            .getOrDefault(false)
+    }
+
     // ---- 系统工具：识屏 / 截屏 ----
 
     /**
@@ -1031,8 +1150,7 @@ class FreeformAccessibilityService : AccessibilityService() {
      *
      * 两条 Stroke 的起始时间相同 = 两根手指同时按下；间距由 [spreadPx] 给出。
      */
-    fun performTwoFingerPress(x: Float, y: Float, spreadPx: Float, durationMs: Long): Boolean {
-        val half = spreadPx / 2f
+    fun performTwoFingerPress(x: Float, y: Float, spreadPx: Float, durationMs: Long): Boolean {        val half = spreadPx / 2f
         val left = Path().apply { moveTo(x - half, y) }
         val right = Path().apply { moveTo(x + half, y) }
         val gesture =
@@ -1280,11 +1398,17 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         // 兜底：遮罩重排依赖无障碍的窗口变化事件，键盘刚弹出那一刻可能还没来得及收缩到键盘上沿。
         // 落点在键盘里就直接忽略——宁可这一次不关窗，也不能把用户打字打断。
-        val ime = runCatching { windows }.getOrNull()?.let { imeBounds(it) }
-        if (ime != null && ime.contains(x.toInt(), y.toInt())) {
+        //
+        // ★ 判据必须用 [keyboardRects]（含输入法自己的应用窗口），不能用 [imeBounds]：
+        //   微信输入法横屏时 `imeBounds` 只报底部 74px，而键盘画在
+        //   `type=1 pkg=com.tencent.wetype [1456,304][2586,1242]` 里 —— 用 imeBounds 判
+        //   「落点在不在键盘上」，用户点字母的每一下都会漏判（2026-10-22 真机日志里
+        //   `OUTSIDE_TAP_IME_IGNORED` 一条都没有，`OUTSIDE_TAP_DISPATCH` 倒是一串）。
+        val keyboard = runCatching { windows }.getOrNull()?.let { keyboardRects(it) }.orEmpty()
+        keyboard.firstOrNull { it.contains(x.toInt(), y.toInt()) }?.let { hit ->
             DebugLog.info(
                 "OUTSIDE_TAP_IME_IGNORED",
-                "落点(${x.toInt()},${y.toInt()})在软键盘 ${ime.toShortString()} 上，忽略这次窗外点击",
+                "落点(${x.toInt()},${y.toInt()})在键盘 ${hit.toShortString()} 上，忽略这次窗外点击",
             )
             return
         }
@@ -1448,6 +1572,7 @@ class FreeformAccessibilityService : AccessibilityService() {
             return
         }
         closing = true
+        closeAbortedByIme = false
         injectDone = false
         closingStartedAt = SystemClock.elapsedRealtime()
         retryCount = 0
@@ -2067,6 +2192,25 @@ class FreeformAccessibilityService : AccessibilityService() {
         val (point, why) = activationPlan(bounds)
         val x = point.first.toInt()
         val y = point.second.toInt()
+        // ★★ **落点压在键盘上就别起滑**（2026-10-22 真机取证，横屏 + 微信输入法）。
+        //
+        // 微信输入法横屏时它的 IME 窗口在 WMS 里是**整屏** `[143,143][2772,1272]`
+        // （自己只把「内容」缩到底部 74px，所以无障碍看到的是 `[143,1198][2772,1272]`），
+        // 小窗底部那条小横条正好被它盖住：`input tap (525,1222)` 落进输入法窗口，
+        // ColorOS 的 `FlexibleCaptionView` 根本没被认领，跟上来的上滑只能白滑。
+        // 真机日志里就是 `OUTSIDE_TAP_STILL_OPEN` 连着两次重试。
+        //
+        // 而且那一刀还可能被输入法当成按键（打进字符）。宁可这次不关（用户会再点一次），
+        // 也不能往输入法里乱注入 —— 与本文件别处「没认领就绝不原地滑」同一条取舍。
+        val keyboard = runCatching { windows }.getOrNull()?.let { keyboardRects(it) }.orEmpty()
+        if (keyboard.any { it.contains(x, y) }) {
+            closeAbortedByIme = true
+            DebugLog.warn(
+                "CLOSE_SWIPE_ON_IME",
+                "横条落点($x,$y)压在键盘上（键盘弹着），这次不起滑：点了也不会被系统认领，还可能打进输入法",
+            )
+            return false
+        }
         DebugLog.info(
             "CLOSE_SWIPE_ACTIVATE",
             "先点横条 ($x,$y) 让系统认领这次触摸（$why）",
@@ -2413,6 +2557,13 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (retryCount >= MAX_RETRY) {
             if (store.outsideTapForceClose && ShizukuShell.hasPermission) {
                 forceStopViaShizuku()
+            } else if (closeAbortedByIme) {
+                // 键盘弹着时「横条被键盘窗口盖住」：落点本身没错，让人去校准准星只会白折腾。
+                DebugLog.warn(
+                    "OUTSIDE_TAP_STILL_OPEN",
+                    "这次没关：键盘弹着，小横条被输入法窗口盖住了（落点已确认压在键盘上）。" +
+                        "先收起键盘再点窗外；「强力关闭」不受这条限制",
+                )
             } else {
                 DebugLog.warn(
                     "OUTSIDE_TAP_STILL_OPEN",
@@ -2737,6 +2888,15 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val MIN_TAP_MS = 50L
         private const val MAX_TAP_MS = 1_500L
 
+        /**
+         * 回放滑动的时长下限/上限。
+         *
+         * 下限 80ms：太短的注入会被部分应用当成「抖动」而不是滚动；
+         * 上限 1_200ms：再长就是用户按着不动，注入一条这么长的手势只会让内容慢慢爬。
+         */
+        private const val MIN_SWIPE_MS = 80L
+        private const val MAX_SWIPE_MS = 1_200L
+
         /** 遍历节点树的上限，避免在深层布局里卡住。 */
         private const val MAX_NODE_DEPTH = 24
         private const val MAX_NODE_COUNT = 400
@@ -2836,6 +2996,24 @@ class FreeformAccessibilityService : AccessibilityService() {
             durationMs: Long,
             onFinished: (() -> Unit)? = null,
         ): Boolean = instance?.performTapThrough(x, y, durationMs, onFinished) ?: false
+
+        /**
+         * 把一次滑动按原始轨迹还回下层（见 [performSwipeThrough]）。
+         *
+         * 与 [tapThrough] 是同一件事的另一半：角落触摸条**故意**是独占窗口，落在它里面的
+         * 点击和滑动都到不了下层应用。点击已经能还回去，「手指滑了一段但没成立手势」那一刀
+         * 以前是直接丢掉的（于是角落成了死区），现在也从这里还。
+         *
+         * 服务未连接时返回 false，调用方应据此提示用户。
+         */
+        fun swipeThrough(
+            x1: Float,
+            y1: Float,
+            x2: Float,
+            y2: Float,
+            durationMs: Long,
+            onFinished: (() -> Unit)? = null,
+        ): Boolean = instance?.performSwipeThrough(x1, y1, x2, y2, durationMs, onFinished) ?: false
 
         /** 配置变化后立即生效；服务未连接时忽略。 */
         fun refreshIfRunning() {

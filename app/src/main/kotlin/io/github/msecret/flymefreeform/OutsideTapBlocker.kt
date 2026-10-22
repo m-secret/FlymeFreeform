@@ -48,6 +48,17 @@ class OutsideTapBlocker(private val context: Context) {
          * 把左边那扇 `[1312,221][2289,1957]` 整个盖在里面）。所以这些矩形也要一并当洞抠掉。
          */
         val others: List<Rect> = emptyList(),
+        /**
+         * 键盘**真正**占据的每一块矩形（未弹出时为空），会被当成洞整块抠掉。
+         *
+         * 不能只用 [ime] 那一条「收缩底边」——那只对「键盘是屏幕底部一整条」的输入法成立。
+         * 微信输入法横屏时把键盘画在自己的**应用窗口**里（真机：`[1456,304][2586,1242]`，
+         * 屏幕右边的悬浮键盘），而它的 IME 窗口被自己设的内容 inset 缩成了底部 74px
+         * （`[143,1198][2772,1272]`）⇒ 只收缩底边等于没让，遮罩照样压在键盘上，点字母就关窗。
+         *
+         * 抠洞（而不是收缩底边）还顺带覆盖了「悬浮键盘 / 单手键盘」这类**不在屏幕底部**的形态。
+         */
+        val keyboard: List<Rect> = emptyList(),
     )
 
     private val windowManager: WindowManager? = context.getSystemService(WindowManager::class.java)
@@ -201,11 +212,14 @@ class OutsideTapBlocker(private val context: Context) {
         store: SettingsStore,
         avoid: List<Rect>,
     ): Map<String, List<Rect>> {
-        // 软键盘弹出时必须把它让出来：键盘铺在屏幕底部，正好压在「小窗下方」那块遮罩上，
+        // 软键盘弹出时必须把它让出来：键盘正好压在小窗下方那块遮罩上，
         // 用户在小窗里打字、点键盘字母时会命中遮罩，被当成「点了窗外」而关掉小窗。
         //
-        // 做法是把遮罩区域的底边收缩到键盘上沿：键盘之上、小窗之外的区域仍然算窗外，
-        // 点那里照样能关闭小窗，只是键盘本身不再被遮罩盖住。
+        // 两层处理：
+        // ① 遮罩底边收缩到 IME 窗口上沿（[Layout.ime]）——对「键盘是屏底一整条」的输入法，
+        //    键盘之上、小窗之外的区域仍算窗外，点那里照样能关闭；
+        // ② 把 [Layout.keyboard] 每一块抠成洞 —— 对键盘不在屏底的输入法（微信输入法横屏的
+        //    悬浮键盘）只有这一步有效，光靠 ① 等于没让。
         val bottomLimit = layout.ime?.top?.let { minOf(it, layout.safe.bottom) } ?: layout.safe.bottom
         val safe = Rect(layout.safe.left, layout.safe.top, layout.safe.right, bottomLimit)
         if (safe.isEmpty) return KEYS.associateWith { emptyList() }
@@ -214,10 +228,14 @@ class OutsideTapBlocker(private val context: Context) {
         // 外扩：小窗标题栏/缩放热区可能贴在边界外沿，内缩会让用户拖不动窗。
         val inner = Rect(layout.freeform).apply { inset(-pad, -pad) }
 
-        // 洞 = 角落触摸条（[avoid]）+ 屏上**其它**自由窗（[Layout.others]，同样按 pad 外扩）。
+        // 洞 = 角落触摸条（[avoid]）+ 屏上**其它**自由窗（[Layout.others]，同样按 pad 外扩）
+        //      + **键盘真正占的每一块**（[Layout.keyboard]，不外扩：键盘矩形本身是准的）。
         // 其它自由窗必须抠掉：它们跟本次这一扇无关，被盖上就点不动了。
-        val holes = ArrayList<Rect>(avoid.size + layout.others.size)
+        // 键盘必须抠掉：见 [Layout.keyboard] 里微信输入法横屏那一例 —— 只收缩底边对
+        // 「键盘不在屏幕底部」的形态完全无效。
+        val holes = ArrayList<Rect>(avoid.size + layout.others.size + layout.keyboard.size)
         holes += avoid
+        holes += layout.keyboard
         for (other in layout.others) {
             if (other.isEmpty) continue
             holes += Rect(other).apply { inset(-pad, -pad) }
