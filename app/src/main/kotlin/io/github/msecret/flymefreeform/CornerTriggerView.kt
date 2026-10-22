@@ -51,6 +51,28 @@ class CornerTriggerView(
          * 调用方在回放前必须先把本触摸条让开（见 [passthroughInFlight]）。
          */
         fun onTapThrough(side: CornerSide, x: Float, y: Float, durationMs: Long)
+
+        /**
+         * 手势未成立、但手指**确实滑动了一段**的一次按压，需要按原始轨迹还回下层。
+         *
+         * 这是 2026-10-20 用户报「轮盘呼出那块点不动、小红书右下角的按钮点不了」的修复。
+         * 老逻辑里，只要位移超过 touchSlop 又不满足「斜向内上滑」，UP 时就直接
+         * [Listener.onGestureCancel] —— 那一刀**既不点击也不滚动**，而且**一条日志都不打**。
+         * 于是角落那一小块成了死区：手点按钮时手指抖/滑过 ~8dp（真机 ≈24px，很常见），
+         * 感受就是「有时能点、有时点不动」，且事后完全查不到痕迹。
+         *
+         * 现在分成两档（见 [onTouchEvent] 的 UP 分支）：
+         * - 位移在 [tapTolerance] 之内 → 仍然算**点击**（按 [downX]/[downY] 回放，手指抖掉的那点位移不影响落点）；
+         * - 超过 [tapTolerance] → 当作**滚动/拖动**，按 down→up 的真实轨迹回放。
+         */
+        fun onSwipeThrough(
+            side: CornerSide,
+            downX: Float,
+            downY: Float,
+            upX: Float,
+            upY: Float,
+            durationMs: Long,
+        )
     }
 
     private val engine = CornerGestureEngine()
@@ -95,8 +117,14 @@ class CornerTriggerView(
                 0L
             }
 
-    /** 手指是否已经移动超过 touchSlop。用于区分「点击」与「滑了一下但不是手势」。 */
-    private var movedBeyondSlop = false
+    /**
+     * 「这仍然算一次点击」的位移上限（px）。
+     *
+     * 取 [touchSlop] 的两倍：用户从屏幕角落去够按钮时，按下到抬起之间手指平移一二十 px 是常态，
+     * 而触摸区本身只有 ~40dp 宽，拿 8dp 的 touchSlop 当判据会让这一整块区域在「抖一点」时直接失灵。
+     * 放大的代价只是「想滚一点点却变成点击」——几十 px 的滚动本来也没有意义，换来的是角落能正常点。
+     */
+    private val tapTolerance: Float get() = touchSlop * TAP_TOLERANCE_FACTOR
 
     /** 多指或系统取消：这种按压不回放，避免误触发下层。 */
     private var suppressTap = false
@@ -210,7 +238,6 @@ class CornerTriggerView(
                 downX = event.rawX
                 downY = event.rawY
                 downTime = event.eventTime
-                movedBeyondSlop = false
                 suppressTap = false
                 engine.down(side, downX, downY)
                 // 排查「轮盘呼不出来」的第一手证据：**触摸到底有没有落到这条触摸条上**。
@@ -228,11 +255,6 @@ class CornerTriggerView(
                     cancelInternal()
                     return true
                 }
-                if (!movedBeyondSlop &&
-                    hypot(event.rawX - downX, event.rawY - downY) > touchSlop
-                ) {
-                    movedBeyondSlop = true
-                }
                 when (engine.move(event.rawX, event.rawY, touchSlop)) {
                     is GestureAction.Activate -> {
                         DebugLog.info("GESTURE_ACTIVATED", "side=$side")
@@ -249,21 +271,42 @@ class CornerTriggerView(
 
             MotionEvent.ACTION_UP -> {
                 val wasActive = engine.isActive
+                val upX = event.rawX
+                val upY = event.rawY
                 when (engine.up()) {
                     GestureAction.Commit -> listener.onGestureCommit()
 
                     else -> {
-                        if (!wasActive && !suppressTap && !movedBeyondSlop) {
-                            val duration =
-                                (event.eventTime - downTime)
-                                    .coerceIn(MIN_TAP_DURATION_MS, MAX_TAP_DURATION_MS)
+                        val duration =
+                            (event.eventTime - downTime)
+                                .coerceIn(MIN_TAP_DURATION_MS, MAX_TAP_DURATION_MS)
+                        // 多指（多半是手掌边缘压到屏幕）不回放：两根手指都还下去只会误触。
+                        if (wasActive || suppressTap) {
+                            // 留一条痕迹：这是「点不动」的另一种可能来源，以前完全静默。
                             DebugLog.info(
-                                "CORNER_TAP_DETECTED",
-                                "坐标=(${downX.toInt()},${downY.toInt()}) 时长=${duration}ms",
+                                "CORNER_GESTURE_CANCELLED",
+                                "side=$side 已激活=$wasActive 多指=$suppressTap",
                             )
-                            listener.onTapThrough(side, downX, downY, duration)
-                        } else {
                             listener.onGestureCancel()
+                        } else {
+                            val distance = hypot(upX - downX, upY - downY)
+                            if (distance <= tapTolerance) {
+                                // ★ 按 **down 点** 回放，不是抬手点：手指那点抖动不该改变落点。
+                                DebugLog.info(
+                                    "CORNER_TAP_DETECTED",
+                                    "坐标=(${downX.toInt()},${downY.toInt()}) 时长=${duration}ms " +
+                                        "位移=${distance.toInt()}px",
+                                )
+                                listener.onTapThrough(side, downX, downY, duration)
+                            } else {
+                                // 滑了、但没滑成「斜向内上」= 用户想滚/拖这一块，按真实轨迹还回去。
+                                DebugLog.info(
+                                    "CORNER_SWIPE_DETECTED",
+                                    "side=$side 从=(${downX.toInt()},${downY.toInt()}) " +
+                                        "到=(${upX.toInt()},${upY.toInt()}) 时长=${duration}ms",
+                                )
+                                listener.onSwipeThrough(side, downX, downY, upX, upY, duration)
+                            }
                         }
                     }
                 }
@@ -285,6 +328,9 @@ class CornerTriggerView(
     }
 
     private companion object {
+        /** 「仍然算点击」的位移上限 = touchSlop × 这个倍数，见 [tapTolerance]。 */
+        const val TAP_TOLERANCE_FACTOR = 2f
+
         /** 回放按压的最短时长。太短可能被下层当成抖动而忽略。 */
         const val MIN_TAP_DURATION_MS = 50L
 

@@ -129,7 +129,26 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
      */
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        // 深浅色切换也会走到这里（uiMode 是配置的一部分）。palette 换了之后，已经画出来的
+        // 浮层不会自己变色（颜色是建 View 时烘进去的），所以顺手把面板撤掉，让用户下次打开
+        // 拿到的是新配色 —— 这比「原地把半屏卡片重刷一遍」稳，也不会打断正在进行的触摸。
+        refreshThemeIfChanged()
         handler.post { onScreenGeometryChanged() }
+    }
+
+    /**
+     * 系统 / 设置切了深浅色时刷新 palette。
+     *
+     * **[Ui.attach] 本身很便宜**（读一次 prefs），所以每次都调；只有**真的变了**才动浮层，
+     * 免得每次旋屏都把「更多」面板收掉一次。
+     */
+    private fun refreshThemeIfChanged() {
+        val wasDark = Ui.isDark
+        Ui.attach(this)
+        if (wasDark == Ui.isDark) return
+        if (previewActive) showMenuPreview()
+        if (drawerPanels.isNotEmpty()) hideDrawer(fade = false)
+        DebugLog.info("THEME_CHANGED", "深色=${Ui.isDark}")
     }
 
     private val triggerViews = LinkedHashMap<CornerSide, CornerTriggerView>()
@@ -344,6 +363,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     override fun onCreate() {
         super.onCreate()
         AppContext.attach(this)
+        // 主题：浮层全部是按 palette 当场画出来的，服务起来时先解析一次；
+        // 系统 / 设置切换深色会走 [onConfigurationChanged]，那里再刷。
+        Ui.attach(this)
         runningService = this
         windowManager = getSystemService(WindowManager::class.java)
         store = SettingsStore(this)
@@ -1818,19 +1840,82 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             )
             return
         }
+        dispatchPassThrough(
+            side = side,
+            logCode = "CORNER_TAP_THROUGH",
+            detail = "side=$side 坐标=(${x.toInt()},${y.toInt()}) 时长=${durationMs}ms",
+            submit = { onFinished ->
+                FreeformAccessibilityService.tapThrough(x, y, durationMs, onFinished)
+            },
+        )
+    }
+
+    /**
+     * 手指在角落**滑了一段、但没滑成「斜向内上」**（= 没呼出轮盘）时，按真实轨迹还回下层。
+     *
+     * 为什么要这条：早先这个分支走的是 [onGestureCancel]，什么都不做、也不打日志，于是
+     * 「点按钮时手指抖过 touchSlop」和「想在这一块滚动」两种操作**全都静默丢失**，
+     * 用户感受就是「轮盘呼出那块点不动」（2026-10-20 报的小红书右下角按钮）。
+     * 现在至少把它当成一次滚动 / 拖动还下去，那一块不再有死区。
+     *
+     * 小窗开着时不还：那种情况下这一块语义上就是「小窗外」，滑动没有可作用的对象，
+     * 还下去只会让遮罩收到一次拖拽。
+     */
+    override fun onSwipeThrough(
+        side: CornerSide,
+        downX: Float,
+        downY: Float,
+        upX: Float,
+        upY: Float,
+        durationMs: Long,
+    ) {
+        if (!store.cornerTapThroughEnabled) {
+            DebugLog.info("CORNER_SWIPE_THROUGH_DISABLED", "透传已关闭，本次滑动被丢弃")
+            return
+        }
+        if (FreeformAccessibilityService.outsideMaskActive()) {
+            DebugLog.info("CORNER_SWIPE_OUTSIDE", "小窗开着，角落滑动让给「窗外点击」以外的逻辑处理")
+            return
+        }
+        dispatchPassThrough(
+            side = side,
+            logCode = "CORNER_SWIPE_THROUGH",
+            detail = "side=$side 从=(${downX.toInt()},${downY.toInt()}) " +
+                "到=(${upX.toInt()},${upY.toInt()}) 时长=${durationMs}ms",
+            submit = { onFinished ->
+                FreeformAccessibilityService.swipeThrough(
+                    downX, downY, upX, upY, durationMs, onFinished,
+                )
+            },
+        )
+    }
+
+    /**
+     * 把一次「触摸条吃掉的输入」还回下层的公共流程：**先让开触摸条，再注入**。
+     *
+     * 两条调用方（点击 / 滑动）只有注入内容不同，让位、兜底超时、失败提示完全一样，
+     * 所以都走这里 —— 免得哪天只修了一条，另一条又漏掉让位而变成「注入被自己吃掉」。
+     *
+     * @param submit 真正注入；返回 false 表示无障碍没连上 / 拒绝了这次手势。
+     */
+    private fun dispatchPassThrough(
+        side: CornerSide,
+        logCode: String,
+        detail: String,
+        submit: (onFinished: () -> Unit) -> Boolean,
+    ) {
+        val view = triggerViews[side]
+        if (view != null && view.passthroughInFlight) {
+            DebugLog.warn("CORNER_TAP_THROUGH_REPLAY", "回放期间又命中触摸条，已忽略以免递归")
+            return
+        }
         setTriggerTouchable(side, false)
         view?.passthroughInFlight = true
         // 等窗口属性真正生效（约两帧）再注入，否则注入的事件仍会命中还没让开的触摸条。
         handler.postDelayed({
-            val submitted =
-                FreeformAccessibilityService.tapThrough(x, y, durationMs) {
-                    handler.post { releaseTapThrough(side) }
-                }
+            val submitted = submit { handler.post { releaseTapThrough(side) } }
             if (submitted) {
-                DebugLog.info(
-                    "CORNER_TAP_THROUGH",
-                    "side=$side 坐标=(${x.toInt()},${y.toInt()}) 时长=${durationMs}ms",
-                )
+                DebugLog.info(logCode, detail)
                 // 兜底：回调万一不来，也不能让触摸条一直处于不可触摸状态。
                 handler.postDelayed({ releaseTapThrough(side) }, TAP_THROUGH_TIMEOUT_MS)
             } else {
