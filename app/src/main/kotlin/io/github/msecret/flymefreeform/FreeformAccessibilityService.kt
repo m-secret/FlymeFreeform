@@ -69,6 +69,35 @@ class FreeformAccessibilityService : AccessibilityService() {
         Thread(runnable, "caption-learn")
     }
 
+    /**
+     * 采「点亮落点安全区」用的线程（见 [PrimeProbe]）。
+     *
+     * 独立于 [captionWorker]：那边一次 `logcat -d` 最长能站 3 秒，共用会把探针饿死，
+     * 而探针的结果是关闭流程**直接读**的（窗口一出现就得备好）。
+     */
+    private val primeWorker = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "prime-probe")
+    }
+
+    /**
+     * 跑「用 shell 摘任务」那条关闭路径的线程（见 [closeViaShellTask]）。
+     *
+     * ★★ **必须独立成后台线程**：`ShizukuShell.run` 是**同步阻塞**的
+     * （`process.waitFor`），而 [performCloseMode] 一系是挂在 [closeHandler]（主线程）上的。
+     * 直接在主线程跑 `am stack list` + `am stack remove`，最坏要站
+     * [SHELL_LIST_TIMEOUT_MS] + [SHELL_REMOVE_TIMEOUT_MS] = 5 秒 —— 那就是一次 ANR，
+     * 而且本服务与 `OverlayGestureService` **同进程**（manifest 没有 `android:process`），
+     * 冻住的是整个应用（悬浮窗、面板、设置页一起卡死）。
+     *
+     * 同文件 [forceStopViaShizuku] 早就是这么做的（`Thread { ShizukuShell.run(...) }`），
+     * 这里照抄同一个约定。
+     *
+     * 独立于 [captionWorker] / [primeWorker]：那两条会被 logcat / getRoot 占住好几秒。
+     */
+    private val shellWorker = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "close-shell")
+    }
+
     /** 上一次打过的窗口快照，用来跳掉内容完全相同的重复日志（见 observeLayout）。 */
     private var lastWindowScan = ""
 
@@ -183,6 +212,56 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private var closeTargetBounds: Rect? = null
     private var closeTargetPackage: String? = null
+
+    /**
+     * 发起关闭那一刻，目标窗**是不是焦点窗**（`AccessibilityWindowInfo.isFocused`）。
+     *
+     * 只给「还要不要先点亮它一下」这个判断用（见 [performCloseMode]）。ColorOS 的关闭手势归
+     * **焦点窗**，非焦点窗的小横条是死的；反过来说，**已经是焦点窗时那一下点亮纯属多余**，
+     * 而它恰恰是「关窗时窗口顶部突然冒出 •••」的来源。
+     */
+    private var closeTargetFocused = false
+
+    /**
+     * 「用 shell 摘任务」这条关闭路径的状态机（见 [performCloseMode] / [recheck]）。
+     *
+     * 为什么需要两个标志：那条路是**异步**的（跑在 [shellWorker] 上），而关闭流程靠
+     * [recheck] 在 [RECHECK_DELAY_MS] 后复检一次来决定「收尾 / 补刀」。两者会打架：
+     *
+     * · [shellClosePending] = 命令还在跑。这期间**绝不能**补刀 —— 窗口还没被摘掉是正常的，
+     *   按老逻辑会再发一次手势，打在正在消失的窗口上（正是日志里那个理论漏「回桌面」窗口）。
+     * · [shellCloseHandled] = 命令已经**成功**（任务摘掉了）。窗口可能还在播退场动画，
+     *   此时同样不许补手势，只等它自己消失到 [MAX_CLOSING_WAIT] 轮为止。
+     *
+     * 两者都在 [startCloseFlow] / [finishCloseFlow] 里复位。
+     */
+    private var shellClosePending = false
+
+    /** 见 [shellClosePending]。 */
+    private var shellCloseHandled = false
+
+    /** [recheck] 为等 shell 结果已经推迟了几轮（上限 [MAX_SHELL_WAIT_ROUNDS]）。 */
+    private var shellWaitRounds = 0
+
+    /**
+     * 最近一次「关闭手势**真正开始**」的时刻（`elapsedRealtime`），见 [recheck]。
+     *
+     * 复检原本是「点窗外那一刻 + [RECHECK_DELAY_MS]」排出来的。shell 那条路异步化之后，
+     * 回退手势可能比这个时刻晚几百毫秒才开始 —— 于是那道排定的复检会撞进「手势刚发出、
+     * 窗口还没来得及变」的中间态，判成「没关掉」立刻补一刀，两刀叠在一起。
+     * 所以改按**真实注入时刻**判，早到就把复检往后推。
+     */
+    private var lastInjectAt = 0L
+
+    /**
+     * 第几次「关闭流程」（每次 [startCloseFlow] +1）。
+     *
+     * 给异步任务打戳用：[shellWorker] 上那条摘任务的命令最长能跑 5 秒（2s + 3s 超时），
+     * 完全可能**跨过**一次 [finishCloseFlow]。它回来时不比对戳，就会把上一轮的结论
+     * 写进下一轮（`shellCloseHandled = true` ⇒ 新一轮白等 6 秒；或 `!removed` ⇒
+     * 往新一轮里多注入一刀手势）。
+     */
+    private var closeFlowToken = 0
 
     /**
      * 关闭动作是否已经**发出**（见 [startCloseFlow]）。
@@ -324,6 +403,44 @@ class FreeformAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() = Unit
+
+    /**
+     * [onDestroy] 已跑过。
+     *
+     * 异步任务（目前只有 [shellWorker] 上那条摘任务的关闭路径）回来时可能落在销毁之后，
+     * 那时**不许**再往主线程序一个「接着干活」的回调——那会在一个已经死掉的服务上跑
+     * [performCloseModeGesture]，去碰已经 detach 的遮罩与窗口。
+     */
+    @Volatile
+    private var destroyed = false
+
+    /**
+     * 销毁时收尾：把后台线程池**真的关掉**。
+     *
+     * ★★★ 2026-10-28 修：`Executors.newSingleThreadExecutor` 建出来的是**非 daemon 线程**，
+     * 而 [captionWorker] / [primeWorker] / [shellWorker] / [screenshotWorker] 这四个池
+     * 从来没有被关闭过 —— 整个类里连 `onDestroy` 都没有。
+     *
+     * 这不是理论问题：ColorOS 会把侧载应用的无障碍**摘出系统名单**（见 `A11Y-GRANT.md`），
+     * `AccessibilityGrant.restoreIfMissing` 恢复时服务是**重建**的，于是每被摘一次就漏
+     * 4 个线程 + 4 个 Executor + 它们各自的任务队列。反复被摘的机器上线程数会一路涨，
+     * 而这些线程每个都还持有服务器实例 ⇒ 整个服务也回收不掉。
+     *
+     * 用 `shutdownNow()` 而不是 `shutdown()`：立刻中断正在跑的 `process.waitFor` /
+     * `getRoot`（中断异常被各自的 `runCatching` 吃掉），不用干等一次最长 5 秒的 shell。
+     */
+    override fun onDestroy() {
+        destroyed = true
+        runCatching {
+            handler.removeCallbacksAndMessages(null)
+            closeHandler.removeCallbacksAndMessages(null)
+            for (worker in arrayOf(captionWorker, primeWorker, shellWorker, screenshotWorker)) {
+                worker.shutdownNow()
+            }
+        }.onFailure { DebugLog.error("A11Y_DESTROY_FAILED", null, it) }
+        instance = null
+        super.onDestroy()
+    }
 
     override fun onUnbind(intent: Intent?): Boolean {
         // 这里同样不能往外抛：断开时爆异常也可能被系统记成服务故障。
@@ -799,6 +916,9 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 窗口一出现先学一次，等用户点窗外时坐标已经就绪，关闭动作就不用再多等一截。
         // 学习本身是「读一次 logcat 就退出」的子进程，不常驻，不额外耗电。
         maybeLearnCaption()
+        // 顺手采一次「上沿哪些位置压着应用自己的可点击控件」（见 [PrimeProbe]）：关闭流程要读它
+        // 才能决定「点亮」那一下点哪儿，而 `getRoot()` 是跨进程调用，绝不能等用户点了窗外才同步做。
+        maybeProbePrime(windowList, chosen.bounds)
         // 软键盘区域一并带出去：底部遮罩收缩到 IME 窗口上沿，再把**键盘真正占的每一块**抠成洞。
         // 不这么做的话，在小窗里打字时点键盘字母会命中遮罩，小窗当场被关掉。
         // 为什么必须两种都用：见 [isKeyboardWindow]（微信输入法横屏把键盘画在自己的应用窗口里）。
@@ -833,6 +953,30 @@ class FreeformAccessibilityService : AccessibilityService() {
         if (SettingsStore(this).outsideTapCloseMode != SettingsStore.CLOSE_MODE_CAPTION_AUTO) return
         if (!FreeformCaption.isAvailable()) return
         captionWorker.execute { FreeformCaption.refresh(this) }
+    }
+
+    /**
+     * 按需采一次「点亮落点的安全区」——窗口上沿这一带里哪些位置压着应用自己的可点击控件。
+     *
+     * 关闭流程（[activateTarget]）要读它才能决定「点亮」那一下点哪儿，而 `getRoot()` / `getChild()`
+     * 都是**跨进程调用**（目标应用卡一下能阻塞好几秒），绝不能等用户点了窗外才同步做。
+     * 所以跟 [maybeLearnCaption] 一样：**窗口一出现就在后台预热**，关闭时只读缓存。
+     *
+     * [PrimeProbe] 自己带节流，这里可以放心地挂在每一次窗口刷新上。
+     *
+     * 只认**内容窗**（`TYPE_APPLICATION`）：伴生装饰窗（`pkg=android`）的 root 是系统那一份，
+     * 里面根本没有应用自己的按钮，拿它去探会得到「很安全」的假结论。
+     */
+    private fun maybeProbePrime(windowList: List<AccessibilityWindowInfo>, bounds: Rect) {
+        val rect = Rect()
+        val content =
+            windowList.firstOrNull { window ->
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) return@firstOrNull false
+                window.getBoundsInScreen(rect)
+                withinSlack(rect, bounds, DECOR_MERGE_SLACK_PX)
+            } ?: return
+        val strip = CornerGeometry.dp(this, PRIME_PROBE_STRIP_DP)
+        primeWorker.execute { runCatching { PrimeProbe.refresh(content, Rect(bounds), strip) } }
     }
 
     /**
@@ -1579,6 +1723,13 @@ class FreeformAccessibilityService : AccessibilityService() {
         closingWaitCount = 0
         closeTargetBounds = Rect(chosen.bounds)
         closeTargetPackage = chosen.pkg
+        closeTargetFocused = chosen.focused
+        // shell 摘任务是异步的，上一轮的残留状态必须清掉，否则这一轮一开局就被判「在等 shell」。
+        shellClosePending = false
+        shellCloseHandled = false
+        shellWaitRounds = 0
+        lastInjectAt = 0
+        closeFlowToken++
         closeStartBounds = Rect(chosen.bounds)
         // 首次复检还没有「上一次」可比，留空让它退回用 closeStartBounds。
         closeLastCheckBounds = null
@@ -1674,6 +1825,16 @@ class FreeformAccessibilityService : AccessibilityService() {
         closeLastCheckBounds = null
         closeTargetBounds = null
         closeTargetPackage = null
+        closeTargetFocused = false
+        // 收尾时 shell 那条路的标志也要复位：它可能还在后台跑（结果回来时 [closeHandler.post]
+        // 仍会执行），下一次关闭不能被上一轮的「已成功 / 还在跑」污染。
+        shellClosePending = false
+        shellCloseHandled = false
+        shellWaitRounds = 0
+        lastInjectAt = 0
+        // 收尾也要作废戳：这条命令可能还在跑，它回来时**绝不能**再往一个已经结束的流程里
+        // 注入手势（见 [closeFlowToken]）。
+        closeFlowToken++
         cancelCloseFlow()
         // **先重放，再催重排**——顺序不能反。
         //
@@ -1764,6 +1925,73 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 那一刀打在空处。真机复现：目标被缩到 [397,559][1261,2095] 后，补刀起点还是
         // (829,2257)，补完依旧 `OUTSIDE_TAP_STILL_OPEN`。
         val target = lastFreeformBounds ?: closeTargetBounds
+        // ★★★ 2026-10-24（用户要求）**有 Shizuku 就先走 shell，第 2 步（点亮）根本不发**。
+        //
+        // 用户的原话是「我发现现在有 shizuku 好像也会有第二步呢」——确实如此：`tapAt` 在有权限时
+        // 只是换成 `input tap` 注入，**落点还是落在窗口里**，误触应用的机理一模一样。
+        // 真正干净的做法是压根不注入触摸：`am stack remove <taskId>` 直接把这扇窗的任务摘掉。
+        //
+        // **语义差异（必须知道）**：手势关闭是「收起小窗、任务留在最近任务里」，摘任务是
+        // 「这个任务没了、下次打开是冷启动」。用户明知这一点仍选了这条（优先保证「不碰应用内容」）——
+        // 日志里打 `CLOSE_SHELL_OK` 时带上这句，日后要回退只需把这里关掉。
+        //
+        // 只在**第一次尝试**走 shell：摘失败了就交给随后的手势路径补刀（手势那套有实测数据）。
+        // `CLOSE_MODE_SYSTEM`（用户明确选了「点 ••• 菜单」）不参与，尊重用户的选择。
+        //
+        // ★★★ 2026-10-28 修：这一条原先**同步**跑在主线程上。`ShizukuShell.run` 内部是
+        // `process.waitFor(timeoutMs)` 阻塞，两次调用最坏 2s + 3s = **5 秒**，而
+        // [performCloseMode] 一系是挂在 [closeHandler]（`Looper.getMainLooper()`）上的
+        // ⇒ 输入分发超时（5s）就是一次 ANR，且本服务与 `OverlayGestureService` 同进程，
+        // 冻住的是整个应用。现在整段丢给 [shellWorker]，结果回到主线程再决定「收尾 / 退回手势」。
+        //
+        // 改异步不影响调用方：[performCloseMode] 的两处调用都是**语句调用**，返回值没人用。
+        if (!isRetry && mode != SettingsStore.CLOSE_MODE_SYSTEM && target != null) {
+            val pkg = closeTargetPackage ?: lastFreeformPackage
+            if (pkg != null && ShizukuShell.hasPermission) {
+                val snapshot = Rect(target)
+                // 领个流程戳：命令最长能跑 5 秒，完全可能跨过一次 [finishCloseFlow]。
+                // 回来时戳不对就整条丢掉，别把上一轮的结论写进下一轮。
+                val token = closeFlowToken
+                shellClosePending = true
+                // 用 runCatching 兜住「线程池已被 [onDestroy] 关掉」这个唯一可能抛的地方
+                // （`RejectedExecutionException`）。真发生时当作「没走 shell」，紧接着的手势路径照旧。
+                val queued =
+                    runCatching {
+                        shellWorker.execute {
+                            val removed =
+                                runCatching { closeViaShellTask(snapshot, pkg) }.getOrDefault(false)
+                            closeHandler.post {
+                                // 服务已销毁 / 已经不是同一个关闭流程了 ⇒ 这一刀作废。
+                                if (destroyed || token != closeFlowToken) return@post
+                                shellClosePending = false
+                                shellCloseHandled = removed
+                                // 摘任务没成 ⇒ 退回手势路径（主线程，与老代码完全一致）。
+                                // 成功 ⇒ 什么都不做：[recheck] 看到 [shellCloseHandled] 自己等窗口消失。
+                                if (!removed) performCloseModeGesture(mode, isRetry, snapshot)
+                            }
+                        }
+                    }.isSuccess
+                // 排上了就到此为止（剩下的交给后台线程 + recheck）；
+                // 没排上（池已关）就落回下面的手势路径，别把这次关闭整个吞掉。
+                if (queued) return true
+                shellClosePending = false
+            }
+        }
+        return performCloseModeGesture(mode, isRetry, target)
+    }
+
+    /**
+     * 关闭动作的**手势**部分——[performCloseMode] 去掉 shell 分支之后剩下的全部内容。
+     *
+     * 单独拆出来只为一件事：shell 那条路是异步的（见 [shellWorker]），它的失败回调要能
+     * 回到这里接着跑。除此之外**行为与拆分前逐字一致**。
+     *
+     * @param target 本次要关的那一扇；调用方已按 `[lastFreeformBounds] ?: [closeTargetBounds]` 取好。
+     */
+    private fun performCloseModeGesture(mode: String, isRetry: Boolean, target: Rect?): Boolean {
+        // ★ 记下「这一刀真正开始的时刻」。复检（[recheck]）按它计时，而不是按「用户点窗外
+        // 那一刻」——shell 那条路是异步的，回退手势可能比排定的复检晚几百毫秒才开始。
+        lastInjectAt = SystemClock.elapsedRealtime()
         // ★★★ **没点过横条，就绝不原地滑**（2026-10-17 多窗专项）。
         //
         // 用户原话：「**单个小窗问题不大，有问题的是多个小窗**」。
@@ -1777,17 +2005,51 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 也就不存在「无主上滑」的风险，别让它被这一步拖累成「点了没反应」。
         if (mode != SettingsStore.CLOSE_MODE_SYSTEM) {
             if (target != null) {
-                if (!shouldPrimeCaption(target)) {
-                    // 多窗口矩对不上（窗口列表刷新慢、伴生装饰窗身份在变）时常见。
-                    // 不影响点亮 —— [activateTarget] 只按矩形算落点，不依赖这个匹配。
-                    DebugLog.info("CLOSE_SWIPE_PRIME_UNKNOWN", "窗口列表里对不上这扇，照样先点横条")
-                }
-                if (!activateTarget(target)) {
-                    DebugLog.warn(
-                        "CLOSE_SWIPE_ABORT",
-                        "点亮没成/横条被挡住，这次**不起滑**（宁可没关掉，也不许滑成「回桌面」）",
+                // ★★★ 2026-10-24（ColorOS 真机日志 `flymefreeform-log-20261024-220848`）
+                // **目标窗本来就是焦点窗、又不贴屏底 ⇒ 这一刀整刀不发。**
+                //
+                // 用户报「点窗外关小窗，小窗上面会冒出那三个点（`•••`）」。日志里那一轮：
+                // ```
+                // OUTSIDE_TAP_TARGET    落点(880,2325) → 目标=com.coolapk.market [123,321][1133,2117] 有焦点=true
+                // CLOSE_SWIPE_ACTIVATE  先点横条 (628,328) …（点窗口上内沿点亮）
+                // CLOSE_SWIPE_FOCUS_DONE 点横条后等 157ms … 读到焦点=true
+                // ```
+                // —— **点亮前后都是焦点**，说明这一刀对身体状态毫无改变，只留下了副作用：
+                // `(628,328)` = 窗口上内沿 2dp（`321+7`，密度 3.5），正落在 ColorOS 的**标题条**
+                // 上（同一轮 `PRIME_PROBE` 显示酷安自己的控件从 `y=434` 才开始，也就是顶上那
+                // 113px ≈ 32dp 全是标题条）。点亮标题条 = **把它显式化**，`•••` 就冒出来了。
+                //
+                // ColorOS 的关闭手势只认**焦点窗**（非焦点窗的横条是死的）——所以这一刀的本意
+                // 是「给非焦点窗补上焦点」。已经是焦点窗时它没有可做的事，只是把标题条点亮。
+                // 2026-10-10 之所以改成「永远先点」，是因为**小米**上已聚焦的窗直接上滑会被
+                // `MiuiFreeformModeMoveHandler` 当成拖拽、把桌面拉起来；那是小米的机理，
+                // 在 ColorOS 上不成立（ColorOS 是 `FlexibleTaskCaptionView` 按焦点窗接管）。
+                //
+                // 例外两条，其余照旧点亮：
+                // ① **贴屏底**：上滑起点落在系统底部手势带里，必须先让这扇窗认领触摸，否则被
+                //    SystemUI 当成底部上滑（A/B：什么都不点 2 关 / 5 回桌面，见 [captionNearScreenBottom]）；
+                // ② **补刀**（[isRetry]）：首刀没关掉说明「不点亮」这条路走不通，补刀时退回老行为，
+                //    宁可让 `•••` 露一下，也不能永远关不掉。
+                val primeNeeded = isRetry || captionNearScreenBottom(target) || !closeTargetFocused
+                if (!primeNeeded) {
+                    DebugLog.info(
+                        "CLOSE_SWIPE_PRIME_SKIP",
+                        "目标窗已是焦点窗、又不贴屏底 ⇒ 不点亮，直接上滑" +
+                            "（点亮只会让 ColorOS 把标题条的 ••• 显出来）",
                     )
-                    return false
+                } else {
+                    if (!shouldPrimeCaption(target)) {
+                        // 多窗口矩对不上（窗口列表刷新慢、伴生装饰窗身份在变）时常见。
+                        // 不影响点亮 —— [activateTarget] 只按矩形算落点，不依赖这个匹配。
+                        DebugLog.info("CLOSE_SWIPE_PRIME_UNKNOWN", "窗口列表里对不上这扇，照样先点横条")
+                    }
+                    if (!activateTarget(target)) {
+                        DebugLog.warn(
+                            "CLOSE_SWIPE_ABORT",
+                            "点亮没成/横条被挡住，这次**不起滑**（宁可没关掉，也不许滑成「回桌面」）",
+                        )
+                        return false
+                    }
                 }
             } else {
                 DebugLog.warn("CLOSE_SWIPE_NO_TARGET", "不知道要关哪一扇，这次不动手")
@@ -1809,6 +2071,119 @@ class FreeformAccessibilityService : AccessibilityService() {
             // 默认（含未知取值、含已下线的「返回键」两种取值）：模拟一次「快速上滑」。
             else -> swipeUpOnCaption(isRetry)
         }
+    }
+
+    /**
+     * 用 shell 把目标小窗的**任务**摘掉——一下都不碰应用内容。见 [performCloseMode] 里的说明。
+     *
+     * 只在 Shizuku 有权限时可用。**认不出「唯一」那一个任务就不动手**：分身（同一包名、
+     * 不同 `userId`）与原体可以同时有任务，摘错等于把用户另一个实例关了
+     * （`LAUNCH.md` 里「`am stack list` 必须按 `userId=` 过滤」是同一个坑）。宁可退回手势路径。
+     *
+     * ※ **只能在 [shellWorker] 上调用**：两次 `ShizukuShell.run` 都是阻塞的（`process.waitFor`），
+     *   放主线程就是 ANR。见 [shellWorker] 的说明。
+     *
+     * @param pkg 调用方在**主线程**取好的包名快照。刻意不从 `closeTargetPackage` 现读：
+     *   那个字段随时会被 [recheck] / [finishCloseFlow] 改掉，后台线程现读可能拿到
+     *   「另一扇窗」的包名，`am stack remove` 就摘到别人头上去了。
+     */
+    private fun closeViaShellTask(bounds: Rect, pkg: String): Boolean {
+        val listing = ShizukuShell.run("am stack list", SHELL_LIST_TIMEOUT_MS)
+        if (!listing.isSuccess) {
+            DebugLog.warn(
+                "CLOSE_SHELL_FAILED",
+                "am stack list 失败 exit=${listing.exitCode} ${listing.stderr.take(120)}",
+                null,
+            )
+            return false
+        }
+        val taskId = findSoleTaskId(listing.stdout, pkg)
+        if (taskId == null) {
+            DebugLog.info("CLOSE_SHELL_MISS", "认不出 $pkg 的**唯一**任务（分身/多任务并存），退回手势")
+            return false
+        }
+        val removed = ShizukuShell.run("am stack remove $taskId", SHELL_REMOVE_TIMEOUT_MS)
+        if (!removed.isSuccess) {
+            DebugLog.warn(
+                "CLOSE_SHELL_FAILED",
+                "am stack remove $taskId 失败 exit=${removed.exitCode} ${removed.stderr.take(120)}",
+                null,
+            )
+            return false
+        }
+        DebugLog.info(
+            "CLOSE_SHELL_OK",
+            "am stack remove $taskId（$pkg 窗口=$bounds）；注意：任务被摘掉，最近任务里不会留",
+        )
+        return true
+    }
+
+    /**
+     * 从 `am stack list` 的输出里找**唯一**那个任务 id；认不出或有歧义就返回 null。
+     *
+     * 各版本排版差异很大（`taskId=123: pkg/.Act` 与 `* Task{... #123 ...}` 都有），所以按「块」扫：
+     * 见到任务头就换块，块里出现过这个包名才算这个包的任务。
+     *
+     * ★★★ 包名匹配**必须有边界**（2026-10-28 修）。原先只判
+     * `line.contains("$pkg/") || line.contains(":$pkg")`，右边没有任何约束，于是
+     * `pkg = com.tencent.mm` 会把 `:com.tencent.mm.bridge` / `:com.tencent.mm.test` 这些
+     * **别的应用**也算成它。两种后果都很难查：
+     *
+     * · 轻：多算出一个任务 ⇒ `found.size != 1` ⇒ 永远「认不出唯一任务」⇒ 明明有 Shizuku
+     *   却**每次都退回手势**，用户体感是「这个功能没生效」；
+     * · 重：真 pkg 那一块没被认出来、而前缀相同的那个应用被认出来时 `found.size == 1`
+     *   ⇒ `am stack remove` **摘掉别人家的任务**（把用户另一个应用关了）。
+     *
+     * 所以改用带左右边界的正则：左边是 `:` `/` 空白 `=` 或行首，右边是 `/` 空白 `}` `"` `,`
+     * 或行尾。`. _` 与字母数字都**不算**边界——那是包名本身还能继续的字符。
+     *
+     * `bounds=` 只记进日志，**不拿它当闸门**：真机上 `am stack list` 的 task bounds 与窗口真实
+     * 几何并不总是同一个（见 `LAUNCH.md`「视觉位置看 dumpsys window windows 的 Frames」），
+     * 拿它比会把本来能关的窗误判成「不是这扇」，白退回手势。
+     */
+    private fun findSoleTaskId(listing: String, pkg: String): Int? {
+        // 每个 pkg 一条正则，循环外建一次（下面要按行扫几十上百行）。
+        val mention = Regex("(?:^|[:/\\s=])" + Regex.escape(pkg) + "(?:[/\\s}\",]|$)")
+        val found = LinkedHashMap<Int, Rect?>()
+        var currentId: Int? = null
+        var currentBounds: Rect? = null
+        var mentioned = false
+        fun flush() {
+            val id = currentId ?: return
+            if (mentioned) found.putIfAbsent(id, currentBounds)
+        }
+        for (line in listing.lines()) {
+            if (TASK_HEADER_REGEX.containsMatchIn(line)) {
+                flush()
+                currentId = TASK_ID_REGEX.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                currentBounds = null
+                mentioned = false
+            }
+            if (mention.containsMatchIn(line)) mentioned = true
+            if (currentBounds == null) {
+                TASK_BOUNDS_REGEX.find(line)?.let { m ->
+                    currentBounds =
+                        Rect(
+                            m.groupValues[1].toInt(),
+                            m.groupValues[2].toInt(),
+                            m.groupValues[3].toInt(),
+                            m.groupValues[4].toInt(),
+                        )
+                }
+            }
+        }
+        flush()
+        if (found.size != 1) {
+            if (found.isNotEmpty()) {
+                DebugLog.warn(
+                    "CLOSE_SHELL_AMBIGUOUS",
+                    "$pkg 有 ${found.size} 个任务 ${found.keys}（分身/多实例），不摘",
+                    null,
+                )
+            }
+            return null
+        }
+        return found.keys.first()
     }
 
     /**
@@ -1999,40 +2374,168 @@ class FreeformAccessibilityService : AccessibilityService() {
      * 因焦点切换留下一个收不掉的悬挂手势，把随后的上滑劈成两半、后半截漏给下层应用
      * （5 轮 3 轮穿透）。所以现在**只在窗口贴屏底时才点横条**，其余一律走标题区——
      * 判据与两侧数据见 [captionNearScreenBottom]，实测对照见那里。
+     *
+     * ★★ 2026-10-24：「标题区」原先的落点是**窗口左上角内缩 20dp**，真机日志证明它其实已经跨进
+     * 应用内容区（酷安首页顶栏的头像 ⇒ 跳到「我的」）。落点已改成「上内沿 4dp + 水平居中」，
+     * 机理与日志见 [titleActivationPoint]。
      */
-    private fun activationPlan(bounds: Rect): Pair<Pair<Float, Float>, String> {
+    private fun activationPlan(bounds: Rect): Pair<Pair<Float, Float>, String>? {
         // ★ 只有「窗口底边贴着屏幕底部」时，才把点亮落点放在横条上。机理与真机数据
         // 见 [captionNearScreenBottom]；不贴屏底时点横条只有坏处，没有好处。
         if (captionNearScreenBottom(bounds)) {
             captionPrimePoint(bounds)?.let { return it to "落在横条上＝这一刀上滑的钥匙" }
         }
-        return titleActivationPoint(bounds) to
-            "点标题区点亮（不碰横条，免得留下收不掉的悬挂手势）"
+        // null = 探针说「上沿这一带全压着应用的可点击控件」⇒ 这一刀不点亮（见 [PrimeProbe]）。
+        val point = titleActivationPoint(bounds) ?: return null
+        return point to "点窗口上内沿点亮（不碰横条，也不碰应用里能点的东西）"
     }
 
     /**
-     * 「点亮」落点的退让方案：窗口内、避开别的自由窗矩形、贴着上边缘（标题栏那一带，
-     * 不是内容区，点下去不会误触应用按钮）。
+     * 「点亮」落点的退让方案：窗口内、避开别的自由窗矩形、贴着**上内沿且水平居中**。
+     *
+     * ★★★ 2026-10-24 首落点从「左上角内缩 20dp」改成「上内沿 4dp + 水平居中」。
+     *
+     * 用户反馈：**点窗外退出酷安时，酷安先跳到「我的」再退出**。日志（`flymefreeform-log-20261024-202619`）
+     * 里那一轮 20:25:59.945 起，能碰到应用的注入只有两处，而只有这一下是「单击」：
+     * ```
+     * CLOSE_SWIPE_ACTIVATE 先点横条 (193,391) …（点标题区点亮（不碰横条…））
+     * ```
+     * 窗口是 `[123,321][1133,2117]` ⇒ `(193,391)` = 窗口左上角内缩 `(70,70)px`（密度 3.5，即 20dp）。
+     * 那一记 **`input tap` 不是「点了一下标题条」，而是点进了应用自己的内容区**：
+     * ColorOS 的小窗标题条在**这扇窗刚开出来、用户还没碰过它**的这一刻是隐藏/不吃触摸的
+     * （同一批 A/B 里点 20dp 能被 `FlexibleTaskCaptionView` 认领，那是因为当时标题条是显式的），
+     * 于是这一下落到酷安首页顶栏左侧的**头像（进「我的」）**上 —— 用户看到的正是
+     * 「先点了我的，再退出」。**同一台机器上开发自测不复现，就是因为测试时多半先摸过那扇窗
+     * （标题条已经显出来），或者换了个顶栏那个位置没有按钮的应用。**
+     *
+     * 为什么 20dp 当初是「踩出来的」（见 [ACTIVATION_INSET_DP]）：再小就会压到**左上圆角**上、
+     * 系统可能不认那个点。
+     *
+     * ★★ 2026-10-24 第二轮（用户：「不要在中间，左上角或者右上角误触会少很多」）：
+     * 落点从「上内沿 + 水平居中」改成 **左右两角优先、中间降为最后**，并且深度从 2dp 起。
+     *
+     * · 中间的坏处：应用顶栏中段几乎总有东西（搜索框 / 标题 / Tab），是「点一下就有反应」的高发区。
+     * · 角落的好处：顶栏两端通常是 padding。但**角不能压圆角**，于是内缩量不写死、按当前深度
+     *   用圆角公式反解（见 [CornerGeometry.cornerClearance]）：1dp 深处要求约 17dp、2dp ⇒ 14dp，
+     *   越深要求越小。这也回答「1px 行不行」——1px 处公式要求约 20dp（正好退回那个老落点），
+     *   而 **1dp 只要 17dp**：所以最浅到 1dp，1px 不行。
+     *
+     * 两种标题条状态下的预期：
+     * · 标题条显式 ⇒ 落点在标题条最上沿（多半是应用图标那一带），ColorOS 照旧认领这一下；
+     * · 标题条隐藏 ⇒ 落进应用顶栏**最上面几像素的 padding**，不会碰到顶栏里的按钮。
+     *
+     * 各档都会先过 [PrimeProbe]；全被占就返回 null（这一次不点亮）。
      */
-    private fun titleActivationPoint(bounds: Rect): Pair<Float, Float> {
+    private fun titleActivationPoint(bounds: Rect): Pair<Float, Float>? {
         val inset = CornerGeometry.dp(this, ACTIVATION_INSET_DP)
+        val edge = CornerGeometry.dp(this, ACTIVATION_EDGE_DP).toInt().coerceAtLeast(1)
+        val step = CornerGeometry.dp(this, ACTIVATION_EDGE_STEP_DP).toInt().coerceAtLeast(1)
+        val maxY = CornerGeometry.dp(this, ACTIVATION_EDGE_MAX_DP).toInt().coerceAtLeast(edge)
         val others =
             lastFreeformWindows
                 .filter { !withinSlack(it.bounds, bounds, closeSameSlackPx) }
                 .map { it.bounds }
-        // 自上而下、左右交替各试几个点，取第一个「在窗口内、且不被别的窗盖住」的。
-        val offsets = intArrayOf(inset, inset * 2, inset * 3)
-        for (dy in offsets) {
-            for (x in intArrayOf(bounds.left + inset, bounds.right - inset)) {
-                val y = bounds.top + dy
-                if (x < bounds.left || x >= bounds.right) continue
-                if (y < bounds.top || y >= bounds.bottom) continue
-                if (others.any { it.contains(x, y) }) continue
-                return x.toFloat() to y.toFloat()
+        // ★★ 2026-10-24 第二层防护：**先问一遍探针，这一点在应用里是什么**（见 [PrimeProbe]）。
+        //
+        // 「贴着上内沿」只是把误触概率压到很低，不是保证：视频播放器、图片查看器、WebView、
+        // 游戏都可能整屏可点。所以这里把「上沿这一带里压着可点击控件的矩形」读出来，
+        // 候选点落进去就换下一个；**全被占就返回 null** —— 这一次不点亮、直接上滑。
+        // 取舍与本文件别处一致：宁可这一刀没被认领（用户再点一次），也不替用户点一下应用按钮。
+        //
+        // 探针**没有可信结论**时返回 null（还没采到 / 拿不到节点树 / 这界面没暴露树），
+        // 那种情况按「没有这层防护」处理，照旧盲点 —— 别让「探针缺失」变成「永远不点亮」。
+        val blocked = runCatching { PrimeProbe.blocked(bounds) }.getOrNull()
+        val safe: (Int, Int) -> Boolean = { x, y -> blocked == null || blocked.none { it.contains(x, y) } }
+        // ★★ 2026-10-24（用户要求）细梯子：**从 2dp 起、每档 2dp 往下试**，浅的优先。
+        //
+        // 越靠近窗口上沿，越可能仍在系统标题条里（那正是「认领」要的地方）、越不可能是应用的
+        // 可点控件（顶栏按钮至少要往下让出一个状态栏/padding）。所以「浅的能点就别点深的」。
+        // 阶梯只做纯数学，不产生 IPC；真正把关的除了深度，就是上面的探针。
+        //
+        // ★★ 2026-10-24 第二轮（用户：「不要在中间，左上角或者右上角误触会少很多」）：
+        // x 从「水平居中优先」改成**左右两角优先，中间降为最后**。中间（标题文字 / 搜索框 /
+        // Tab 栏）是应用顶栏最容易被点响的地方，两个角往往是 padding。
+        //
+        // 但「角」不能压到圆角上——那一点是窗口外的透明像素，系统既不认领也不误触，这一刀白费。
+        // 所以 x 的内缩量不写死，按**当前深度 dy 反解圆角**：贴着上沿越浅，圆角弧线在该高度
+        // 离左右边缘越远（`clearance ≥ r − √(2·r·dy − dy²)`，与绘制角落里那个「轮盘让位」
+        // 同一个公式，见 [CornerGeometry.cornerClearance]）。半径用设备真值，换机型自动跟着变。
+        // 这也顺手解释了**为什么 1px 不行**：dy=1px 时这个式子要求内缩约 20dp（就是老落点那个值），
+        // 「1px + 角落」在几何上根本不存在——要贴角就得让出一块，要让得少就得往下走一点。
+        //
+        // ★ 2026-10-24（用户：「离顶部和左边都 1dp 呢」）：**两个方向同时缩**是另一条式子。
+        // 点 `(left+d, top+d)` 到圆角圆心 `(left+r, top+r)` 的距离是 `(r−d)·√2`，要落在窗口内得
+        // `(r−d)·√2 ≤ r` ⇒ **`d ≥ r·(1−1/√2) ≈ 0.293·r`**（r=24dp ⇒ 7dp；r=16dp ⇒ 4.7dp）。
+        // 也就是说「两边都 1dp」在 r≥3.5dp 的圆角上必然是窗口外 —— 系统不会把它派给窗口，
+        // 这一刀既不认领也不误触，等于白点。对称贴角的下限是 0.293r，永远缩不到 1dp。
+        //
+        // 本函数**仍只缩 x**（y 固定为最浅的 edge）：因为「会不会点到应用按钮」由 **y** 决定
+        // （顶栏按钮从窗口顶 +32dp 才开始），x 再往里让也不过多走几 dp 横向 padding。
+        // 用对称点会把 y 从 1dp 抬到 7dp，是拿真正的风险维度去换观感，不划算。
+        // ★★★ 2026-10-24（用户：「不同机型圆角不一样，17dp 在别的机型上会不会不能用」）：
+        // **17dp 不是写死的**，是这一行按本机圆角现算的结果 —— r 大就要让得多，r 小就让得少
+        // （12dp ⇒ 7dp，16dp ⇒ 10dp，24dp ⇒ 17dp，28dp ⇒ 21dp）。但有两处必须堵住，否则换机型就废：
+        //
+        // ① **圆角读不到时不能当 0**。`roundedCornerRadius()` 优先问 `WindowInsets`，读不到退回
+        //    资源，都读不到返回 0；0 会让公式算出「不用让」，于是在圆角大的机型上这一点掉到窗口外
+        //    ⇒ 白点一下（既不认领也不误触），补刀场景就是「怎么也关不掉」。
+        //    所以读不到时按**常见最大圆角**估（[ACTIVATION_FALLBACK_CORNER_DP]），宁可多让几 dp。
+        // ② **内缩的上限不能小于 r**。`cornerClearance(r, dy) ≤ r` 恒成立，所以只要上限 ≥ r
+        //    就永不截断；早先写死 20dp，r>28dp 的机型（大圆角/自定义 ROM）会被截断 ⇒ 又掉到圆角外。
+        val corner =
+            runCatching { CornerGeometry.roundedCornerRadius(this) }.getOrDefault(0)
+                .takeIf { it > 0 }
+                ?: CornerGeometry.dp(this, ACTIVATION_FALLBACK_CORNER_DP)
+        val minClear = CornerGeometry.dp(this, ACTIVATION_CORNER_INSET_DP).toInt().coerceAtLeast(1)
+        // 上限 = max(20dp, r)：r 小时仍按老值兜底，r 大时跟着放开，保证几何结论不被截断。
+        val clearCap = maxOf(inset, corner)
+        // ★★ 2026-10-24 第四轮（用户：「那放在哪最安全」）：**盲点不许往下钻**。
+        //
+        // 探针**有结论**时，深档会被 [safe] 逐个挡掉，走到 60dp 也无所谓——它挡得住按钮。
+        // 探针**没结论**时（自绘界面、拿不到树、还没采完）就是纯盲点，深档等于往应用顶栏里点：
+        // 酷安那扇窗的可点控件从窗口顶 +32dp 就开始了（`[123,434][281,580]` 头像）。
+        // 所以盲点只走「系统标题条能盖住的那一段」（[ACTIVATION_BLIND_MAX_DP]），
+        // 超过就放弃点亮 —— 宁可这一次没关掉，也不盲点一个不知道是什么的按钮。
+        val blindMax = CornerGeometry.dp(this, ACTIVATION_BLIND_MAX_DP).toInt().coerceAtLeast(edge)
+        val limit = if (blocked == null) minOf(maxY, blindMax) else maxY
+        var dy = edge
+        while (dy <= limit) {
+            val y = bounds.top + dy
+            if (y >= bounds.bottom) break
+            // 内缩量：圆角在这一深度要求的让位 → 至少 CORNER_INSET（读不到圆角/深档时的下限），
+            // 至多 clearCap（≥ r，所以永远够用，不会被截断成「掉在圆角外」）。
+            val clear =
+                maxOf(minClear, CornerGeometry.cornerClearance(corner, dy)).coerceAtMost(clearCap)
+            // 极窄的小窗（左右两个角都快碰头）就别勉强，交给下一档深度。
+            if (clear * 2 < bounds.width()) {
+                for (x in intArrayOf(bounds.left + clear, bounds.right - 1 - clear, bounds.centerX())) {
+                    if (x <= bounds.left || x >= bounds.right) continue
+                    if (others.any { it.contains(x, y) }) continue
+                    if (!safe(x, y)) continue
+                    return x.toFloat() to y.toFloat()
+                }
             }
+            dy += step
         }
-        // 极端层叠（每个可试点都被别的窗盖住）→ 退回横条落点，至少保证落在窗口内。
-        return captionPoint(bounds, SettingsStore(this))
+        // ③ 探针说「哪儿都有可点击控件」⇒ 放弃点亮。
+        if (blocked != null) {
+            DebugLog.warn(
+                "CLOSE_SWIPE_PRIME_BLOCKED",
+                "上沿这一带全压着应用的可点击控件（${blocked.size} 个），这次不点亮、直接上滑",
+            )
+            return null
+        }
+        // ④ 探针没结论、盲点梯子又走完了（候选全被别的小窗盖住 / 已到标题条下沿）⇒ 也放弃点亮。
+        //
+        // 早先这里退回 [captionPoint]（点横条）「至少落在窗口内」，但真机数据说那条更糟：
+        // **不贴屏底**时按横条会被 `FlexiblePointerHandler` 认领成 scale 手势，焦点切换让
+        // InputDispatcher 再投递一次 DOWN，留下收不掉的悬挂手势，把随后的上滑劈成两半、
+        // 后半截漏给下层应用（5 轮 3 轮穿透）。放弃反而是最安全的那个。
+        DebugLog.warn(
+            "CLOSE_SWIPE_PRIME_BLIND",
+            "探针没结论、标题条这一带又找不到落脚点 ⇒ 这次不点亮、直接上滑",
+        )
+        return null
     }
 
     /**
@@ -2169,7 +2672,13 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 「放弃」的取舍：宁可这一下没关掉（用户会再点一次），也不能滑成回桌面。
         val nearBottom = captionNearScreenBottom(bounds)
         if (nearBottom && captionPrimePoint(bounds) == null) {
-            val promote = titleActivationPoint(bounds)
+            val promote = titleActivationPoint(bounds) ?: run {
+                DebugLog.warn(
+                    "CLOSE_SWIPE_ABORT_BLIND",
+                    "横条被压住、提窗落点又全压在应用可点击控件上 ⇒ 这次不动手",
+                )
+                return false
+            }
             DebugLog.info(
                 "CLOSE_SWIPE_PROMOTE",
                 "横条被上层小窗压住 → 先点标题区 (${promote.first.toInt()},${promote.second.toInt()}) 提窗",
@@ -2189,7 +2698,36 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         // 只算一次落点：早先 [activationPoint] 和这里的 `onCaption` 各调一次 [captionPrimePoint]，
         // 于是「横条被压住」那条日志在真机上总是出现两遍。
-        val (point, why) = activationPlan(bounds)
+        //
+        // null = 探针判定「上沿这一带全压着应用的可点击控件」⇒ **这一刀不点亮**，直接上滑
+        // （见 [titleActivationPoint] / [PrimeProbe]）。少了「认领」这一下，浮中段的上滑会变成
+        // 掷骰子——但这是有意的取舍：宁可没关掉（用户再点一次），也不替用户点一下应用按钮。
+        val plan = activationPlan(bounds)
+        if (plan == null) {
+            DebugLog.warn(
+                "CLOSE_SWIPE_PRIME_SKIPPED",
+                "没有安全的点亮落点，这次不点亮、直接上滑（宁可没关掉，也不误触应用）",
+            )
+            // ★★★ 2026-10-28 修：这里原来只判 `nearBottom`，于是 **非焦点窗**也会「不点亮直接滑」。
+            //
+            // 「不点亮也能滑」这个结论只对**已经是焦点窗**的那扇成立（2026-10-24 的真机数据：
+            // 有焦点=true 时跳过点亮，19/20 一次关掉）。非焦点窗的横条是死的，这一刀没有认领，
+            // 会漏给 SystemUI 变成「底部上滑回桌面」——正是本文件反复强调的「没有认领就绝不原地滑」。
+            //
+            // 而走进这个分支的前提恰恰是「探针说上沿这一带全压着应用按钮 / 盲点又超出标题条」，
+            // 这种事最容易发生在**多窗重叠**的小窗上（别的窗盖住了浅档），而那正是非焦点窗最常见的处境
+            // ⇒ 前一个版本等于在这种场景上把风险最高的那一刀放行了。
+            if (nearBottom || !closeTargetFocused) {
+                DebugLog.warn(
+                    "CLOSE_SWIPE_ABORT_UNPRIMED",
+                    "不点亮就没有认领（贴屏底=${nearBottom} 有焦点=${closeTargetFocused}）" +
+                        "⇒ 这次不起滑，否则会漏成「回桌面」",
+                )
+                return false
+            }
+            return true
+        }
+        val (point, why) = plan
         val x = point.first.toInt()
         val y = point.second.toInt()
         // ★★ **落点压在键盘上就别起滑**（2026-10-22 真机取证，横屏 + 微信输入法）。
@@ -2520,6 +3058,22 @@ class FreeformAccessibilityService : AccessibilityService() {
             finishCloseFlow()
             return
         }
+        // ★★★ 2026-10-28：复检只该在手势**真正发出** [RECHECK_DELAY_MS] 之后才判「没关掉」。
+        // 注入可能是异步才发出的（shell 失败 ⇒ 回退手势，见 [performCloseMode]），而这条复检是
+        // 按「用户点窗外那一刻」排的，会**早到**、撞进「刚发出、窗口还没来得及变」的中间态
+        // ⇒ 立刻判成没关掉、再补一刀，两刀叠在一起。早到就往后推，推到正好 [RECHECK_DELAY_MS]。
+        if (lastInjectAt > 0) {
+            val sinceInject = SystemClock.elapsedRealtime() - lastInjectAt
+            if (sinceInject in 0 until RECHECK_DELAY_MS) {
+                val wait = RECHECK_DELAY_MS - sinceInject
+                DebugLog.info(
+                    "OUTSIDE_TAP_RECHECK_EARLY",
+                    "复检早到（注入后 ${sinceInject}ms），推迟 ${wait}ms 再看",
+                )
+                postCloseFlow(wait) { recheck() }
+                return
+            }
+        }
         val anyWindow = observeLayout()
         // 「还有自由窗」不等于「没关掉」：屏上可能还开着**另一扇**小窗，那一扇跟本次关闭
         // 无关。照旧逻辑就会再补一刀把它也关掉（用户报的「两扇并排，点一下窗外关掉俩」）。
@@ -2543,6 +3097,31 @@ class FreeformAccessibilityService : AccessibilityService() {
         val shrinking = isShrinking(now)
         // 记下**本次**看到的尺寸，供下一轮复检比对（见 [closeLastCheckBounds]）。
         closeLastCheckBounds = Rect(now)
+        // ★★★ 2026-10-28：shell 摘任务是**异步**的（见 [shellClosePending]），这两轮里窗口还在
+        // 是正常现象，按老逻辑会立刻补一刀手势 —— 那一刀会打在**正在消失**的窗口上，是
+        // 「漏成回桌面」残留的理论窗口。所以只等不打，分两种：
+        //   · [shellClosePending]：命令还没回来，等它回来；
+        //   · [shellCloseHandled]：命令回了且成功，等窗口自己消失。
+        // 等待轮数有上限（[MAX_SHELL_WAIT_ROUNDS] × [SHELL_WAIT_STEP_MS] 覆盖
+        // [SHELL_LIST_TIMEOUT_MS] + [SHELL_REMOVE_TIMEOUT_MS] 的最坏情况），超时就落回原逻辑，
+        // 宁可多等几轮，也不能永远不收尾。
+        if (shellClosePending || shellCloseHandled) {
+            if (shellWaitRounds < MAX_SHELL_WAIT_ROUNDS) {
+                shellWaitRounds++
+                DebugLog.info(
+                    "OUTSIDE_TAP_SHELL_WAIT",
+                    "shell 摘任务中（未回=${shellClosePending} 已成功=${shellCloseHandled}）" +
+                        "第 $shellWaitRounds 轮，先不补手势",
+                )
+                postCloseFlow(SHELL_WAIT_STEP_MS) { recheck() }
+                return
+            }
+            DebugLog.warn(
+                "OUTSIDE_TAP_SHELL_SLOW",
+                "shell 等了 $shellWaitRounds 轮窗口还在，按「没关掉」继续原流程",
+                null,
+            )
+        }
         if (shrinking) {
             if (closingWaitCount >= MAX_CLOSING_WAIT) {
                 DebugLog.warn("OUTSIDE_TAP_STILL_CLOSING", "窗口一直在收起，停止补刀", null)
@@ -2827,12 +3406,84 @@ class FreeformAccessibilityService : AccessibilityService() {
         private const val CLOSE_FOCUS_POLL_MS = 10L
 
         /**
-         * 「点亮」目标窗时，落点到窗口边缘的距离。
+         * 「点亮」候选点水平内缩的**上限**，同时也是历史落点的内缩量。
          *
          * 20dp 是踩出来的：小一点会压到窗口的圆角上（系统可能不认这一个点），
          * 大一点就跨进内容区、可能误触应用里的按钮。
+         *
+         * ⚠️ 后半句在 2026-10-24 被真机日志验成真的了（用户报「点窗外退出酷安，先跳到我的再退出」）——
+         * 20dp **本来就已经在应用内容区里**（酷安首页顶栏头像 `[123,434][281,580]`，落点 `(193,391)`）。
+         *
+         * 现在它退居二线：只在「圆角公式要求的内缩超过 20dp」时封顶（`dy=1px` 恰好就是这个量级，
+         * 见 [ACTIVATION_EDGE_DP]），正常 2dp 深度只会用到 14dp 左右。
          */
         private const val ACTIVATION_INSET_DP = 20
+
+        /**
+         * 读不到本机圆角半径时，按这个值**保守估算**（[titleActivationPoint]）。
+         *
+         * 28dp 是常见 ColorOS / HyperOS 屏幕圆角的上界（实测机器 20~28dp）。宁可多让几 dp：
+         * 让多了只是落点偏内（y 仍是 1dp，还在应用顶栏最上面的留白里）；
+         * 让少了就是落到圆角外的透明像素上——那一刀既不认领也不误触，等于白点，
+         * 补刀场景下表现成「怎么也关不掉」，比误触更难查。
+         */
+        private const val ACTIVATION_FALLBACK_CORNER_DP = 28
+
+        /**
+         * 「点亮」首选落点离窗口**上内沿**的距离。
+         *
+         * ★ 2026-10-24 从 4dp → 2dp → **1dp**（用户要求「越浅越好」）。1dp 是 dp 分辨率下
+         * 几何允许的最浅值：密度 3.5 时是 3px（≈0.86mm），已经贴着上沿，视觉上与边框无异。
+         *
+         * ⚠️ **1px 不行，1dp 可以**——两者差着 3.5 倍，而圆角公式对「深度」极其敏感：
+         * `clear ≥ r − √(2·r·dy − dy²)`。按 r≈24dp：
+         * `dy=1px` ⇒ 内缩 **20dp**（正好是那个点到酷安头像的老落点）；
+         * `dy=1dp` ⇒ 17dp；`dy=2dp` ⇒ 14dp；`dy=4dp` ⇒ 11dp。
+         * 所以「贴左边 1px」在窗口里根本不存在，「离顶 1dp」是存在的，只是水平要多让一点。
+         *
+         * 深度和水平内缩是**同一条曲线上的两个参数**，改这里要连着看 [ACTIVATION_CORNER_INSET_DP]
+         * 与 [ACTIVATION_INSET_DP]。
+         */
+        private const val ACTIVATION_EDGE_DP = 1
+
+        /**
+         * 「点亮」候选点离窗口**左右边缘**的最小内缩（贴角用）。
+         *
+         * 只兜「读不到设备圆角半径」的情况：那时 [CornerGeometry.cornerClearance] 返回 0，
+         * 不给个下限就会点到边框线上。8dp 在视觉上仍然算「角」，又足够离开那条 1px 边框。
+         */
+        private const val ACTIVATION_CORNER_INSET_DP = 8
+
+        /** 「点亮」候选点的向下步长：2dp 起、每档 +2dp，**浅的优先**（见 [titleActivationPoint]）。 */
+        private const val ACTIVATION_EDGE_STEP_DP = 2
+
+        /**
+         * 「点亮」细梯子的最深一档。
+         *
+         * 再往下就跨进应用内容区了（顶栏按钮一般在状态栏/padding 之下不远）。给到 60dp 是为了
+         * 多窗层叠时还能在这些窗口里找到「没被别的窗盖住」的点；真正把关的是 [PrimeProbe]。
+         */
+        private const val ACTIVATION_EDGE_MAX_DP = 60
+
+        /**
+         * **盲点**（[PrimeProbe] 没结论）时，点亮落点最深只到这里。
+         *
+         * 32dp 是 ColorOS 小窗标题条的实测高度：`flymefreeform-log-20261024-220848` 里窗口
+         * `[123,321][1133,2117]`、应用自己的第一个可点控件在 `y=434` ⇒ `434−321 = 113px`，
+         * 密度 3.5 即 32.3dp。也就是说**标题条以下就是应用顶栏按钮区**。
+         *
+         * 探针有结论时不必受这个限制（它会逐个挡住可点控件）；没结论时越过它就是在盲点应用按钮，
+         * 所以干脆放弃这一刀。见 [titleActivationPoint]。
+         */
+        private const val ACTIVATION_BLIND_MAX_DP = 32
+
+        /**
+         * [PrimeProbe] 要采的「上沿线」高度。
+         *
+         * 候选落点最深只到「窗口上沿 + 60dp」（兜底梯子最后一档），给到 120dp 足够覆盖，
+         * 又能把遍历的节点数压在很小的范围里（只往与这条带相交的子树走）。
+         */
+        private const val PRIME_PROBE_STRIP_DP = 120
 
         /**
          * 「窗口底边算贴屏底」的容差——超过这个距离就不认为上滑起点会落进系统底部手势带。
@@ -2844,6 +3495,37 @@ class FreeformAccessibilityService : AccessibilityService() {
 
         /** 无障碍回退路径下，「点一下」的按压时长。 */
         private const val CLOSE_FOCUS_TAP_MS = 60L
+
+        /**
+         * `am stack list` / `am stack remove` 的超时（有 Shizuku 时用，见 [closeViaShellTask]）。
+         *
+         * 这两条是**替换掉整条注入链路**的，多等一点无所谓（真机 `am stack list` 约 100~300ms）；
+         * 但不能不设上限——Shizuku 偶尔会卡住，卡在关闭链路上比关不掉更糟。
+         */
+        private const val SHELL_LIST_TIMEOUT_MS = 2_000L
+        private const val SHELL_REMOVE_TIMEOUT_MS = 3_000L
+
+        /**
+         * [recheck] 等一次 shell 摘任务的步长（见 [shellClosePending]）。每轮只轮询这个间隔。
+         */
+        private const val SHELL_WAIT_STEP_MS = 400L
+
+        /**
+         * [recheck] 最多为 shell 让路几轮（见 [shellClosePending]）。
+         *
+         * 15 × 400ms = 6s > [SHELL_LIST_TIMEOUT_MS] + [SHELL_REMOVE_TIMEOUT_MS] = 5s，
+         * 所以正常情况一定等得到结果；只有 Shizuku 卡死才会走到「超时继续」那条。
+         */
+        private const val MAX_SHELL_WAIT_ROUNDS = 15
+
+        /** `am stack list` 里「一个任务的开头」：两种排版都认（见 [findSoleTaskId]）。 */
+        private val TASK_HEADER_REGEX = Regex("""taskId=|Task\{""")
+
+        /** 任务 id：`taskId=123`，或 `* Task{abc #123 ...}` 里的 `#123`。 */
+        private val TASK_ID_REGEX = Regex("""(?:taskId=|#)(\d+)""")
+
+        /** 任务 bounds：`bounds=[l,t][r,b]`（只进日志，不当闸门）。 */
+        private val TASK_BOUNDS_REGEX = Regex("""bounds=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]""")
 
         /**
          * 从「决定关闭」到「注入手势」之间的等待。

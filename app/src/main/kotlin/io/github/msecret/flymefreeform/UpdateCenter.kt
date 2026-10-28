@@ -74,6 +74,17 @@ object UpdateCenter {
     var state = State()
         private set
 
+    /**
+     * 自动检查**上一次成功**拉到的完整 release 列表（内存缓存，不持久化；从新到旧）。
+     *
+     * 为什么要留着：自动检查发现新版本后弹的是「发现新版本 x」提示框，用户点进去以前只能选
+     * 下载路线，**看不到改了什么**（2026-10-28 用户反馈）。而这份列表就在自动检查的
+     * `onSuccess` 手里，不缓存的话要为此再发一次 GitHub 请求（未认证每小时只有 60 次）。
+     * 进程重启后为空 ⇒ [UpdatePrompt] 退回原来的「选择下载方式」。
+     */
+    var lastReleases: List<UpdateChecker.Release> = emptyList()
+        private set
+
     private val listeners = mutableListOf<() -> Unit>()
 
     /** 自动检查正在进行：防重入（切页、回前台都会调 [autoCheck]）。 */
@@ -115,24 +126,44 @@ object UpdateCenter {
      * [force] = `true` 只给「用户刚拨开开关」用：那是他主动要的，不该被冷却挡住。
      */
     fun autoCheck(context: Context, force: Boolean = false) {
-        if (autoRunning) return
+        if (autoRunning) {
+            // 防重入。**要留一行**：进了应用没查更新时，「是不是上一次还没回来」是最先要排除的可能。
+            DebugLog.info("UPDATE_AUTO_SKIP", "已有检查在进行中")
+            return
+        }
         // 持 Context 的只能是 applicationContext：这是个 object，活过任何一个 Activity。
         val app = context.applicationContext
         val store = SettingsStore(app)
-        if (!store.autoCheckUpdate) return
+        if (!store.autoCheckUpdate) {
+            DebugLog.info("UPDATE_AUTO_SKIP", "自动检查开关已关")
+            return
+        }
         val now = System.currentTimeMillis()
         // 频率 `0` = 每次启动都查，这里自然退化成「永不冷却」。
-        if (!force && now - store.lastUpdateCheckAt < store.autoUpdateIntervalHours * HOUR_MS) return
+        if (!force && now - store.lastUpdateCheckAt < store.autoUpdateIntervalHours * HOUR_MS) {
+            // ★★ 冷却挡掉时**必须留一行**（2026-10-28）：这是「进应用没自动查更新」最常见的答案。
+            // 静默返回会让日志看上去像「autoCheck 根本没被调用过」，而实际是调了但被挡了。
+            DebugLog.info(
+                "UPDATE_AUTO_SKIP",
+                "冷却中：距上次 ${(now - store.lastUpdateCheckAt) / 60_000} 分钟，" +
+                    "间隔 ${store.autoUpdateIntervalHours} 小时",
+            )
+            return
+        }
         // ★ 时间戳**在发请求之前**写，理由见 [SettingsStore.lastUpdateCheckAt]。
         store.lastUpdateCheckAt = now
         autoRunning = true
-        UpdateChecker.check { outcome ->
+        DebugLog.info("UPDATE_AUTO_START", "force=$force")
+        UpdateChecker.check("auto") { outcome ->
             autoRunning = false
             // 无论成败都要把「上次检查时间」推给界面 —— 用户看到的是「我刚查过」，
             // 至于查成功没有，那是状态文字那一行的事。
             val base = state.copy(lastCheckedAt = now)
             outcome
                 .onSuccess { releases ->
+                    // 先记下整份列表：[UpdatePrompt] 弹「发现新版本」时要用它展示更新日志，
+                    // 免得为了看日志再查一次 GitHub（额度每小时只有 60 次）。
+                    lastReleases = releases
                     val latest = releases.first()
                     val local = UpdateChecker.installedVersionName(app)
                     if (UpdateChecker.isNewer(latest.version, local)) {
@@ -152,7 +183,13 @@ object UpdateCenter {
                                 pendingAnnounce = !alreadyKnown,
                             ),
                         )
-                        if (!alreadyKnown) DebugLog.info("UPDATE", "自动检查：发现新版本 ${latest.version}")
+                        if (!alreadyKnown) {
+                            DebugLog.info("UPDATE_AUTO_NEW", "发现新版本 ${latest.version}（本机 $local）")
+                        } else {
+                            // 同一版重复查到：界面要更新，但**不再弹提示框**，所以日志也得单独留一条，
+                            // 否则日志里会空着，像是「这一轮什么都没查到」。
+                            DebugLog.info("UPDATE_AUTO_KNOWN", "仍是 ${latest.version}，本轮不重复提示")
+                        }
                     } else {
                         // 已是最新：**把旧结论清掉**，而不是像原来那样「什么都不写」。
                         //
@@ -172,6 +209,13 @@ object UpdateCenter {
                                 downloadUrl = null,
                                 pendingAnnounce = false,
                             ),
+                        )
+                        // 「查到了、但没新版」也要留痕：这是自动检查最常见的结局，静默会让
+                        // 「自动检查到底跑没跑」永远查不清（2026-10-28）。
+                        DebugLog.info(
+                            "UPDATE_AUTO_LATEST",
+                            "已是最新：远端 ${latest.version} / 本机 $local" +
+                                if (base.latestVersion != null) "（清掉了旧结论 ${base.latestVersion}）" else "",
                         )
                     }
                 }

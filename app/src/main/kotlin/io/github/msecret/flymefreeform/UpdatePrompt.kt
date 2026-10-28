@@ -14,7 +14,8 @@ import android.widget.LinearLayout
  * ⚠️ **手动点「检查更新」那条路不经过这里**：那条路查到新版本会直接弹更新日志
  * （`Changelog.show`，对话框里自带 GitHub / 网盘两颗下载按钮）。2026-10-10 之前
  * 「检查更新」那一行还兼职做下载入口（`pickDownload`），现在那行**只负责检查**，
- * 所以 `pickDownload` 只剩 [show] 的「前往下载」这一个调用点了（见 `AboutActivity.updateRow`）。
+ * `pickDownload` 只剩下 [show] 里「没有缓存时」这一条兜底调用了（2026-10-28 起
+ * 有缓存时改走更新日志，见 [show]）。
  *
  * ## 为什么「前往下载」不是直接开浏览器
  *
@@ -28,15 +29,45 @@ object UpdatePrompt {
      *
      * [version] 是远端最新版号，[localVersion] 是本机装的版本 —— 两个都写进正文，用户才知道
      * 自己是「从几升到几」。
+     *
+     * ## 「前往下载」为什么改成了「查看更新日志」（2026-10-28）
+     *
+     * 以前这里点下去只弹 [pickDownload] 那两行下载路线，**全程看不到改了什么** —— 而同一件事
+     * 走「手动检查更新」是有更新日志的（`AboutActivity.checkForUpdate` → `Changelog.show`），
+     * 于是两条路对不上（用户反馈：「检查到更新没显示日志」）。
+     *
+     * 现在优先弹 `Changelog.show`：它自己带 GitHub / 网盘两颗下载按钮，
+     * **下载一步都没多变**，只是中间先给用户看改了什么。
+     *
+     * 拿不到缓存（进程刚重启、或这次是「手动检查」发现的）就退回原来的 [pickDownload] ——
+     * 不为了看一眼日志专门再发一次 GitHub 请求（未认证每小时只有 60 次额度）。
      */
     fun show(activity: Activity, version: String, localVersion: String) {
+        val newer = UpdateCenter.lastReleases.filter { UpdateChecker.isNewer(it.version, localVersion) }
         AppDialog.show(
             activity = activity,
             title = "发现新版本 $version",
             message = "当前版本 $localVersion。\n\n要现在去看看吗？",
-            positiveText = "前往下载",
+            positiveText = if (newer.isEmpty()) "前往下载" else "查看更新日志",
             negativeText = "以后再说",
-        ) { pickDownload(activity) }
+        ) {
+            if (newer.isEmpty()) {
+                DebugLog.info("UPDATE_PROMPT_DOWNLOAD", "没有缓存的 release 列表，直接进下载选择")
+                pickDownload(activity)
+            } else {
+                DebugLog.info(
+                    "UPDATE_PROMPT_CHANGELOG",
+                    "自动提示 → 更新日志，列出 ${newer.size} 个版本（${newer.joinToString(",") { it.version }}）",
+                )
+                Changelog.show(
+                    activity = activity,
+                    title = "发现新版本 $version",
+                    releases = newer,
+                    githubUrl = UpdateCenter.state.downloadUrl ?: newer.first().url,
+                    quarkUrl = UpdateChecker.QUARK_URL,
+                )
+            }
+        }
     }
 
     /**

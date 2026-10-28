@@ -1891,10 +1891,30 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     }
 
     /**
+     * 每一次「角落透传」回放的代号，**按边分开**记（见 [dispatchPassThrough]）。
+     *
+     * 为什么必须按边分开：左右两角的触摸条可以同时在回放。用**一个**全局代号的话，
+     * 左边新起一次回放就会把右边那次还在等着的「解除让位」判成过期 ⇒ 右边永久停在
+     * `FLAG_NOT_TOUCHABLE`，那个角从此点不动（只能重启服务，正是本文件最怕的状态）。
+     */
+    private val passThroughGeneration = HashMap<CornerSide, Long>()
+
+    /**
      * 把一次「触摸条吃掉的输入」还回下层的公共流程：**先让开触摸条，再注入**。
      *
      * 两条调用方（点击 / 滑动）只有注入内容不同，让位、兜底超时、失败提示完全一样，
      * 所以都走这里 —— 免得哪天只修了一条，另一条又漏掉让位而变成「注入被自己吃掉」。
+     *
+     * ★★★ 2026-10-28 修：**兜底定时器必须能被作废**。
+     *
+     * 原来正常路径（`onFinished` 回调 → [releaseTapThrough]）走完之后，那条
+     * 「[TAP_THROUGH_TIMEOUT_MS] 后兜底解除」的定时器**仍然留在队列里**。它会在
+     * **下一次**回放进行中到点，把这一次的「不可触摸」提前解除 ⇒ 注入的事件被自己的
+     * 触摸条吃掉（或直接漏成一次递归）。[releaseTapThrough] 里那句
+     * `if (!view.passthroughInFlight) return` 挡不住 —— 那一刻它恰好是 true。
+     *
+     * 所以每次回放领一个**代号**，所有「解除让位」的闭包（正常回调 / 兜底超时）都必须先
+     * 比对代号，过期的一律不动手。
      *
      * @param submit 真正注入；返回 false 表示无障碍没连上 / 拒绝了这次手势。
      */
@@ -1911,19 +1931,23 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         }
         setTriggerTouchable(side, false)
         view?.passthroughInFlight = true
+        val generation = (passThroughGeneration[side] ?: 0L) + 1
+        passThroughGeneration[side] = generation
+        // 只有「还是这一次回放」才允许解除让位；过期的那一刀什么都不做。
+        val release = { if (passThroughGeneration[side] == generation) releaseTapThrough(side) }
         // 等窗口属性真正生效（约两帧）再注入，否则注入的事件仍会命中还没让开的触摸条。
         handler.postDelayed({
-            val submitted = submit { handler.post { releaseTapThrough(side) } }
+            val submitted = submit { handler.post { release() } }
             if (submitted) {
                 DebugLog.info(logCode, detail)
                 // 兜底：回调万一不来，也不能让触摸条一直处于不可触摸状态。
-                handler.postDelayed({ releaseTapThrough(side) }, TAP_THROUGH_TIMEOUT_MS)
+                handler.postDelayed({ release() }, TAP_THROUGH_TIMEOUT_MS)
             } else {
                 DebugLog.warn(
                     "CORNER_TAP_THROUGH_UNAVAILABLE",
                     "无障碍服务未连接或拒绝了注入；可在设置里关闭「角落点击透传」或开启无障碍",
                 )
-                releaseTapThrough(side)
+                release()
             }
         }, TAP_THROUGH_HANDOFF_MS)
     }

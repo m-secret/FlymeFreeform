@@ -1,9 +1,8 @@
 package io.github.msecret.flymefreeform
 
 import android.util.Log
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -18,7 +17,14 @@ object DebugLog {
 
     private val entries = ArrayDeque<String>()
     private val listeners = CopyOnWriteArrayList<(List<String>) -> Unit>()
-    private val formatter = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    /**
+     * 时间格式器。**必须是不可变实现** —— `append()` 会被主线程、`close-shell`、
+     * `caption-*`、`pool-*` 多线程同时调用，而 `SimpleDateFormat` 不是线程安全的：
+     * 早期版本用它在并发下会打出串行的时间戳甚至抛 `ArrayIndexOutOfBoundsException`。
+     * `java.time.DateTimeFormatter` 是不可变的，直接多线程共用。
+     */
+    private val formatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
 
     /** 日志总开关。关闭时 info/warn/error 都不记录（也不写 logcat）。 */
     @Volatile
@@ -65,7 +71,7 @@ object DebugLog {
         }
         val line =
             buildString {
-                append(formatter.format(Date()))
+                append(LocalTime.now().format(formatter))
                 append(' ')
                 append(code)
                 if (!detail.isNullOrBlank()) {

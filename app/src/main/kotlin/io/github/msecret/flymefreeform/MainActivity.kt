@@ -253,6 +253,23 @@ class MainActivity : Activity() {
         announceUpdateIfNeeded()
     }
 
+    /**
+     * 拿到窗口焦点后**补弹**「发现新版本」提示框。
+     *
+     * ★★ 这是 2026-10-28 补的，缺它时提示框会**永久丢失**：
+     * [announceUpdateIfNeeded] 要求 `hasWindowFocus()`，而生命周期里 **`onResume` 时窗口还没拿到焦点**
+     * （焦点在 `onResume` 之后由 `ViewRootImpl` 授予，随后才回调 `onWindowFocusChanged(true)`）。
+     * 于是「结果在后台回来 ⇒ `onResume` 补弹」这条路每次都被焦点判据挡掉，而真正拿到焦点时
+     * 又没有任何回调再叫它一次 —— 自动检查的提示框只在「结果恰好落在有焦点的那一瞬」才会出现，
+     * 其余情况一律静默（入口行仍亮着「发现新版本 x」，用户却从没被提示过）。
+     *
+     * 只在 `hasFocus = true` 那一拍调：失去焦点（下拉通知栏、弹窗、切走）时不该弹。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) announceUpdateIfNeeded()
+    }
+
     override fun onDestroy() {
         FreeformAccessibilityService.removeConnectionListener(a11yConnectionListener)
         ServiceEvents.removeListener(serviceStateListener)

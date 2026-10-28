@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.Toast
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -119,10 +120,33 @@ object UpdateChecker {
      *
      * 回调前**不检查**调用方还活着没有——调用方（Activity）自己判断 `isFinishing`／
      * `isDestroyed` 再决定要不要碰 View，这里管不着。
+     *
+     * @param from 调用来源的短标签（`auto` / `manual` / `changelog`）。**只进日志**，用来回答
+     *   「到底是哪条路在查/哪条路失败了」—— 三个入口共用这一个函数，不打来源就分不清谁是谁。
+     *
+     * ## 日志
+     *
+     * 2026-10-28 之前这里**一条日志都没有**：检查更新失败时日志里是空的，只能看到界面上
+     * 那句「检查失败，请检查网络后重试」，分不出是超时、403 限流、404 没发布、还是 DNS 挂了。
+     * 现在三条线固定打：[UPDATE_START]（发请求前）、[UPDATE_OK]（含耗时/条数/最新版号）、
+     * [UPDATE_FAIL]（含耗时 + 异常类名与 message，由 `DebugLog` 自动附上）。
      */
-    fun check(onResult: (Result<List<Release>>) -> Unit) {
+    fun check(from: String = "?", onResult: (Result<List<Release>>) -> Unit) {
         worker.execute {
+            val startedAt = SystemClock.elapsedRealtime()
+            DebugLog.info("UPDATE_START", "来源=$from")
             val outcome = runCatching { fetchReleases() }
+            val cost = SystemClock.elapsedRealtime() - startedAt
+            outcome
+                .onSuccess { releases ->
+                    DebugLog.info(
+                        "UPDATE_OK",
+                        "来源=$from 耗时=${cost}ms 条数=${releases.size} 最新=${releases.first().version}",
+                    )
+                }
+                .onFailure { error ->
+                    DebugLog.warn("UPDATE_FAIL", "来源=$from 耗时=${cost}ms", error)
+                }
             mainHandler.post { onResult(outcome) }
         }
     }
@@ -181,6 +205,12 @@ object UpdateChecker {
             }
         try {
             val code = connection.responseCode
+            // 把状态码与限流额度一起记下来：403 既可能是限流也可能是别的拦截，
+            // 而 `X-RateLimit-Remaining` 能一眼区分（剩 0 = 真限流，还剩几十 = 另有原因）。
+            DebugLog.info(
+                "UPDATE_HTTP",
+                "code=$code 限流剩余=${connection.getHeaderField("X-RateLimit-Remaining") ?: "?"}",
+            )
             if (code == HttpURLConnection.HTTP_NOT_FOUND) throw NoReleaseException()
             if (code == HttpURLConnection.HTTP_FORBIDDEN) throw RateLimitException()
             if (code !in 200..299) throw IOException("HTTP $code")

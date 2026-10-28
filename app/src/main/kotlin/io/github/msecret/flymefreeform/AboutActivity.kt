@@ -117,6 +117,18 @@ class AboutActivity : Activity() {
         announceUpdateIfNeeded()
     }
 
+    /**
+     * 拿到窗口焦点后**补弹**提示框。与 `MainActivity` 里那份同理（见那边的长注释）：
+     * `onResume` 时窗口还没拿到焦点，只靠它补弹会被 `hasWindowFocus()` 判据全部挡掉。
+     *
+     * ⚠️ 本页的 `announceUpdateIfNeeded` 还多一道 `pendingAnnounce` —— 弹过一次就清掉了，
+     * 所以焦点反复变化（弹窗开关、下拉通知栏）不会重复弹。
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) announceUpdateIfNeeded()
+    }
+
     override fun onDestroy() {
         UpdateCenter.removeListener(updateListener)
         super.onDestroy()
@@ -370,7 +382,10 @@ class AboutActivity : Activity() {
         // 「正在检查…」只是中间态：只换那行文字，**不动**「已知有没有新版本」那份结论
         //（先清掉再写回来，设置页那个入口行会跟着闪一下，且失败时会把已知版本白白丢掉）。
         setDetailText("正在检查…", Ui.COLOR_ON_SURFACE_VARIANT, checkedAt = now)
-        UpdateChecker.check { outcome ->
+        // ★ 手动检查以前**一条日志都没有**（2026-10-28）：查到新版、没新版、失败，日志全是空的，
+        // 只有界面文字变了。用户说「点了检查更新没反应」时根本分不清走到了哪一步。
+        DebugLog.info("UPDATE_MANUAL_START", "手动检查更新")
+        UpdateChecker.check("manual") { outcome ->
             // 页面可能在请求飞在半路时就被关掉了，这时别再碰 View。
             if (isFinishing || isDestroyed) return@check
             checking = false
@@ -396,18 +411,27 @@ class AboutActivity : Activity() {
                             githubUrl = latest.url,
                             quarkUrl = UpdateChecker.QUARK_URL,
                         )
+                        DebugLog.info(
+                            "UPDATE_MANUAL_NEW",
+                            "发现 ${latest.version}（本机 $local），已弹更新日志，列出 " +
+                                "${releases.count { UpdateChecker.isNewer(it.version, local) }} 个版本",
+                        )
                     } else {
                         // 本地比远端还新也走这里（比如自己编的包），说法统一成「已是最新」。
                         // ★ `latest = null` 会**把旧结论清掉** —— 否则会出现「已是最新版本 1.1.7」
                         // 但状态里还攥着 1.1.6 那份下载地址、入口行还亮着「发现新版本 1.1.6」的怪状态。
                         // ⚠️ 这里**不弹任何东西**（理由见 [updateRow] 的注释）。
                         concludeCheck("已是最新版本 $local", Ui.COLOR_ACCENT, latest = null, checkedAt = now)
+                        DebugLog.info("UPDATE_MANUAL_LATEST", "已是最新：远端 ${latest.version} / 本机 $local")
                     }
                 }
                 // 失败**保留**上一次的结论：这次没拿到任何新信息，把已知的那份抹掉只会更糟
                 //（网络抖一下，用户就以为「没有新版本」了）。想知道具体原因，状态文字里已经写着。
                 .onFailure { error ->
-                    setDetailText(updateFailureText(error), Ui.COLOR_DANGER, checkedAt = now)
+                    val text = updateFailureText(error)
+                    setDetailText(text, Ui.COLOR_DANGER, checkedAt = now)
+                    // 日志里记**界面上那句话**，这样用户报「显示检查失败」时能直接从日志对上是哪种失败。
+                    DebugLog.warn("UPDATE_MANUAL_FAIL", "界面提示=$text", error)
                 }
         }
     }
@@ -502,10 +526,15 @@ class AboutActivity : Activity() {
      * 慢或失败时下面本来就有对应的 Toast / 对话框兜底，等待本身不需要回执。
      */
     private fun loadChangelog(mineOnly: Boolean) {
-        if (loadingChangelog) return
+        if (loadingChangelog) {
+            // 连点两下第二下会被这里挡掉，以前是静默的 —— 看起来就像「点了没反应」（2026-10-28）。
+            DebugLog.info("CHANGELOG_SKIP", "上一次拉取还没回来")
+            return
+        }
         loadingChangelog = true
         val local = UpdateChecker.installedVersionName(this)
-        UpdateChecker.check { outcome ->
+        DebugLog.info("CHANGELOG_START", "mineOnly=$mineOnly 本机=$local")
+        UpdateChecker.check("changelog") { outcome ->
             if (isFinishing || isDestroyed) return@check
             loadingChangelog = false
             outcome
@@ -518,11 +547,18 @@ class AboutActivity : Activity() {
                             githubUrl = null,
                             quarkUrl = null,
                         )
+                        DebugLog.info("CHANGELOG_OK", "弹全部日志，共 ${releases.size} 个版本")
                         return@onSuccess
                     }
                     val mine = releases.firstOrNull { it.version == local }
                     if (mine == null) {
                         Toast.makeText(this, "发布记录里没有 $local 这一版", Toast.LENGTH_SHORT).show()
+                        // 这条最容易让人以为是 bug（「日志里没有我这一版」），必须留痕，
+                        // 顺带把远端都有哪些版本记下来，好判断是「包比 release 新」还是解析漏了。
+                        DebugLog.warn(
+                            "CHANGELOG_NO_LOCAL",
+                            "发布记录里没有 $local；远端=${releases.joinToString(",") { it.version }}",
+                        )
                         return@onSuccess
                     }
                     Changelog.show(
@@ -532,9 +568,12 @@ class AboutActivity : Activity() {
                         githubUrl = null,
                         quarkUrl = null,
                     )
+                    DebugLog.info("CHANGELOG_OK", "弹本版本 $local 的日志")
                 }
                 .onFailure { error ->
-                    Toast.makeText(this, updateFailureText(error), Toast.LENGTH_SHORT).show()
+                    val text = updateFailureText(error)
+                    Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+                    DebugLog.warn("CHANGELOG_FAIL", "界面提示=$text", error)
                 }
         }
     }
