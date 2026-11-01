@@ -699,6 +699,9 @@ class MainActivity : Activity() {
                     store.hideFromRecents,
                 ) { checked ->
                     store.hideFromRecents = checked
+                    // 点了就要立刻生效：这一刻**不会**再走 onResume（开关就在当前页上），
+                    // 而用户完全可能马上上滑去看卡片在不在（见 [AppContext.applyRecentsExclusion]）。
+                    AppContext.applyRecentsExclusion(this)
                 },
             ),
         )
@@ -1022,12 +1025,17 @@ class MainActivity : Activity() {
      * 3. **窗内小横条关闭**的常驻监听（[CaptionTapClose]）挂在服务上：服务被重启的话它自己会
      *    重读，没重启（比如恢复后 `enabled=false`）就得靠这一句。
      * 4. **日志开关**是进程内的静态量（[DebugLog.enabled]），它不跟着 prefs 走。
+     * 5. **「后台隐藏」的标志**打在 task 上（[AppContext.applyRecentsExclusion]），同样不跟着
+     *    prefs 走 —— 而且恢复完页面**不会**重新 `onResume`，必须在这里补一次。
      */
     private fun syncRuntimeAfterRestore() {
         DebugLog.enabled = store.debugLogEnabled
         CaptionTapClose.sync(this)
         FreeformAccessibilityService.refreshIfRunning()
         restartServiceForRestoredSettings()
+        // ★ 5. 「后台隐藏」也是运行态：标志打在 task 上，不随 prefs 变。恢复完必须按新值
+        // 重打一遍，否则「备份里是关的、本机原本开着」这种情况，卡片会一直躲着（见 [AppContext]）。
+        AppContext.applyRecentsExclusion(this)
     }
 
     /**

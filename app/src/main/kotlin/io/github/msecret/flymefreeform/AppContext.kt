@@ -1,6 +1,7 @@
 package io.github.msecret.flymefreeform
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
@@ -15,7 +16,7 @@ import android.os.SystemClock
  * 于是在进程最早能拿到 Context 的地方（[BootReceiver] / [OverlayGestureService] /
  * [MainActivity]）记一份 applicationContext，之后按需取。
  *
- * 另附一个「后台隐藏」的共享入口，见 [hideFromRecentsOnLeave]。
+ * 另附「后台隐藏」的两个入口，见 [applyRecentsExclusion]（主）与 [hideFromRecentsOnLeave]（兜底）。
  */
 object AppContext {
     @Volatile
@@ -26,11 +27,61 @@ object AppContext {
         if (app != null) value = app
     }
 
+    // ---- 「后台隐藏」 ----
+
     /**
-     * 「后台隐藏」：在 Activity 的 `onUserLeaveHint()` 里调这一句。
+     * 「后台隐藏」的**主机制**：让本应用的 task 干脆不进「最近任务」列表。
+     *
+     * 做法只有一句：`AppTask.setExcludeFromRecents(true)`，开关关掉时传 `false` 清回来
+     * （**必须清**，否则那个 task 会一直躲着，用户把开关关了还找不到）。
+     * 在 `Application.ActivityLifecycleCallbacks.onActivityResumed` 里每页调一次
+     * （见 [FlymeApp]），另在「设置页那个开关被点」和「恢复备份之后」各补一次，
+     * 因为那两种时刻**不会**重新走 `onResume`。
+     *
+     * ## 为什么从 `onUserLeaveHint` + `finishAndRemoveTask()` 改成这个
+     *
+     * 旧实现是「用户主动离开时把整个 task 结束掉」。它在「上滑回桌面」这条路上是有效的，
+     * 但用户 2026-11-01 报的这条路它**完全不触发**：
+     * 「进后台手势时上滑然后**停顿**」—— 停顿那一下进的是 quickstep 的「最近任务总览」，
+     * 应用是被总览**接过去**的，并没有真的「离开」；`onUserLeaveHint()` 整个不回调
+     * （它只在真正离开时来），于是 `finishAndRemoveTask()` 一次都没跑，卡片就留在列表里，
+     * 回桌面再上滑还能看见。
+     *
+     * 所以这里换成**和「什么时候离开」完全解耦**的判据：不看用户怎么走，只看「这个 task
+     * 该不该出现在列表里」。用户对比的 GKD 用的就是这一句 —— 它 `MainActivity` 里
+     * `settings.mapState { excludeFromRecents }.collect { app.activityManager.appTasks.forEach { task ->
+     * task.setExcludeFromRecents(it) } }`，别的什么都没做（2026-11-01 读的 `gkd-kit/gkd` main）。
+     *
+     * ## ★ 更正一条旧结论（2026-10-28 那版判错了）
+     *
+     * 旧注释写着「`AppTask.setExcludeFromRecents()` 实测无效」，**那个判断是错的**，
+     * 错的根源是拿错了证据：当时看的是 `dumpsys activity recents` 里的 `Recent #N`，
+     * 而那一节列的是**系统里所有 task**，被排除的 task 一样在里面（只多一个
+     * `isExcluded=true`）。真机复核（PMX110 / ColorOS 17 / Android 16，2026-11-01）：
+     * GKD 的 task 就在那份列表里、`isExcluded=true`，而它的卡片在「最近任务」里就是不出现。
+     *
+     * 这个 API 的真实语义是「**列表构建时要不要收这个 task**」，不是「把已经在列表里的摘掉」。
+     * 所以它对**之后**每一次构建都生效 —— 上滑停顿那一下抬不起头，但用户从总览回桌面、
+     * 再上滑重新构建列表时，卡片就不在了。要做到「看一眼总览就没有」得靠 `excludeFromRecents`
+     * 静态声明（编译期写死、用户关不掉），那与本开关的语义冲突，不做。
+     */
+    fun applyRecentsExclusion(context: Context) {
+        val hide = SettingsStore(context).hideFromRecents
+        val manager = context.getSystemService(ActivityManager::class.java) ?: return
+        // 拿不到 task 列表（进程刚起、系统还没登记）就什么也不做：下一次 onResume 还会再来。
+        // 整段都不许抛：这是挂 `onActivityResumed` 上的，抛出去就是「一开页就闪退」。
+        runCatching { manager.appTasks }.getOrNull()?.forEach { task ->
+            runCatching { task.setExcludeFromRecents(hide) }
+        }
+    }
+
+    /**
+     * 「后台隐藏」的**兜底**：在 Activity 的 `onUserLeaveHint()` 里调这一句。
      *
      * 用户**主动离开**应用时（按 Home、切到别的应用），把整个 task 结束掉，一并从系统的
-     * 「最近任务」里摘除。
+     * 「最近任务」里摘除。主机制已经是 [applyRecentsExclusion]（打标志），这一条留着是因为
+     * 它**更快**：`onUserLeaveHint` 在回桌面那段动画之前就到，卡片连一帧都不会露；
+     * 而且万一某台机器不认那个标志，这条还能把 task 直接干掉。
      *
      * ## 为什么是「每个 Activity 各挂一行」而不是一处集中
      *
@@ -39,20 +90,6 @@ object AppContext {
      * 所以只能挂在各 Activity 的 `onUserLeaveHint()` 上。而「主动离开」可能发生在**任何一个**
      * 界面上（主设置页、主动呼出、小窗关闭方式、应用管理、日志……），少挂一个就会出现
      * 「在那个页面按 Home 就没隐藏」。
-     *
-     * ## 为什么不用 `AppTask.setExcludeFromRecents()`
-     *
-     * 第一版用的就是它（API 30+，看着最对症），真机实测（PMX110 / ColorOS 17 / Android 16）
-     * **不生效**，证据很明确：
-     * - 它**只生效了一半**——`dumpsys activity recents` 里能看到 task 的 baseIntent 变成了
-     *   `flg=0x10800000`（含 `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`），而 `am start` 自己只会给
-     *   `0x10000000`，那个标志确实是我们的代码写上去的；
-     * - 但 **task 依旧留在最近任务列表里**（按 Home 退到后台后仍在 `Recent #1`）。
-     *
-     * 原因是 AOSP 的 `RecentTasks` 只在 **task 首次加入列表那一刻**看这个标志；而应用代码最早
-     * 也只能跑到 `onCreate`／`onResume`，那时 task 早就进去了。之后再调
-     * `setExcludeFromRecents` **只改字段，不会把已在列表里的 task 移除**。所以这条路在「本次
-     * 开机、本次 task 生命周期」内兑现不了，只能改为主动移除。
      *
      * ## 为什么用 `onUserLeaveHint` 而不是 `onStop`
      *

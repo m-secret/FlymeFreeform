@@ -1264,16 +1264,27 @@ class SettingsStore(context: Context) {
     /**
      * 「后台隐藏」：开启后本应用不出现在系统「最近任务」（Recents）里。
      *
-     * 默认关闭。生效方式是**用户主动离开应用时把整个 task 结束并移除**（见 [AppContext]，
-     * 挂在 Application 的 `onActivityUserLeaveHint` 上）。
+     * 默认关闭。生效方式有两条，都见 [AppContext]：
+     * - **主**：`AppTask.setExcludeFromRecents()`，每页 `onResume` 对齐一次（[FlymeApp] 里挂的
+     *   `ActivityLifecycleCallbacks`）。这是 GKD 的同款做法。
+     * - **兜底**：用户主动离开时 `finishAndRemoveTask()`（各 Activity 的 `onUserLeaveHint`）。
      *
-     * 这里有两个走过弯路的方案，都别再退回去：
+     * ## 别再退回去的两条
+     *
      * - manifest 里的静态 `android:excludeFromRecents`：编译期写死，一旦加上就永远隐藏，
      *   用户没法随手关掉，不符合「开关」的语义。
-     * - `ActivityManager.AppTask.setExcludeFromRecents()`：**看着最对症但实测无效**。
-     *   真机（PMX110 / ColorOS 17 / Android 16）上它只把标志写进 task 的 baseIntent
-     *   （`dumpsys activity recents` 能看到 `flg=0x10800000`），**并不会把已经在「最近任务」
-     *   列表里的 task 移除**——AOSP 的 `RecentTasks` 只在 task 首次入列时看这个标志。
+     * - **只**靠 `finishAndRemoveTask()`（2026-10-28 ~ 11-01 的那版）：对「上滑回桌面」有效，
+     *   但「上滑**停顿**进最近任务总览」那条路 `onUserLeaveHint` 整个不回调，卡片照旧留在列表里
+     *   （用户 2026-11-01 报的就是这个）。
+     *
+     * ## ★ 更正：`setExcludeFromRecents()` 不是「无效」
+     *
+     * 旧注释写它「实测无效」，其实是**拿错了证据**：当时看的是 `dumpsys activity recents` 的
+     * `Recent #N`，而那一节列的是系统里所有 task，被排除的 task 也在里面（只是多一个
+     * `isExcluded=true`）。真机复核（PMX110 / ColorOS 17 / Android 16，2026-11-01）：
+     * GKD 的 task 就在那份列表里、`isExcluded=true`，而它的卡片在「最近任务」里就是不出现。
+     * 这个 API 的语义是「**列表构建时要不要收这个 task**」——对已构建好的那次列表无效，
+     * 对之后每一次构建都有效。细节见 [AppContext.applyRecentsExclusion]。
      */
     var hideFromRecents: Boolean
         get() = preferences.getBoolean(KEY_HIDE_FROM_RECENTS, false)
