@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「游戏应用」页底栏第一格：清单（Material Symbols 的 list），24dp 网格。
+  这一格是「还没算游戏的应用」，用清单而不是勾，才和右边那格区分得开。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M3,9h2V7H3v2zM3,13h2v-2H3v2zM3,17h2v-2H3v2zM7,9h14V7H7v2zM7,13h14v-2H7v2zM7,17h14v-2H7v2z" />
+</vector>

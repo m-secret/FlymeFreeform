@@ -36,7 +36,7 @@ import java.util.concurrent.Executors
  * | tab | 放什么 |
  * | --- | --- |
  * | **首页** | 一张「前提检查表」：运行环境 + 权限三行 → 缺项提示 → `[启动主动呼出]` |
- * | **功能** | 分三节：呼出与触感（主动呼出与轮盘 / 更多面板 / 触感）、应用与图标（管理应用 / 图标）、小窗（小窗尺寸 / 小窗关闭方式） |
+ * | **功能** | 分三节：呼出与触感（主动呼出与轮盘 / 更多面板 / 触感 / 游戏设置）、应用与图标（管理应用 / 图标）、小窗（小窗尺寸 / 小窗关闭方式） |
  * | **设置** | 「常规」（后台隐藏）/「备份与恢复」/「调试」（运行日志）/「关于」（一行入口 → [AboutActivity]）四节 |
  *
  * ## 区块标题：只有「功能」「设置」两格有
@@ -557,7 +557,12 @@ class MainActivity : Activity() {
                         openPage(Intent(this, DrawerSettingsActivity::class.java))
                     },
                 )
-                .row(hapticRow),
+                .row(hapticRow)
+                .row(
+                    Ui.entryRow(this, "游戏设置", "关闭主动呼出 / 窗外点击") {
+                        openPage(Intent(this, GameSettingsActivity::class.java))
+                    },
+                ),
         )
         // 「呼出」这一块的**按系统分家**提醒（空串就不加这一行，见 [SystemSupport.overlayGestureNote]）。
         SystemSupport.overlayGestureNote(this).takeIf { it.isNotEmpty() }?.let { note ->

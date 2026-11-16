@@ -59,6 +59,9 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private val settingsStore: SettingsStore by lazy { SettingsStore(this) }
 
+    /** [GameGuard] 状态变了 → 重排遮罩（「关闭窗外点击」靠它进出游戏）。挪一拍再刷新。 */
+    private val gameForegroundChanged: () -> Unit = { handler.post { safeRefresh() } }
+
     /**
      * 学「小横条真实坐标」用的线程。
      *
@@ -312,6 +315,10 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 第一次布局交给消息队列：`refresh()` 要查窗口（IPC），占着 `onServiceConnected`
         // 会拖长连接过程，卡太久同样会被系统当成无响应。
         handler.post { safeRefresh() }
+        // 先挂监听再当场认一次：用户可能先进游戏、无障碍之后才连上。
+        GameGuard.removeListener(gameForegroundChanged)
+        GameGuard.addListener(gameForegroundChanged)
+        handler.post { runCatching { GameGuard.onAccessibilityConnected(this) } }
         // 设置页正等着这个信号（见 [addConnectionListener]）：**连上就当场刷新**，
         // 不用靠时间窗口去轮询猜。放在最后调：这时 `instance` 和遮罩都已经就位。
         notifyConnectionChanged()
@@ -383,6 +390,14 @@ class FreeformAccessibilityService : AccessibilityService() {
     private var lastForegroundPackage: String? = null
 
     /**
+     * 最近一次窗口扫描看到的应用窗口包名（[observeLayout] 顺手收，不额外跑 [packageOf] 的 IPC）。
+     *
+     * 「关闭窗外点击」要靠它判游戏：小窗压在全屏游戏上时**焦点在小窗里那个应用**，
+     * 前台包名不是游戏，只看 [GameGuard.inGame] 永远让不开。
+     */
+    private val screenOwners = HashSet<String>()
+
+    /**
      * 顺手记一笔「前台换成了谁」，供「更多」面板的「最近使用」用（见 [RecentUsage]）。
      *
      * 这是「读系统最近使用」的**免权限**那一路：本服务一直在跑，前台包名变化本身就等于
@@ -396,7 +411,10 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     private fun rememberForeground(event: AccessibilityEvent) {
         val packageName = event.packageName?.toString().orEmpty()
-        if (packageName.isEmpty() || packageName == lastForegroundPackage) return
+        if (packageName.isEmpty()) return
+        // ★ 必须在去重之前：下面那条去重只服务于「最近使用」写盘，不能把游戏判据的输入掐掉。
+        GameGuard.onForeground(this, packageName)
+        if (packageName == lastForegroundPackage) return
         lastForegroundPackage = packageName
         runCatching { RecentUsage.noteForeground(this, settingsStore, packageName) }
             .onFailure { DebugLog.warn("RECENT_FOREGROUND_FAILED", packageName, it) }
@@ -431,6 +449,9 @@ class FreeformAccessibilityService : AccessibilityService() {
      */
     override fun onDestroy() {
         destroyed = true
+        // 判据没了就放行，否则触摸条会永久停在收起状态。
+        runCatching { GameGuard.onAccessibilityDisconnected() }
+        runCatching { GameGuard.removeListener(gameForegroundChanged) }
         runCatching {
             handler.removeCallbacksAndMessages(null)
             closeHandler.removeCallbacksAndMessages(null)
@@ -450,6 +471,9 @@ class FreeformAccessibilityService : AccessibilityService() {
             blocker?.detachAll()
             blocker = null
             removeCloseAnchorMarker()
+            // 同 [onDestroy]：ColorOS 摘权限这条路先走 onUnbind。
+            GameGuard.onAccessibilityDisconnected()
+            GameGuard.removeListener(gameForegroundChanged)
             DebugLog.info("A11Y_DISCONNECTED", "无障碍服务已断开")
             A11yTrace.append(this, "A11Y_DISCONNECTED 无障碍服务被断开（若紧接着系统把开关关了，就是被停用）")
         }.onFailure { DebugLog.error("A11Y_UNBIND_FAILED", null, it) }
@@ -582,6 +606,8 @@ class FreeformAccessibilityService : AccessibilityService() {
         }
         // 每次都探一遍窗口：标记需要它，校准后的关闭也需要最新的小窗边界。
         val layout = observeLayout()
+        // 屏上有谁一并交给 [GameGuard]：小窗压住游戏时触摸条与遮罩都要继续让开。
+        GameGuard.updateOnScreen(screenOwners)
         // **只看窗外关闭自己的开关**，不再要求主开关 [SettingsStore.enabled]（「主动呼出」）。
         //
         // 两者本来就是独立的功能：遮罩由**无障碍服务**铺，跟角落触摸条跑不跑没关系；关闭动作
@@ -594,7 +620,15 @@ class FreeformAccessibilityService : AccessibilityService() {
         // 所以只能整体撤下遮罩；面板撤下时 [OverlayGestureService.hideDrawer] 会主动催一次重排。
         // 不这么做的话，面板会变成「点哪儿都在点窗外」：每点一下就关掉一个本来就开着的小窗。
         val panelShown = OverlayGestureService.fullScreenSurfaceShown
-        val needMask = store.outsideTapCloseEnabled && !panelShown
+        // 「关闭窗外点击」：屏上一露头游戏就别铺遮罩。
+        // ⚠️ 必须带开关，只看 [GameGuard.inGame] 会让游戏里永远关不掉小窗。
+        // ⚠️ 也不能只看 `inGame`：小窗压在全屏游戏上时焦点在小窗里那个应用，前台包名不是游戏
+        //    ⇒ `inGame` 恒 false，开关等于没开（2026-11-16 用户报的就是这个）。所以只要
+        //    屏上还有游戏窗口（[GameGuard.gameOnScreen]）一律让开。
+        val gamePause =
+            store.pauseOutsideTapInGame &&
+                (GameGuard.inGame || GameGuard.gameOnScreen())
+        val needMask = store.outsideTapCloseEnabled && !panelShown && !gamePause
         val screen = screenBounds()
         val avoid = if (needMask) triggerBarRects(screen) else emptyList()
         // 「本该抠洞却一个都没抠出来」才是故障（小窗开着时角落会被遮罩盖住）。
@@ -607,7 +641,13 @@ class FreeformAccessibilityService : AccessibilityService() {
                     target.detachAll()
                     DebugLog.info(
                         "OUTSIDE_TAP_DISABLED",
-                        if (panelShown) "「更多」/识屏面板铺着，撤下遮罩" else "窗外关闭已关闭，撤下遮罩",
+                        when {
+                            gamePause && !GameGuard.inGame ->
+                                "游戏在屏上（小窗压着它）且开了「关闭窗外点击」，撤下遮罩"
+                            gamePause -> "游戏在前台且开了「关闭窗外点击」，撤下遮罩"
+                            panelShown -> "「更多」/识屏面板铺着，撤下遮罩"
+                            else -> "窗外关闭已关闭，撤下遮罩"
+                        },
                     )
                 }
             }
@@ -715,6 +755,7 @@ class FreeformAccessibilityService : AccessibilityService() {
     private fun observeLayout(): OutsideTapBlocker.Layout? {
         val windowList = runCatching { windows }.getOrNull()
         lastWindows = windowList.orEmpty()
+        screenOwners.clear()
         if (windowList == null) return null
         // TEMP-PROBE（取证用，验完删）：把无障碍看到的每一扇窗口打出来。
         // 小米小窗的形态必须实测 —— 它的装饰是 WM Shell 图层、不是独立窗口，
@@ -799,6 +840,9 @@ class FreeformAccessibilityService : AccessibilityService() {
             val owner = packageOf(window)
             val bounds = Rect().also { window.getBoundsInScreen(it) }
             if (bounds.isEmpty) continue
+            if (window.type == AccessibilityWindowInfo.TYPE_APPLICATION && owner != null) {
+                screenOwners += owner
+            }
             if (isKeyboardWindow(window.type, owner, imePackage)) keyboardBounds += Rect(bounds)
             if (window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
                 imeUnion = imeUnion?.also { it.union(bounds) } ?: Rect(bounds)

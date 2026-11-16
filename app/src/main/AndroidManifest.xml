@@ -87,6 +87,18 @@
             android:exported="false"
             android:label="主动呼出" />
 
+        <!-- 「哪些应用算游戏」名单（上百行应用，单独成页）。 -->
+        <activity
+            android:name=".GameAppsActivity"
+            android:exported="false"
+            android:label="游戏应用" />
+
+        <!-- 游戏设置（关闭主动呼出 / 关闭窗外点击），入口在「功能」tab。 -->
+        <activity
+            android:name=".GameSettingsActivity"
+            android:exported="false"
+            android:label="游戏设置" />
+
         <activity
             android:name=".OutsideTapSettingsActivity"
             android:exported="false"

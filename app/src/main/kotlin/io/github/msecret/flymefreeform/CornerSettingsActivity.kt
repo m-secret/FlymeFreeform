@@ -17,7 +17,7 @@ import android.widget.TextView
  * 「主动呼出与轮盘」二级设置页（Material 3 版面）。
  *
  * ⚠️ 页名 2026-10-09 去掉了「设置」二字（原「主动呼出与轮盘设置」）。理由是「功能」tab
- * 「呼出与触感」那一节里另外两行是「更多面板」「触感」，**都不带「设置」后缀**，只有它带；
+ * 「呼出与触感」那一节里另外几行是「游戏设置」「更多面板」「触感」，**都不带「设置」后缀**，只有它带；
  * 而且它本身就在设置里，后缀是废话。**入口行名与页内大标题要一致**，别只改一个。
  *
  * 从主设置页拆出来：主页面被授权、手势、窗外关闭、应用管理、日志等塞得太长，
@@ -36,6 +36,9 @@ import android.widget.TextView
  *
  * 「图标来源」那一组 2026-10-08 搬到了主界面「功能」tab 卡片上（见 `MainActivity` 的
  * `iconSourceButton`）：它管的是全局观感，不属于「呼出」这一套参数。
+ *
+ * 游戏那两条 2026-11-16 也搬到了 [GameSettingsActivity]（入口在「功能」tab）。
+ * ★ 这一页不要再放游戏开关或入口：两处都能改，状态就打架。
  */
 class CornerSettingsActivity : Activity() {
 
@@ -179,6 +182,7 @@ class CornerSettingsActivity : Activity() {
     private fun resetToDefaults() {
         resetTouchValues()
         resetMenuValues()
+        // 游戏那两条不在这页上了，所以不碰：「恢复默认」只对页面上看得见的东西负责。
         afterReset()
     }
 

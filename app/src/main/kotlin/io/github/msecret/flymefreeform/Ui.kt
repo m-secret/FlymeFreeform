@@ -15,10 +15,12 @@ import android.graphics.drawable.RippleDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -346,6 +348,9 @@ object Ui {
     /** 单张独立容器（搜索框、日志框）用 large（16dp）。 */
     const val RADIUS_ROW = SHAPE_LARGE
 
+    /** 触发左右滑动切页所需的最小横向位移（dp）。太小会和「点一下」抢。 */
+    const val SWIPE_MIN_DP = 56
+
     /** 组内行的左右内边距；分隔线也跟着它内缩，与文字左边缘对齐。 */
     const val ROW_PADDING_H = 16
 
@@ -442,7 +447,25 @@ object Ui {
      * 观感就是「组件没贴边」——用户直接否掉了。大屏要的是**用满**这块屏，不是把它裁成手机。
      */
     fun scrollPage(context: Context, content: View): ScrollView =
-        ScrollView(context).apply {
+        SwipeAwareScrollView(context, dp(context, SWIPE_MIN_DP), { null }) {}.apply {
+            setBackgroundColor(COLOR_SURFACE)
+            isFillViewport = true
+            addView(content)
+        }
+
+    /**
+     * 同 [scrollPage]，但认得**左右滑动**：横滑超 [SWIPE_MIN_DP] 就回调 `onSwipe(-1 / 1)`。
+     *
+     * 判定与手感的规矩全在 [SwipeAwareScrollView] 里（和主界面切 tab 同一套）。
+     * [ignoreTouchIn] 里的手势不参与判定——搜索框里横拖是在选字，不该被当成切页。
+     */
+    fun swipeScrollPage(
+        context: Context,
+        content: View,
+        ignoreTouchIn: View? = null,
+        onSwipe: (direction: Int) -> Unit,
+    ): ScrollView =
+        SwipeAwareScrollView(context, dp(context, SWIPE_MIN_DP), { ignoreTouchIn }, onSwipe).apply {
             setBackgroundColor(COLOR_SURFACE)
             isFillViewport = true
             addView(content)
@@ -975,6 +998,7 @@ object Ui {
             setOnClickListener { onClick() }
         }
 
+
     // ---- Slider ----
 
     /**
@@ -1500,6 +1524,11 @@ class TabStrip(
         }
     }
 
+    /** 改一格的文字（例如「未添加 93」里的数字）。高亮与图标不受影响。 */
+    fun setTitle(index: Int, title: String) {
+        labels.getOrNull(index)?.text = title
+    }
+
     /** 一格的背景：内容层 = 选中药丸（未选全透明），遮罩层 = 同一形状的不透明药丸。 */
     private fun tabBackground(active: Boolean): Drawable =
         RippleDrawable(
@@ -1612,7 +1641,7 @@ class TabStrip(
  *
  * ## 左右滑动切页
  *
- * 内容区上挂了一个**只认横向**的手势（见 [SwipeAwareScrollView]）：横向位移超过 [SWIPE_MIN_DP]
+ * 内容区上挂了一个**只认横向**的手势（见 [SwipeAwareScrollView]）：横向位移超过 [Ui.SWIPE_MIN_DP]
  * 且至少是纵向的 1.5 倍才切页，否则一律放给滚动。
  *
  * 判定用「拖动位移」而不是 fling 速度——**慢慢拖过去也该切页**，只认「甩」会让人觉得时灵时不灵。
@@ -1630,6 +1659,12 @@ class TabbedPage(
     private val tabStrip: TabStrip
     private val tabCount = tabs.size
     private var currentIndex = 0
+
+    /** 可滚动区本身：切页后要能回到顶部。 */
+    private var scroll: ScrollView? = null
+
+    /** 落在这里面的手势不参与切页（例如搜索框里横拖是在选字）。 */
+    var swipeIgnore: View? = null
 
     init {
         orientation = VERTICAL
@@ -1653,7 +1688,8 @@ class TabbedPage(
         val scroll =
             SwipeAwareScrollView(
                 context = context,
-                thresholdPx = Ui.dp(context, SWIPE_MIN_DP),
+                thresholdPx = Ui.dp(context, Ui.SWIPE_MIN_DP),
+                ignoreTouchIn = { swipeIgnore },
             ) { direction -> request(currentIndex + direction) }
                 .apply {
                     setBackgroundColor(Ui.COLOR_SURFACE)
@@ -1662,10 +1698,19 @@ class TabbedPage(
                     // 宽度铺满、不限宽（理由见 [Ui.scrollPage]）。
                     addView(content)
                 }
+        this.scroll = scroll
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
 
         tabStrip = TabStrip(context, tabs) { index -> request(index) }
         addView(tabStrip)
+    }
+
+    /** 改一格底栏的文字（例如带数字的「未添加 93」）。 */
+    fun setTabTitle(index: Int, title: String) = tabStrip.setTitle(index, title)
+
+    /** 内容回到顶部（同一个滚动区里换内容时用）。 */
+    fun scrollToTop() {
+        scroll?.scrollTo(0, 0)
     }
 
     /**
@@ -1679,11 +1724,6 @@ class TabbedPage(
         currentIndex = target
         tabStrip.select(target)
         onSelect(target)
-    }
-
-    private companion object {
-        /** 触发切页所需的最小横向位移（dp）。太小会和「点一下」抢。 */
-        const val SWIPE_MIN_DP = 56
     }
 }
 
@@ -1705,10 +1745,20 @@ class TabbedPage(
  *
  * 竖直方向的滚动完全不受影响：判定要求横向位移至少是纵向的 [SWIPE_RATIO] 倍，
  * 达不到就原样交给 [ScrollView] 处理。
+ *
+ * [ignoreTouchIn] 里的手势整条不判（搜索框：横拖是在选字），下手点落在它上面就放行。
+ *
+ * ## 上下拉到头时的回弹是**自己画的**
+ *
+ * 系统那套拉伸（`overScrollMode = always`）在真机上一次都没出现（ColorOS / HyperOS 都一样），
+ * 而内容不满一屏的页面（首页 / 功能）连「能不能拉」都看不出来——用户的原话是「不像设置那样
+ * 可以有上下拉动的动效」。所以这里在拉到头时把内容整体推开一小段（位移按 [RUBBER] 阻尼、
+ * 上限 [MAX_PULL_DP]），松手弹回。可滚动区间内完全不碰，滚动仍是系统原生行为。
  */
 private class SwipeAwareScrollView(
     context: Context,
     private val thresholdPx: Int,
+    private val ignoreTouchIn: () -> View? = { null },
     private val onSwipe: (direction: Int) -> Unit,
 ) : ScrollView(context) {
 
@@ -1718,16 +1768,117 @@ private class SwipeAwareScrollView(
     /** 这条手势已经被「抢」过来了：剩下的 MOVE / UP 都由本控件吃掉。 */
     private var hijacked = false
 
+    /** 下手点落在 [ignoreTouchIn] 上：整条手势都不判。 */
+    private var ignored = false
+
+    /** 上一次 MOVE 的 y：回弹按「每帧位移」累加，不按「起点位移」（否则从半屏外拖到顶会一口气弹开）。 */
+    private var lastY = 0f
+
+    /** 当前把内容推开了多少 px（正数 = 往下推开）。 */
+    private var pullOffset = 0f
+
+    /** 这一笔手势是不是已经拉出内容了。只有它才会拦住滚动。 */
+    private var pulling = false
+
+    /** 拉的方向：`1` 往下、`-1` 往上。整笔手势只认这个方向，掉头只收回、不反向推。 */
+    private var pullSign = 1
+
+    /** 推开的上限（px）。 */
+    private val maxPullPx = MAX_PULL_DP * resources.displayMetrics.density
+
+    /** 手指要走多远才算「在拉」而不是「在点」。 */
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+    /**
+     * 竖拉回弹。**放在 [dispatchTouchEvent] 里**：子 View（卡片行）会先把 DOWN 吃掉，
+     * `onTouchEvent` 拿不到 DOWN，`lastY` 就会沿用上一笔手势的坐标——第一帧位移大得离谱，
+     * 内容一下弹到上限或者干脆不动（「有时候识别不出来」就是这么来的）。
+     */
+    private fun handlePull(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastY = event.y
+                pulling = false
+                // 上一笔的回弹可能还在跑：接着当前位移拉，别一下跳回 0。
+                pullOffset = getChildAt(0)?.translationY ?: 0f
+                getChildAt(0)?.animate()?.cancel()
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val dy = event.y - lastY
+                lastY = event.y
+                if (!pulling) {
+                    // 用「相对按下点的累计位移」判定：手慢时每帧 dy 都可能小于 touchSlop，
+                    // 按单帧判会一直认不出（「有时候识别不出来」就是这么来的）。
+                    val total = event.y - downY
+                    if (abs(total) <= touchSlop) return false
+                    val atEdge =
+                        (total > 0 && !canScrollVertically(-1)) ||
+                            (total < 0 && !canScrollVertically(1))
+                    if (!atEdge) return false
+                    pulling = true
+                    pullSign = if (total > 0) 1 else -1
+                    // 下面的卡片 / ScrollView 都当成「这下手势作废」，否则松手会被当成点了一下。
+                    val cancel = MotionEvent.obtain(event)
+                    cancel.action = MotionEvent.ACTION_CANCEL
+                    super.dispatchTouchEvent(cancel)
+                    cancel.recycle()
+                }
+                // 掉头只把已经推开的量收回来，不往反方向推（要反拉得重新起手）。
+                val next = pullOffset + dy * rubber()
+                setPull(
+                    if (pullSign > 0) next.coerceIn(0f, maxPullPx) else next.coerceIn(-maxPullPx, 0f),
+                )
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (pulling) {
+                    pulling = false
+                    releasePull()
+                    // 吞掉 UP：子 View 早就收到 CANCEL 了，再放行只会多出一次「点击」。
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /** 越接近上限越推不动（不然能一直拉出一条空屏）。 */
+    private fun rubber(): Float =
+        RUBBER * (1f - abs(pullOffset) / maxPullPx).coerceIn(0f, 1f)
+
+    private fun setPull(offset: Float) {
+        pullOffset = offset
+        getChildAt(0)?.apply {
+            if (offset == 0f) animate().cancel()
+            translationY = offset
+        }
+    }
+
+    private fun releasePull() {
+        if (pullOffset == 0f) return
+        pullOffset = 0f
+        getChildAt(0)
+            ?.animate()
+            ?.translationY(0f)
+            ?.setDuration(SPRING_MS)
+            ?.setInterpolator(DecelerateInterpolator())
+            ?.start()
+    }
+
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
                 downY = event.y
                 hijacked = false
+                ignored = touchInIgnored(event.rawX, event.rawY)
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (!hijacked) {
+                // 已经在竖拉了就别再判横滑：拉出内容后手指横向一动，会顺带把页面切走。
+                if (!hijacked && !ignored && !pulling) {
                     val dx = event.x - downX
                     val dy = event.y - downY
                     if (abs(dx) >= thresholdPx && abs(dx) >= abs(dy) * SWIPE_RATIO) {
@@ -1745,12 +1896,35 @@ private class SwipeAwareScrollView(
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> hijacked = false
         }
+        // 竖拉：拦下来就别再让 ScrollView 跟着滚（到了头本来就滚不动）。
+        if (!hijacked && !ignored && handlePull(event)) return true
         return super.dispatchTouchEvent(event)
+    }
+
+    /** 下手点是不是落在 [ignoreTouchIn] 上（用屏幕坐标比，`rawX/rawY` 也是屏幕坐标）。 */
+    private fun touchInIgnored(rawX: Float, rawY: Float): Boolean {
+        val view = ignoreTouchIn() ?: return false
+        if (!view.isShown || view.width == 0) return false
+        val origin = IntArray(2)
+        view.getLocationOnScreen(origin)
+        return rawX >= origin[0] &&
+            rawX < origin[0] + view.width &&
+            rawY >= origin[1] &&
+            rawY < origin[1] + view.height
     }
 
     private companion object {
         /** 横向位移至少要达到纵向的这么多倍才认作「左右滑动」，否则就是在上下滚。 */
         const val SWIPE_RATIO = 1.5f
+
+        /** 手指走 1px，内容推开多少（阻尼）。 */
+        const val RUBBER = 0.4f
+
+        /** 推开量的上限（dp）：再拉多也只是这么一小段，不会把内容拖出屏幕。 */
+        const val MAX_PULL_DP = 68f
+
+        /** 松手回弹的时长（ms）。 */
+        const val SPRING_MS = 240L
     }
 }
 

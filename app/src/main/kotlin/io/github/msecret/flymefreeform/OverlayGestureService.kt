@@ -60,6 +60,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
     /** 上一次已知的「是不是横屏」，用来过滤同一方向上的重复回调（刷新率、亮度变化也会触发）。 */
     private var lastLandscape: Boolean = false
 
+    /** [GameGuard] 状态变了 → 重排触摸条。窗口只能在主线程动，所以再 post 一拍。 */
+    private val gameChanged: () -> Unit = { handler.post { syncTriggersForGame() } }
+
     /**
      * 屏幕方向变了（旋转，或横屏下上滑回竖屏桌面）时，把浮层按新屏幕重新摆一遍。
      *
@@ -398,6 +401,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 「窗内关闭」的常驻监听挂在**本服务**上（它是本应用唯一的常驻前台服务）。
         // 服务没跑时这个功能不生效，所以这里和 [applySettings] 各同步一次。
         CaptionTapClose.sync(this)
+        // 「关闭主动呼出」：前台判据由无障碍服务喂给 [GameGuard]，这里只接「变了」那一声。
+        GameGuard.addListener(gameChanged)
         // 「应用首字母分组」那套东西提前备好，**全在后台线程**：
         // 1. [AppDrawerPanel.preloadSectionLetters] 把上次算好的「标签 → 字母」读回内存；
         // 2. [AppDrawerPanel.warmSectionLetters] 把 ICU 音译器的一次性规则构建（真机实测
@@ -710,6 +715,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
 
     override fun onDestroy() {
         isRunning = false
+        // 先摘监听：GameGuard 是进程级单例，握着旧实例的回调就回收不掉。
+        GameGuard.removeListener(gameChanged)
         // 对称地喊一声：界面把按钮从「停止主动呼出」翻回「启动主动呼出」。
         ServiceEvents.notifyChanged()
         runningService = null
@@ -835,8 +842,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
             removeTriggers()
             return
         }
-        syncTrigger(CornerSide.Left, store.leftCornerEnabled)
-        syncTrigger(CornerSide.Right, store.rightCornerEnabled)
+        syncTrigger(CornerSide.Left, triggerWanted(CornerSide.Left))
+        syncTrigger(CornerSide.Right, triggerWanted(CornerSide.Right))
         // **几何参数（触摸条尺寸 / 位置 / 左右边缘预留）必须在这里无条件重刷一次。**
         // 已存在的触摸条在上面那两个 [syncTrigger] 里走的是 `existing != null` 提前 return 的
         // 分支，尺寸与 `edgeBandPx` 都不会更新——这正是用户反馈的「左右边缘预留改动不生效」：
@@ -846,6 +853,43 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 无法自愈，只能靠这里把它拽回来。
         resetTriggerStates()
         if (previewActive) showMenuPreview()
+    }
+
+    /**
+     * 开关 AND 状态。判据只在 [GameGuard]，这里别自己按包名或横屏猜。
+     *
+     * 带 [GameGuard.gameOnScreen]：小窗压在全屏游戏上时焦点在小窗里那个应用，
+     * `inGame` 会变 false —— 只看它的话触摸条会在游戏里冒回来。
+     */
+    private fun gamePaused(): Boolean =
+        store.pauseInGame && (GameGuard.inGame || GameGuard.gameOnScreen())
+
+    /**
+     * 某一侧现在该不该有触摸条。
+     * ★ 唯一判据：配置生效、巡检补建、窗口重建三处都得走它，漏一处就会把触摸条挂回游戏里。
+     */
+    private fun triggerWanted(side: CornerSide): Boolean {
+        if (!store.enabled || gamePaused()) return false
+        return if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
+    }
+
+    /** 进出游戏：只重排触摸条，不走整条 [applySettings]（那一拍重排几何、枚举应用都是白跑）。 */
+    private fun syncTriggersForGame() {
+        if (!isRunning) return
+        if (!store.enabled) return
+        if (!store.pauseInGame) return
+        val paused = gamePaused()
+        syncTrigger(CornerSide.Left, triggerWanted(CornerSide.Left))
+        syncTrigger(CornerSide.Right, triggerWanted(CornerSide.Right))
+        if (paused) {
+            // 屏上可能还留着一扇轮盘，触摸条撤了它就再也找不回来，当场收掉。
+            if (menuView != null) removeMenu(MenuExit.NONE)
+            collapseTrigger()
+        } else {
+            // 离开游戏：几何与触摸状态摆正。
+            updateTriggerLayout()
+            resetTriggerStates()
+        }
     }
 
     private fun syncTrigger(side: CornerSide, enabled: Boolean) {
@@ -1993,8 +2037,8 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         val existing = triggerViews.remove(side) ?: return
         runCatching { windowManager.removeViewImmediate(existing) }
         if (expandedSide == side) expandedSide = null
-        val enabled = if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
-        if (!enabled) {
+        // 同 [checkTriggers]：游戏里是**故意**没有触摸条的，重建等于把它挂回去。
+        if (!triggerWanted(side)) {
             DebugLog.warn("TRIGGER_RESYNCED", "side=$side 已禁用，直接移除（原因：$reason）")
             publishMaskAvoidRects()
             return
@@ -2129,9 +2173,9 @@ class OverlayGestureService : Service(), CornerTriggerView.Listener {
         // 重排放在遍历之后：它自己会遍历一遍并可能 resync，套在循环里等于边遍历边改。
         if (needsRelayout) updateTriggerLayout()
         // 开关是开的却没有窗口（上一次 addView 失败等）——补一个。
+        // ⚠️ 判据走 [triggerWanted]：游戏里触摸条是故意撤掉的，只看角落开关的话巡检每 5 秒就挂回去。
         listOf(CornerSide.Left, CornerSide.Right).forEach { side ->
-            val enabled = if (side == CornerSide.Left) store.leftCornerEnabled else store.rightCornerEnabled
-            if (enabled && triggerViews[side] == null) {
+            if (triggerWanted(side) && triggerViews[side] == null) {
                 DebugLog.warn("TRIGGER_WATCHDOG", "side=$side 缺窗口，补建")
                 syncTrigger(side, true)
             }

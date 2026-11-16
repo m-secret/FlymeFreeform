@@ -355,6 +355,52 @@ class SettingsStore(context: Context) {
         get() = preferences.getBoolean(KEY_RIGHT, true)
         set(value) = preferences.edit().putBoolean(KEY_RIGHT, value).apply()
 
+    /** 「关闭主动呼出」：游戏在前台时整条触摸条收起。判据见 [GameGuard]。默认关。 */
+    var pauseInGame: Boolean
+        get() = preferences.getBoolean(KEY_PAUSE_IN_GAME, false)
+        set(value) = preferences.edit().putBoolean(KEY_PAUSE_IN_GAME, value).apply()
+
+    /**
+     * 「关闭窗外点击」：游戏在前台时不铺遮罩，点小窗外不关。和 [pauseInGame] 独立。
+     * 小横条上滑（[CaptionTapClose]）不受影响。
+     */
+    var pauseOutsideTapInGame: Boolean
+        get() = preferences.getBoolean(KEY_PAUSE_OUTSIDE_TAP_IN_GAME, false)
+        set(value) = preferences.edit().putBoolean(KEY_PAUSE_OUTSIDE_TAP_IN_GAME, value).apply()
+
+    /** 手动当成游戏的包名。系统分类认不出的游戏靠它补。 */
+    var gameAppsAdded: Set<String>
+        get() = preferences.getStringSet(KEY_GAME_APPS_ADDED, emptySet()).orEmpty().toSet()
+        set(value) = preferences.edit().putStringSet(KEY_GAME_APPS_ADDED, value.toSet()).apply()
+
+    /** 手动排除的包名。★ 必须独立一份：只靠「不在 [gameAppsAdded] 里」表达不出「系统说它是游戏、我不同意」。 */
+    var gameAppsExcluded: Set<String>
+        get() = preferences.getStringSet(KEY_GAME_APPS_EXCLUDED, emptySet()).orEmpty().toSet()
+        set(value) = preferences.edit().putStringSet(KEY_GAME_APPS_EXCLUDED, value.toSet()).apply()
+
+    /** [packageName] 算不算游戏。用户点过名的压过系统分类。 */
+    fun isGameApp(packageName: String, systemGame: Boolean): Boolean =
+        when (packageName) {
+            in gameAppsAdded -> true
+            in gameAppsExcluded -> false
+            else -> systemGame
+        }
+
+    /** 记下「算 / 不算游戏」。和系统分类一致时两份名单都不留（回到「自动」）。 */
+    fun setGameApp(packageName: String, game: Boolean, systemGame: Boolean) {
+        val added = gameAppsAdded.toMutableSet()
+        val excluded = gameAppsExcluded.toMutableSet()
+        added -= packageName
+        excluded -= packageName
+        if (game != systemGame) {
+            if (game) added += packageName else excluded += packageName
+        }
+        preferences.edit()
+            .putStringSet(KEY_GAME_APPS_ADDED, added)
+            .putStringSet(KEY_GAME_APPS_EXCLUDED, excluded)
+            .apply()
+    }
+
     /** 角落触摸区**宽度**，单位 dp。默认 20（窄），最小 10。 */
     var cornerRangeDp: Int
         get() = preferences.getInt(KEY_RANGE_DP, DEFAULT_RANGE_WIDTH_DP)
@@ -1947,6 +1993,16 @@ class SettingsStore(context: Context) {
         private const val KEY_ENABLED = "enabled"
         private const val KEY_LEFT = "corner_left_enabled"
         private const val KEY_RIGHT = "corner_right_enabled"
+
+        /** 「游戏中不呼出」，见 [SettingsStore.pauseInGame]。 */
+        private const val KEY_PAUSE_IN_GAME = "corner_pause_in_game"
+
+        /** 「游戏中不关小窗」，见 [SettingsStore.pauseOutsideTapInGame]。 */
+        private const val KEY_PAUSE_OUTSIDE_TAP_IN_GAME = "outside_tap_pause_in_game"
+
+        /** 用户手动指定的「游戏应用」名单（加 / 排除两份），见 [SettingsStore.isGameApp]。 */
+        private const val KEY_GAME_APPS_ADDED = "game_apps_added"
+        private const val KEY_GAME_APPS_EXCLUDED = "game_apps_excluded"
         private const val KEY_RANGE_DP = "corner_range_dp"
         private const val KEY_RANGE_HEIGHT_DP = "corner_range_height_dp"
         private const val KEY_EDGE_INSET_DP = "corner_edge_inset_dp"
@@ -2586,7 +2642,8 @@ class SettingsStore(context: Context) {
                 // 总开关 / 触摸区
                 KEY_ENABLED, KEY_LEFT, KEY_RIGHT, KEY_RANGE_DP, KEY_RANGE_HEIGHT_DP,
                 KEY_EDGE_INSET_DP, KEY_BOTTOM_INSET_DP, KEY_CORNER_TAP_THROUGH, KEY_PINS, KEY_PIN_PAGES,
-                KEY_PIN_DEFAULT_PAGE,
+                KEY_PIN_DEFAULT_PAGE, KEY_PAUSE_IN_GAME, KEY_PAUSE_OUTSIDE_TAP_IN_GAME,
+                KEY_GAME_APPS_ADDED, KEY_GAME_APPS_EXCLUDED,
                 // 关闭方式（窗外 / 窗内）
                 KEY_OUTSIDE_TAP, KEY_CAPTION_TAP_CLOSE, KEY_OUTSIDE_TAP_SIDES_ONLY,
                 KEY_OUTSIDE_TAP_MASK, KEY_OUTSIDE_TAP_PADDING_DP, KEY_OUTSIDE_TAP_DEBUG,

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「游戏应用」页底栏第二格：勾（Material Symbols 的 check），24dp 网格。
+  对应「已算作游戏」的那一份名单。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M9,16.17L4.83,12l-1.42,1.41L9,19L21,7l-1.41,-1.41z" />
+</vector>
